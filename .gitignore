@@ -1,0 +1,7 @@
+/target
+/crates/launcher-tauri/gen/
+**/*.rs.bk
+.DS_Store
+*.db
+*.db-wal
+*.db-shm

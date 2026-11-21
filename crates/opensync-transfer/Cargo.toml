@@ -1,0 +1,23 @@
+[package]
+name = "opensync-transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+opensync-api = { path = "../opensync-api" }
+rayon.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+zip.workspace = true

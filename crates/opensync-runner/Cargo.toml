@@ -1,0 +1,22 @@
+[package]
+name = "opensync-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+launcher-db = { path = "../launcher-db" }
+opensync-api = { path = "../opensync-api" }
+opensync-proton = { path = "../opensync-proton" }
+opensync-sync = { path = "../opensync-sync" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+hex.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,245 @@
+use chrono::{DateTime, Utc};
+use launcher_db::{DbError, InstalledGame, LauncherDb, PlaySession};
+use opensync_api::OpenSyncClient;
+use opensync_proton::{
+    LaunchCommandSpec, ProtonError, ProtonInstallation, build_launch_command, discover_executables,
+};
+use opensync_sync::{SyncReport, sync_game_saves};
+use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
+use std::time::{Duration, Instant};
+use thiserror::Error;
+use tokio::process::Command;
+
+#[derive(Debug, Error)]
+pub enum RunnerError {
+    #[error("db error: {0}")]
+    Db(#[from] DbError),
+    #[error("proton error: {0}")]
+    Proton(#[from] ProtonError),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("no launchable executable found in {0}")]
+    NoExecutableFound(PathBuf),
+}
+
+pub type RunnerResult<T> = Result<T, RunnerError>;
+
+#[derive(Debug, Clone)]
+pub enum PostExitSyncStatus {
+    Synced(SyncReport),
+    QueuedOffline(String),
+    SkippedDisabled,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionOutcome {
+    pub exit_code: Option<i32>,
+    pub session: PlaySession,
+    pub sync_status: PostExitSyncStatus,
+}
+
+/// Tracks active screen time while excluding system sleep / suspend jumps.
+/// On each heartbeat tick, if wall-clock jumped more than `suspend_threshold` ahead of
+/// the active tick budget (or monotonic delta exceeds expected tick), the sleep gap is
+/// subtracted so lid-closed suspend time never inflates screen time.
+#[derive(Debug, Clone)]
+pub struct SessionClock {
+    active_duration: Duration,
+    last_wall: DateTime<Utc>,
+    last_mono: Duration,
+    suspend_threshold: Duration,
+}
+
+impl SessionClock {
+    pub fn start(now_wall: DateTime<Utc>) -> Self {
+        Self {
+            active_duration: Duration::ZERO,
+            last_wall: now_wall,
+            last_mono: Duration::ZERO,
+            suspend_threshold: Duration::from_secs(15),
+        }
+    }
+
+    pub fn with_suspend_threshold(mut self, threshold: Duration) -> Self {
+        self.suspend_threshold = threshold;
+        self
+    }
+
+    /// Advances the clock with the current wall time and monotonic elapsed duration.
+    /// Any interval where wall time jumped significantly beyond monotonic active time
+    /// (indicating OS suspend/hibernate) is excluded from active playtime.
+    pub fn tick(&mut self, now_wall: DateTime<Utc>, mono_elapsed: Duration) {
+        let mono_delta = mono_elapsed.saturating_sub(self.last_mono);
+        let wall_delta = (now_wall - self.last_wall)
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+
+        // If wall time jumped much farther than monotonic time, the machine slept
+        // (on Linux CLOCK_MONOTONIC pauses during suspend while wall clock advances).
+        // Even if monotonic kept ticking (e.g. CLOCK_BOOTTIME / VM pause), cap huge single gaps
+        // beyond suspend_threshold.
+        let skew = wall_delta.abs_diff(mono_delta);
+        if skew <= self.suspend_threshold && mono_delta <= self.suspend_threshold {
+            self.active_duration += mono_delta;
+        } else if wall_delta <= self.suspend_threshold && mono_delta <= self.suspend_threshold {
+            self.active_duration += mono_delta;
+        }
+        // Otherwise treat the jump as a suspend/sleep gap and do not add it.
+
+        self.last_wall = now_wall;
+        self.last_mono = mono_elapsed;
+    }
+
+    pub fn active_duration(&self) -> Duration {
+        self.active_duration
+    }
+
+    pub fn active_secs(&self) -> u64 {
+        self.active_duration.as_secs()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LaunchOptions {
+    pub auto_sync_on_close: bool,
+    /// Brief settle delay after process exit so games finish flushing save files to disk.
+    pub sync_settle_delay: Duration,
+    /// Interval between screen-time heartbeats (detects OS sleep/suspend).
+    pub heartbeat_interval: Duration,
+    pub extra_args: Vec<String>,
+    pub prefixes_root: PathBuf,
+}
+
+impl Default for LaunchOptions {
+    fn default() -> Self {
+        Self {
+            auto_sync_on_close: true,
+            sync_settle_delay: Duration::from_millis(500),
+            heartbeat_interval: Duration::from_secs(5),
+            extra_args: Vec::new(),
+            prefixes_root: PathBuf::from("./prefixes"),
+        }
+    }
+}
+
+/// Resolves the command to execute for an installed game (using saved override or auto-discovery).
+pub fn resolve_launch_command(
+    game: &InstalledGame,
+    proton: Option<&ProtonInstallation>,
+    prefixes_root: &Path,
+    extra_args: &[String],
+) -> RunnerResult<LaunchCommandSpec> {
+    let exe = if let Some(rel) = &game.executable_rel_path {
+        let abs = game.install_dir.join(rel);
+        if abs.is_file() {
+            let kind = opensync_proton::detect_binary_kind(&abs);
+            let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+            opensync_proton::DiscoveredExecutable {
+                rel_path: rel.clone(),
+                abs_path: abs,
+                kind,
+                size,
+            }
+        } else {
+            discover_executables(&game.install_dir, &game.name)
+                .into_iter()
+                .next()
+                .ok_or_else(|| RunnerError::NoExecutableFound(game.install_dir.clone()))?
+        }
+    } else {
+        discover_executables(&game.install_dir, &game.name)
+            .into_iter()
+            .next()
+            .ok_or_else(|| RunnerError::NoExecutableFound(game.install_dir.clone()))?
+    };
+
+    let prefix_dir = prefixes_root.join(game.game_id.to_string());
+    Ok(build_launch_command(&exe, &prefix_dir, proton, extra_args)?)
+}
+
+/// Launches a game, tracks active screen time with suspend exclusion until exit,
+/// records the play session in SQLite, and automatically syncs saves when the game closes.
+/// If the server is unreachable at close time, queues the game in `pending_syncs`.
+pub async fn launch_and_track(
+    db: &LauncherDb,
+    client: Option<&OpenSyncClient>,
+    game: &InstalledGame,
+    proton: Option<&ProtonInstallation>,
+    options: LaunchOptions,
+) -> RunnerResult<SessionOutcome> {
+    let spec = resolve_launch_command(game, proton, &options.prefixes_root, &options.extra_args)?;
+
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(&spec.args)
+        .current_dir(&spec.working_dir)
+        .kill_on_drop(false);
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+
+    let started_at = Utc::now();
+    let mono_start = Instant::now();
+    let mut clock = SessionClock::start(started_at);
+    let mut child = cmd.spawn()?;
+
+    let status: ExitStatus = loop {
+        tokio::select! {
+            res = child.wait() => {
+                clock.tick(Utc::now(), mono_start.elapsed());
+                break res?;
+            }
+            _ = tokio::time::sleep(options.heartbeat_interval) => {
+                clock.tick(Utc::now(), mono_start.elapsed());
+            }
+        }
+    };
+
+    let ended_at = Utc::now();
+    // Ensure very short sessions that still ran (> 0ms) record at least their rounded active seconds.
+    let active_secs = clock.active_secs();
+    let mut session = db.record_play_session(
+        &game.profile_id,
+        game.game_id,
+        started_at,
+        ended_at,
+        active_secs,
+        &spec.runtime_label,
+        false,
+    )?;
+
+    let sync_status = if !options.auto_sync_on_close {
+        PostExitSyncStatus::SkippedDisabled
+    } else {
+        if !options.sync_settle_delay.is_zero() {
+            tokio::time::sleep(options.sync_settle_delay).await;
+        }
+        match client {
+            Some(c) => match sync_game_saves(c, game.game_id, &game.install_dir, false).await {
+                Ok(report) => {
+                    let _ = db.update_game_synced_at(&game.profile_id, game.game_id, Utc::now());
+                    let _ = db.clear_pending_sync(&game.profile_id, game.game_id);
+                    let _ = db.mark_session_synced(session.id);
+                    session.synced = true;
+                    PostExitSyncStatus::Synced(report)
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    let _ = db.queue_pending_sync(&game.profile_id, game.game_id, &msg);
+                    PostExitSyncStatus::QueuedOffline(msg)
+                }
+            },
+            None => {
+                let msg = "offline at session exit".to_string();
+                let _ = db.queue_pending_sync(&game.profile_id, game.game_id, &msg);
+                PostExitSyncStatus::QueuedOffline(msg)
+            }
+        }
+    };
+
+    Ok(SessionOutcome {
+        exit_code: status.code(),
+        session,
+        sync_status,
+    })
+}
