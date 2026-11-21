@@ -315,9 +315,15 @@ impl LauncherPaths {
 /// Default destination for downloaded games: `<Games>/OpenSync` in the user's home dir.
 /// Checks `Games` then `games`; if neither exists, falls back to creating `Games/OpenSync`.
 pub fn default_games_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME")
-        && !home.trim().is_empty()
-    {
+    let home_env = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|h| !h.trim().is_empty())
+        });
+    if let Some(home) = home_env {
         let home = PathBuf::from(home);
         let games = [home.join("Games"), home.join("games")]
             .into_iter()

@@ -154,7 +154,14 @@ pub async fn get_bootstrap_state(state: State<'_, AppState>) -> Result<Bootstrap
 }
 
 fn expand_home(raw: &str) -> PathBuf {
-    let home = std::env::var("HOME").ok().filter(|h| !h.trim().is_empty());
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|h| !h.trim().is_empty())
+        });
     if raw == "~" {
         if let Some(home) = home {
             return PathBuf::from(home);
@@ -684,12 +691,24 @@ pub fn pick_upload_folder() -> Result<Option<String>, String> {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    let picked = try_dialog(
+        "powershell",
+        &[
+            "-NoProfile",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Choose game folder'; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }",
+        ],
+    );
+
+    #[cfg(not(target_os = "windows"))]
     let picked = try_dialog(
         "zenity",
         &["--file-selection", "--directory", "--title=Choose game folder"],
     )
     .or_else(|| try_dialog("kdialog", &["--getexistingdirectory", "/home"]))
     .or_else(|| try_dialog("yad", &["--file-selection", "--directory", "--title=Choose game folder"]));
+
     Ok(picked)
 }
 

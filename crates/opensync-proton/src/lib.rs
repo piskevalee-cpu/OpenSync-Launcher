@@ -183,6 +183,14 @@ pub fn discover_executables(install_dir: &Path, game_name: &str) -> Vec<Discover
             } else {
                 1
             };
+            #[cfg(target_os = "windows")]
+            let kind_rank = match c.kind {
+                BinaryKind::WindowsPe => 0,
+                BinaryKind::LinuxElf => 1,
+                BinaryKind::ShellScript => 2,
+                BinaryKind::Unknown => 3,
+            };
+            #[cfg(not(target_os = "windows"))]
             let kind_rank = match c.kind {
                 BinaryKind::LinuxElf => 0,
                 BinaryKind::WindowsPe => 1,
@@ -320,6 +328,16 @@ pub fn build_launch_command(
             })
         }
         BinaryKind::WindowsPe => {
+            #[cfg(target_os = "windows")]
+            if proton.is_none() {
+                return Ok(LaunchCommandSpec {
+                    program: exe.abs_path.clone(),
+                    args: extra_args.to_vec(),
+                    env: Vec::new(),
+                    working_dir,
+                    runtime_label: "native".to_string(),
+                });
+            }
             let proton = proton.ok_or(ProtonError::NotInstalled)?;
             fs::create_dir_all(prefix_dir)?;
 

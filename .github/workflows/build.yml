@@ -1,0 +1,199 @@
+name: Build OpenSync Launcher (AppImage & Windows .exe)
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build-linux-appimage:
+    name: Linux (AppImage amd64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux GTK & WebKitGTK dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            squashfs-tools \
+            desktop-file-utils \
+            file
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Rust workspace tests
+        run: cargo test --workspace --exclude launcher-tauri
+
+      - name: Build release binary
+        run: cargo build --release -p launcher-tauri
+
+      - name: Resolve version
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION=$(python3 -c 'import json; print(json.load(open("crates/launcher-tauri/tauri.conf.json"))["version"])')
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Package AppImage
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          OUT_DIR="dist"
+          APPDIR="/tmp/OpenSync_Launcher.AppDir"
+          mkdir -p "$OUT_DIR" \
+            "$APPDIR/usr/bin" \
+            "$APPDIR/usr/share/applications" \
+            "$APPDIR/usr/share/metainfo" \
+            "$APPDIR/usr/share/icons/hicolor/512x512/apps" \
+            "$APPDIR/usr/share/icons/hicolor/256x256/apps" \
+            "$APPDIR/usr/share/icons/hicolor/128x128/apps" \
+            "$APPDIR/usr/share/icons/hicolor/32x32/apps"
+
+          cp target/release/opensync-launcher "$APPDIR/usr/bin/opensync-launcher"
+          strip "$APPDIR/usr/bin/opensync-launcher"
+          chmod 755 "$APPDIR/usr/bin/opensync-launcher"
+
+          cp crates/launcher-tauri/icons/icon.png "$APPDIR/opensync-launcher.png"
+          ln -sf opensync-launcher.png "$APPDIR/.DirIcon"
+          cp crates/launcher-tauri/icons/icon.png "$APPDIR/usr/share/icons/hicolor/512x512/apps/opensync-launcher.png"
+          cp crates/launcher-tauri/icons/128x128@2x.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/opensync-launcher.png"
+          cp crates/launcher-tauri/icons/128x128.png "$APPDIR/usr/share/icons/hicolor/128x128/apps/opensync-launcher.png"
+          cp crates/launcher-tauri/icons/32x32.png "$APPDIR/usr/share/icons/hicolor/32x32/apps/opensync-launcher.png"
+
+          cat > "$APPDIR/AppRun" << 'EOF'
+          #!/bin/sh
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          export PATH="${HERE}/usr/bin:${PATH}"
+          export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+          exec "${HERE}/usr/bin/opensync-launcher" "$@"
+          EOF
+          chmod 755 "$APPDIR/AppRun"
+
+          cat > "$APPDIR/opensync-launcher.desktop" << 'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=OpenSync Launcher
+          Comment=Desktop game launcher and differential save sync client for OpenSync
+          Exec=opensync-launcher
+          Icon=opensync-launcher
+          Terminal=false
+          Categories=Game;
+          StartupWMClass=opensync-launcher
+          EOF
+          cp "$APPDIR/opensync-launcher.desktop" "$APPDIR/usr/share/applications/opensync-launcher.desktop"
+
+          cat > "$APPDIR/usr/share/metainfo/opensync-launcher.appdata.xml" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <component type="desktop-application">
+            <id>opensync-launcher.desktop</id>
+            <metadata_license>MIT</metadata_license>
+            <project_license>MIT</project_license>
+            <name>OpenSync Launcher</name>
+            <summary>Desktop game launcher and differential save sync client for OpenSync</summary>
+            <description>
+              <p>Native desktop game launcher for self-hosted OpenSync game archives with wire-speed streaming extraction, automatic differential save sync on game close, crash recovery, and GE-Proton integration.</p>
+            </description>
+            <launchable type="desktop-id">opensync-launcher.desktop</launchable>
+            <url type="homepage">https://github.com/piskevalee-cpu/OpenSync-Launcher</url>
+          </component>
+          EOF
+
+          curl -fsSL -o /tmp/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          curl -fsSL -o /tmp/runtime-x86_64 https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+          chmod +x /tmp/appimagetool /tmp/runtime-x86_64
+
+          APPIMAGE_NAME="OpenSync_Launcher_${VERSION}_amd64.AppImage"
+          ARCH=x86_64 /tmp/appimagetool --appimage-extract-and-run --no-appstream --runtime-file /tmp/runtime-x86_64 "$APPDIR" "$OUT_DIR/$APPIMAGE_NAME"
+          chmod +x "$OUT_DIR/$APPIMAGE_NAME"
+          (cd "$OUT_DIR" && sha256sum "$APPIMAGE_NAME" > "${APPIMAGE_NAME}.sha256")
+          ls -lh "$OUT_DIR"
+
+      - name: Upload Linux AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensync-launcher-linux-appimage
+          path: dist/OpenSync_Launcher_*_amd64.AppImage*
+          if-no-files-found: error
+
+  build-windows-exe:
+    name: Windows (.exe x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Windows release .exe
+        run: cargo build --release --target x86_64-pc-windows-msvc -p launcher-tauri
+
+      - name: Package Windows .exe & SHA-256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $version = $env:GITHUB_REF -replace '^refs/tags/v', ''
+          } else {
+            $conf = Get-Content "crates/launcher-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
+            $version = $conf.version
+          }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $exeName = "OpenSync_Launcher_${version}_x64.exe"
+          Copy-Item "target/x86_64-pc-windows-msvc/release/opensync-launcher.exe" "dist/$exeName"
+          $hash = (Get-FileHash "dist/$exeName" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $exeName" | Out-File -FilePath "dist/$exeName.sha256" -Encoding ascii
+          Get-ChildItem dist
+
+      - name: Upload Windows .exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensync-launcher-windows-exe
+          path: dist/OpenSync_Launcher_*_x64.exe*
+          if-no-files-found: error
+
+  release:
+    name: Publish Release Assets
+    needs: [build-linux-appimage, build-windows-exe]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Linux & Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Attach .AppImage and .exe to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*

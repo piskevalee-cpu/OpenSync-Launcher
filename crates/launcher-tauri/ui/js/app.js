@@ -1690,7 +1690,8 @@ function renderGameDetailView() {
     : `<div class="card-cover-placeholder" data-cover-game="${g.game_id}" data-cover-class=""><span class="card-cover-monogram">${esc(monogram(g.name))}</span></div>`;
 
   const isWindows = g.binary_kind === 'WindowsPe';
-  const needsProton = isWindows && state.protonInstallations.length === 0;
+  const isWindowsHost = /Win/i.test(navigator.platform || navigator.userAgent || '');
+  const needsProton = isWindows && !isWindowsHost && state.protonInstallations.length === 0;
 
   let primaryBtnHtml;
   if (isPlaying) {
@@ -1754,7 +1755,7 @@ function renderGameDetailView() {
       : `<span class="badge">Archive ready</span>`;
 
   const runtimeBadge = isWindows
-    ? `<span class="badge">${icon('cpu', 12)}Windows via Proton</span>`
+    ? `<span class="badge">${icon('cpu', 12)}${isWindowsHost ? 'Native Windows' : 'Windows via Proton'}</span>`
     : `<span class="badge">${icon('cpu', 12)}Native Linux</span>`;
 
   viewEl.innerHTML = `

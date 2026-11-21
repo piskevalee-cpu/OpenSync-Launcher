@@ -27,6 +27,21 @@ fn resolve_data_root() -> PathBuf {
     {
         return PathBuf::from(home).join(".local/share/opensync-launcher");
     }
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA")
+        && !local_app_data.trim().is_empty()
+    {
+        return PathBuf::from(local_app_data).join("opensync-launcher");
+    }
+    if let Ok(app_data) = std::env::var("APPDATA")
+        && !app_data.trim().is_empty()
+    {
+        return PathBuf::from(app_data).join("opensync-launcher");
+    }
+    if let Ok(user_profile) = std::env::var("USERPROFILE")
+        && !user_profile.trim().is_empty()
+    {
+        return PathBuf::from(user_profile).join("AppData/Local/opensync-launcher");
+    }
     PathBuf::from("./opensync-launcher-data")
 }
 
