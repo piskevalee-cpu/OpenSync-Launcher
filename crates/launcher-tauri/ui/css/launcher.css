@@ -84,7 +84,7 @@ body.is-scrolling .card.steam-card {
 
 ::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius);
 }
 
 ::-webkit-scrollbar-thumb:hover {
@@ -219,7 +219,7 @@ a {
   align-items: center;
   gap: 5px;
   padding: 1px 7px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: rgba(125, 250, 155, 0.14);
   border: 1px solid rgba(125, 250, 155, 0.36);
   color: var(--accent);
@@ -253,7 +253,7 @@ a {
   align-items: center;
   gap: 7px;
   padding: 5px 11px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--panel);
   border: 1px solid var(--border);
   font-size: 12px;
@@ -660,7 +660,7 @@ button:disabled,
   align-items: center;
   gap: 5px;
   padding: 2px 9px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   font-size: 11px;
   font-weight: 660;
   border: 1px solid var(--border-bright);
@@ -1042,7 +1042,7 @@ button:disabled,
   z-index: 4;
   will-change: transform, opacity;
   padding: 3px 9px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   font-size: 11px;
   font-weight: 700;
   backdrop-filter: blur(12px);
@@ -1420,7 +1420,7 @@ button:disabled,
   right: 8px;
   bottom: 8px;
   padding: 2px 9px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: rgba(10, 10, 14, 0.82);
   border: 1px solid var(--border-bright);
   color: var(--fg);
@@ -1663,7 +1663,7 @@ button:disabled,
 .dl-progress-track {
   position: relative;
   height: 10px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--bg-soft);
   border: 1px solid var(--border);
   overflow: hidden;
@@ -1674,7 +1674,7 @@ button:disabled,
   position: relative;
   height: 100%;
   width: 0%;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: linear-gradient(90deg, #52d97c 0%, var(--accent) 100%);
   transition: width 0.25s linear, background 0.2s ease;
   overflow: hidden;
@@ -2120,7 +2120,7 @@ button:disabled,
   min-width: 22px;
   height: 22px;
   padding: 0 6px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--panel-2);
   border: 1px solid var(--border-bright);
   color: var(--fg);
@@ -2471,7 +2471,7 @@ body.has-gamepad-bar .toast-stack {
   gap: 7px;
   height: 30px;
   padding: 0 11px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--panel);
   border: 1px solid var(--border);
   font-size: 12px;
@@ -2503,7 +2503,7 @@ body.has-gamepad-bar .toast-stack {
   min-width: 18px;
   height: 17px;
   padding: 0 5px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: rgba(255, 255, 255, 0.07);
   color: var(--fg);
   font-size: 10.5px;
@@ -2763,7 +2763,7 @@ body.has-gamepad-bar .toast-stack {
 .sync-banner-track {
   width: 100%;
   height: 4px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: rgba(255, 255, 255, 0.07);
   overflow: hidden;
   position: relative;
@@ -2771,7 +2771,7 @@ body.has-gamepad-bar .toast-stack {
 
 .sync-banner-fill {
   height: 100%;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: linear-gradient(90deg, rgba(125, 250, 155, 0.35), var(--accent), #b6ffca);
   width: 45%;
   animation: sync-indeterminate 1.15s cubic-bezier(0.4, 0, 0.2, 1) infinite;
@@ -2905,7 +2905,7 @@ body.has-gamepad-bar .fab-upload {
   align-items: center;
   gap: 8px;
   padding: 5px 11px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--accent-dim);
   border: 1px solid rgba(125, 250, 155, 0.38);
   color: var(--accent);
@@ -3099,7 +3099,7 @@ body.has-gamepad-bar .fab-upload {
   align-items: center;
   gap: 7px;
   padding: 3px 10px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   font-size: 11px;
   font-weight: 720;
   border: 1px solid rgba(125, 250, 155, 0.4);
@@ -3123,7 +3123,7 @@ body.has-gamepad-bar .fab-upload {
 .upload-progress-track {
   width: 100%;
   height: 10px;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: var(--bg-soft);
   border: 1px solid var(--border);
   overflow: hidden;
@@ -3133,7 +3133,7 @@ body.has-gamepad-bar .fab-upload {
 .upload-progress-fill {
   height: 100%;
   width: 0%;
-  border-radius: 999px;
+  border-radius: var(--radius);
   background: linear-gradient(90deg, #4fd07a, var(--accent));
   box-shadow: 0 0 14px rgba(125, 250, 155, 0.45);
   transition: width 0.18s linear;
