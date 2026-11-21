@@ -72,6 +72,12 @@ fn main() {
     tauri::Builder::default()
         .manage(app_state)
         .setup(move |app| {
+            if let (Some(icon), Some(win)) = (
+                app.default_window_icon().cloned(),
+                app.get_webview_window("main"),
+            ) {
+                let _ = win.set_icon(icon);
+            }
             let app_handle = app.handle().clone();
             let state = app.state::<AppState>();
             let core_for_events = Arc::clone(&state.core);
