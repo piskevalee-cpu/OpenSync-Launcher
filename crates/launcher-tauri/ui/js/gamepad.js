@@ -6,7 +6,7 @@ const FOCUSABLE_SELECTOR = [
   'button:not(:disabled)',
   'a[href]',
   'input:not(:disabled):not([type="hidden"])',
-  'select:not(:disabled)',
+  '.css-select-option',
   '[tabindex="0"]',
 ].join(', ');
 
@@ -239,7 +239,19 @@ export function createGamepadController(hooks) {
     }
 
     const view = hooks.getView?.() || 'library';
+    if (document.querySelector('.css-select-menu')) {
+      return [
+        { key: 'A', label: 'Select' },
+        { key: 'B', label: 'Close menu' },
+      ];
+    }
     const onCard = focusedEl?.classList.contains('steam-card');
+    if (view === 'upload') {
+      return [
+        { key: 'A', label: 'Select' },
+        { key: 'B', label: 'Back to library' },
+      ];
+    }
     if (view === 'library') {
       if (onCard) {
         const primaryLabel = focusedEl.dataset.primaryAction === 'play'
@@ -277,11 +289,19 @@ export function createGamepadController(hooks) {
       ];
     }
 
-    if (view === 'proton') {
+    if (view === 'settings') {
       return [
         { key: 'A', label: 'Select' },
         { key: 'Y', label: 'Rescan' },
         { key: 'LB/RB', label: 'Switch tab' },
+      ];
+    }
+
+    // Profile is reachable from the topbar dropdown, not a topbar tab: [B] goes home.
+    if (view === 'profile') {
+      return [
+        { key: 'A', label: 'Select' },
+        { key: 'B', label: 'Back to library' },
       ];
     }
 
@@ -422,8 +442,10 @@ export function createGamepadController(hooks) {
 
   // Keyboard spatial navigation & shortcuts matching controller controls
   window.addEventListener('keydown', (e) => {
+    // The custom CSS dropdown owns its own keyboard handling.
+    if (e.target?.closest?.('.css-select, .css-select-menu')) return;
     const tag = document.activeElement?.tagName;
-    const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+    const typing = tag === 'INPUT' || tag === 'TEXTAREA';
 
     if (e.key === 'Escape') {
       backAction();
@@ -504,6 +526,9 @@ export function createGamepadController(hooks) {
   rafId = window.requestAnimationFrame(pollGamepads);
 
   return {
+    focusElement(el) {
+      if (el) setFocus(el, { scroll: false });
+    },
     onViewRendered() {
       if (connectedPadName || inputMode === 'gamepad' || inputMode === 'keyboard') {
         requestAnimationFrame(() => ensureFocus());

@@ -21,6 +21,9 @@ function normalizeServerUrl(raw) {
   }
   try {
     const u = new URL(s);
+    if (u.hostname === '0.0.0.0' || u.hostname === '[::]' || u.hostname === '::') {
+      u.hostname = '127.0.0.1';
+    }
     u.hash = '';
     u.search = '';
     let p = u.pathname.replace(/\/+$/, '');
@@ -98,6 +101,76 @@ function monogram(name) {
   const words = String(name || 'OS').trim().split(/\s+/).filter(Boolean);
   if (words.length >= 2) return (words[0][0] + words[1][0]).toUpperCase();
   return String(name || 'OS').trim().slice(0, 2).toUpperCase();
+}
+
+function fmtDate(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function isDefaultPfp(path) {
+  return !path || path === '/img/blankpfp.jpg';
+}
+
+function pfpCacheKey(profileId, userId) {
+  return `${profileId || 'none'}_${userId}`;
+}
+
+/// Renders an avatar slot: cached image when available, otherwise a clean monogram that is
+/// upgraded in place once `ensureUserPfp` resolves.
+function pfpSlotHtml(profileId, userId, pfpPath, className, label) {
+  const safeClass = esc(className);
+  const monogramHtml = esc(monogram(label));
+  if (profileId == null || userId == null) {
+    return `<span class="${safeClass}" aria-hidden="true">${monogramHtml}</span>`;
+  }
+  const key = pfpCacheKey(profileId, userId);
+  if (!state.pfpCache.has(key)) {
+    ensureUserPfp(profileId, userId, pfpPath);
+  }
+  const cached = state.pfpCache.get(key);
+  if (cached) {
+    return `<img class="${safeClass}" src="${cached}" alt="" decoding="async" />`;
+  }
+  return `<span class="${safeClass} pfp-pending" data-pfp-key="${esc(key)}" data-pfp-class="${safeClass}" aria-hidden="true">${monogramHtml}</span>`;
+}
+
+async function ensureUserPfp(profileId, userId, pfpPath) {
+  const key = pfpCacheKey(profileId, userId);
+  if (state.pfpCache.has(key) || state.pfpPending.has(key)) return;
+  state.pfpPending.add(key);
+  try {
+    const dataUrl = await bridge.getUserPfpDataUrl(pfpPath || null, userId);
+    state.pfpCache.set(key, dataUrl || null);
+    const slots = [...document.querySelectorAll('[data-pfp-key]')].filter(
+      (el) => el.dataset.pfpKey === key,
+    );
+    if (dataUrl) {
+      for (const slot of slots) {
+        const img = document.createElement('img');
+        img.className = slot.dataset.pfpClass || '';
+        img.src = dataUrl;
+        img.alt = '';
+        img.decoding = 'async';
+        img.dataset.pfpLoaded = String(userId);
+        slot.replaceWith(img);
+      }
+    } else {
+      for (const slot of slots) {
+        slot.removeAttribute('data-pfp-key');
+        slot.classList.remove('pfp-pending');
+      }
+    }
+  } catch {
+    state.pfpCache.set(key, null);
+  } finally {
+    state.pfpPending.delete(key);
+  }
+}
+
+function invalidateUserPfp(profileId, userId) {
+  state.pfpCache.delete(pfpCacheKey(profileId, userId));
 }
 
 function protonSourceLabel(source) {
@@ -182,13 +255,18 @@ function normalizeDownloadJob(raw) {
 
 // ---------- App State ----------
 
-const TAB_ORDER = ['library', 'downloads', 'proton', 'profiles'];
+const TAB_ORDER = ['library', 'downloads', 'settings'];
 
 const state = {
-  view: 'library', // 'library' | 'game-detail' | 'downloads' | 'proton' | 'profiles'
+  view: 'library', // 'library' | 'game-detail' | 'downloads' | 'settings' | 'profile'
+  gamesDir: '',
   selectedGameId: null,
   activeProfile: null,
   profiles: [],
+  currentUser: null,
+  pfpCache: new Map(), // `${profileId}_${userId}` -> dataUrl | null
+  pfpPending: new Set(),
+  profileDangerError: null,
   connectionState: { status: 'disconnected' },
   protonInstallations: [],
   pendingSyncs: [],
@@ -207,9 +285,226 @@ const state = {
   checkingGeProton: false,
   geProtonError: null,
   reconnecting: false,
+  uploads: [], // normalized live upload jobs
+  uploadForm: null, // form state survives navigation (like the web UI's session)
+  cssSelectOpen: null, // currently open custom dropdown
+  activityLogs: [],
+  activityMenuOpen: false,
+  interruptedSessions: [],
+  promptedInterruptedGameIds: new Set(),
 };
 
 const activeWaveforms = new Map(); // job_id -> WaveformCanvas
+const activeUploadWaveforms = new Map(); // job_id -> WaveformCanvas
+
+// ---------- Scroll performance ----------
+// Mark the body while the user is actively scrolling so paused cards skip the
+// expensive 3D-tilt/backdrop repaints. No layout reads in the hot path.
+let scrollIdleTimer = null;
+function initScrollPerf() {
+  window.addEventListener(
+    'scroll',
+    () => {
+      document.body.classList.add('is-scrolling');
+      if (scrollIdleTimer !== null) clearTimeout(scrollIdleTimer);
+      scrollIdleTimer = window.setTimeout(() => {
+        document.body.classList.remove('is-scrolling');
+        scrollIdleTimer = null;
+      }, 90);
+    },
+    { passive: true },
+  );
+}
+
+// ---------- Reusable CSS select (replaces every native <select>) ----------
+
+function closeCssSelect() {
+  const inst = state.cssSelectOpen;
+  if (!inst) return;
+  state.cssSelectOpen = null;
+  inst.close();
+}
+
+/**
+ * Creates an accessible, gamepad-friendly dropdown. The menu is appended to
+ * #app-shell with fixed positioning so it is never clipped by panels/cards.
+ */
+function createCssSelect({ options, value = '', onChange, disabled = false, ariaLabel = 'Select', placeholder = 'Select…' }) {
+  const root = document.createElement('div');
+  root.className = 'css-select';
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'css-select-trigger';
+  trigger.setAttribute('aria-haspopup', 'listbox');
+  trigger.setAttribute('aria-expanded', 'false');
+  trigger.setAttribute('aria-label', ariaLabel);
+  trigger.disabled = Boolean(disabled);
+  trigger.innerHTML = `<span class="css-select-value"></span><span class="css-select-chevron">${icon('chevron-down', 15)}</span>`;
+
+  const valueEl = trigger.querySelector('.css-select-value');
+  let selected = options.some((o) => o.value === value) ? value : (options[0]?.value ?? '');
+  let activeIndex = Math.max(0, options.findIndex((o) => o.value === selected));
+  let menu = null;
+  let open = false;
+
+  function labelFor(v) {
+    return options.find((o) => o.value === v)?.label ?? placeholder;
+  }
+
+  function syncTrigger() {
+    valueEl.textContent = labelFor(selected);
+    trigger.setAttribute('aria-label', `${ariaLabel}: ${labelFor(selected)}`);
+  }
+
+  function positionMenu() {
+    if (!menu || !trigger.isConnected) return;
+    const r = trigger.getBoundingClientRect();
+    menu.style.setProperty('--css-select-width', `${Math.round(r.width)}px`);
+    const menuRect = menu.getBoundingClientRect();
+    const menuW = Math.max(r.width, menuRect.width);
+    const fitsLeft = r.left + menuW <= window.innerWidth - 8;
+    const left = fitsLeft
+      ? Math.max(8, Math.round(r.left))
+      : Math.max(8, Math.round(r.right - menuW));
+    const below = window.innerHeight - r.bottom - 8;
+    const above = r.top - 8;
+    const top = below >= Math.min(menuRect.height, 220) || below >= above
+      ? Math.round(r.bottom + 6)
+      : Math.max(8, Math.round(r.top - menuRect.height - 6));
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+  }
+
+  function onWindowLayout() {
+    if (open) positionMenu();
+  }
+
+  function onDocPointer(e) {
+    if (!root.contains(e.target) && !menu?.contains(e.target)) closeCssSelect();
+  }
+  function onDocKey(e) {
+    if (!open) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeCssSelect();
+      trigger.focus();
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      e.stopPropagation();
+      const dir = e.key === 'ArrowDown' ? 1 : -1;
+      activeIndex = (activeIndex + dir + options.length) % options.length;
+      paintActive();
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      e.stopPropagation();
+      pick(activeIndex);
+    }
+  }
+
+  function paintActive() {
+    if (!menu) return;
+    [...menu.querySelectorAll('.css-select-option')].forEach((el, i) => {
+      el.classList.toggle('is-active', i === activeIndex);
+    });
+    const active = menu.querySelector('.css-select-option.is-active');
+    active?.scrollIntoView({ block: 'nearest' });
+  }
+
+  function pick(index) {
+    const opt = options[index];
+    if (!opt) return;
+    selected = opt.value;
+    activeIndex = index;
+    syncTrigger();
+    closeCssSelect();
+    trigger.focus();
+    if (typeof onChange === 'function') onChange(selected);
+  }
+
+  function openMenu() {
+    if (disabled || open) return;
+    closeCssSelect();
+    open = true;
+    activeIndex = Math.max(0, options.findIndex((o) => o.value === selected));
+    menu = document.createElement('div');
+    menu.className = 'css-select-menu';
+    menu.setAttribute('role', 'listbox');
+    menu.setAttribute('aria-label', ariaLabel);
+    for (const [i, opt] of options.entries()) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = `css-select-option${opt.value === selected ? ' selected' : ''}${i === activeIndex ? ' is-active' : ''}`;
+      item.setAttribute('role', 'option');
+      item.setAttribute('aria-selected', String(opt.value === selected));
+      item.innerHTML = `<span>${esc(opt.label)}</span>${opt.value === selected ? `<span class="css-select-check">${icon('check', 15)}</span>` : ''}`;
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        pick(i);
+      });
+      item.addEventListener('pointerenter', () => {
+        activeIndex = i;
+        paintActive();
+      });
+      menu.appendChild(item);
+    }
+    document.body.appendChild(menu);
+    state.cssSelectOpen = { close: destroyMenu };
+    root.classList.add('is-open');
+    trigger.setAttribute('aria-expanded', 'true');
+    positionMenu();
+    document.addEventListener('pointerdown', onDocPointer);
+    document.addEventListener('keydown', onDocKey, true);
+    window.addEventListener('resize', onWindowLayout);
+    window.addEventListener('scroll', onWindowLayout, true);
+    // Only move controller focus ring into the menu when controller/keyboard nav is active.
+    if (document.body.classList.contains('gp-mode')) {
+      gamepadCtrl?.focusElement?.(menu.querySelector('.css-select-option.is-active'));
+    }
+  }
+
+  function destroyMenu() {
+    if (!open) return;
+    open = false;
+    root.classList.remove('is-open');
+    trigger.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('pointerdown', onDocPointer);
+    document.removeEventListener('keydown', onDocKey, true);
+    window.removeEventListener('resize', onWindowLayout);
+    window.removeEventListener('scroll', onWindowLayout, true);
+    menu?.remove();
+    menu = null;
+  }
+
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (open) closeCssSelect();
+    else openMenu();
+  });
+  trigger.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!open) openMenu();
+    }
+  });
+  root.addEventListener('css-select-destroy', destroyMenu);
+
+  syncTrigger();
+  root.appendChild(trigger);
+  return {
+    element: root,
+    get value() { return selected; },
+    set(value) {
+      selected = options.some((o) => o.value === value) ? value : (options[0]?.value ?? '');
+      syncTrigger();
+    },
+    setDisabled(v) { trigger.disabled = Boolean(v); },
+    destroy() {
+      destroyMenu();
+      root.remove();
+    },
+  };
+}
 
 // ---------- DOM References ----------
 
@@ -218,10 +513,104 @@ const profileSwitcherEl = document.getElementById('profile-switcher');
 const statusRightEl = document.getElementById('status-right');
 const modalRoot = document.getElementById('modal-root');
 const lightboxRoot = document.getElementById('lightbox-root');
+const syncBannerRoot = document.getElementById('sync-banner-root');
 const toastRoot = document.getElementById('toast-root');
 const navDlPill = document.getElementById('nav-dl-pill');
+const fabUploadEl = document.getElementById('fab-upload');
 
 let gamepadCtrl = null;
+let libViewShell = null;
+let libSortControl = null;
+const cardDomCache = new Map(); // game_id -> { sig, card }
+const liveSyncBanners = new Map(); // game_id -> { el, timer }
+
+// ---------- Live Post-Close Auto-Sync Banner ----------
+
+function showLiveSyncBanner(gameId, gameName, trigger = 'post_exit') {
+  if (!syncBannerRoot) return;
+  const existing = liveSyncBanners.get(gameId);
+  if (existing) {
+    if (existing.timer) clearTimeout(existing.timer);
+    existing.el.remove();
+    liveSyncBanners.delete(gameId);
+  }
+
+  const titleText = trigger === 'post_exit'
+    ? `Game closed · Auto-syncing ${gameName}…`
+    : trigger === 'recovery'
+      ? `Recovering saves · ${gameName}…`
+      : `Syncing saves · ${gameName}…`;
+  const subText = trigger === 'post_exit'
+    ? 'Scanning game folder & uploading differential save overlay…'
+    : 'Diffing save files against clean server manifest…';
+
+  const el = document.createElement('div');
+  el.className = 'sync-banner';
+  el.dataset.gameId = String(gameId);
+  el.innerHTML = `
+    <div class="sync-banner-main">
+      <div class="sync-banner-icon"><span class="spin-icon">${icon('refresh-cw', 17)}</span></div>
+      <div class="sync-banner-text">
+        <div class="sync-banner-title">${esc(titleText)}</div>
+        <div class="sync-banner-sub">${esc(subText)}</div>
+      </div>
+    </div>
+    <div class="sync-banner-track"><div class="sync-banner-fill"></div></div>
+  `;
+  syncBannerRoot.appendChild(el);
+  liveSyncBanners.set(gameId, { el, timer: null });
+}
+
+function completeLiveSyncBanner(gameId, gameName, { uploadedFiles = 0, uploadedBytes = 0, deletedPaths = 0, error = null } = {}) {
+  if (!syncBannerRoot) return;
+  let record = liveSyncBanners.get(gameId);
+  if (!record) {
+    showLiveSyncBanner(gameId, gameName, 'post_exit');
+    record = liveSyncBanners.get(gameId);
+  }
+  if (!record) return;
+  if (record.timer) clearTimeout(record.timer);
+
+  const { el } = record;
+  el.classList.add('is-complete');
+  if (error) {
+    el.classList.add('is-warn');
+    el.innerHTML = `
+      <div class="sync-banner-main">
+        <div class="sync-banner-icon">${icon('wifi-off', 17)}</div>
+        <div class="sync-banner-text">
+          <div class="sync-banner-title">Save sync queued · ${esc(gameName)}</div>
+          <div class="sync-banner-sub">${esc(error)}</div>
+        </div>
+      </div>
+      <div class="sync-banner-track"><div class="sync-banner-fill"></div></div>
+    `;
+  } else {
+    const detail = uploadedFiles > 0 || deletedPaths > 0
+      ? `${uploadedFiles} file${uploadedFiles === 1 ? '' : 's'} uploaded (${humanBytes(uploadedBytes)})${deletedPaths > 0 ? ` · ${deletedPaths} deleted` : ''}`
+      : 'All save files verified up to date';
+    el.innerHTML = `
+      <div class="sync-banner-main">
+        <div class="sync-banner-icon">${icon('check', 17)}</div>
+        <div class="sync-banner-text">
+          <div class="sync-banner-title">Auto-sync complete · ${esc(gameName)}</div>
+          <div class="sync-banner-sub">${esc(detail)}</div>
+        </div>
+      </div>
+      <div class="sync-banner-track"><div class="sync-banner-fill"></div></div>
+    `;
+  }
+
+  record.timer = window.setTimeout(() => {
+    el.style.transition = 'opacity 0.24s ease, transform 0.24s ease';
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(8px)';
+    window.setTimeout(() => {
+      el.remove();
+      liveSyncBanners.delete(gameId);
+    }, 250);
+  }, 4400);
+}
 
 // ---------- Toast System ----------
 
@@ -253,9 +642,14 @@ async function ensureCover(game) {
         img.className = slot.dataset.coverClass || 'card-cover-img';
         img.src = dataUrl;
         img.alt = game.name;
+        img.decoding = 'async';
         slot.replaceWith(img);
         img.dataset.coverLoaded = String(game.game_id);
       });
+      const cached = cardDomCache.get(game.game_id);
+      if (cached && cached.sig.endsWith('|0')) {
+        cached.sig = `${cached.sig.slice(0, -2)}|1`;
+      }
     }
   } catch {
     state.coverCache.set(game.game_id, null);
@@ -265,21 +659,50 @@ async function ensureCover(game) {
 }
 
 // ---------- Steam 3D Perspective Tilt ----------
+// Same math/vars as the web UI (client/js/views/library.js). The only difference is
+// rAF throttling + a cached rect: identical rendered result, fewer webview repaints.
 
 function attachSteamTilt(card) {
   const MAX_TILT_X = 7;
   const MAX_TILT_Y = 8;
-  card.addEventListener('pointermove', (e) => {
-    const rect = card.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
-    const px = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    const py = ((e.clientY - rect.top) / rect.height) * 2 - 1;
-    card.style.setProperty('--rx', `${(-py * MAX_TILT_X).toFixed(2)}deg`);
-    card.style.setProperty('--ry', `${(px * MAX_TILT_Y).toFixed(2)}deg`);
-    card.style.setProperty('--gx', `${(((e.clientX - rect.left) / rect.width) * 100).toFixed(1)}%`);
-    card.style.setProperty('--gy', `${(((e.clientY - rect.top) / rect.height) * 100).toFixed(1)}%`);
+  let rect = null;
+  let latest = null;
+  let frame = 0;
+  let lastVars = null;
+
+  card.addEventListener('pointerenter', () => {
+    rect = card.getBoundingClientRect();
+    lastVars = null;
   });
+
+  card.addEventListener('pointermove', (e) => {
+    latest = e;
+    if (frame) return;
+    frame = requestAnimationFrame(() => {
+      frame = 0;
+      if (!latest || !rect || !rect.width || !rect.height) return;
+      const px = ((latest.clientX - rect.left) / rect.width) * 2 - 1; // -1..1
+      const py = ((latest.clientY - rect.top) / rect.height) * 2 - 1; // -1..1
+      const rx = (-py * MAX_TILT_X).toFixed(2);
+      const ry = (px * MAX_TILT_Y).toFixed(2);
+      const gx = (((latest.clientX - rect.left) / rect.width) * 100).toFixed(1);
+      const gy = (((latest.clientY - rect.top) / rect.height) * 100).toFixed(1);
+      const nextVars = `${rx}|${ry}|${gx}|${gy}`;
+      if (nextVars === lastVars) return;
+      lastVars = nextVars;
+      card.style.setProperty('--rx', `${rx}deg`);
+      card.style.setProperty('--ry', `${ry}deg`);
+      card.style.setProperty('--gx', `${gx}%`);
+      card.style.setProperty('--gy', `${gy}%`);
+    });
+  });
+
   card.addEventListener('pointerleave', () => {
+    if (frame) cancelAnimationFrame(frame);
+    frame = 0;
+    latest = null;
+    rect = null;
+    lastVars = null;
     card.style.removeProperty('--rx');
     card.style.removeProperty('--ry');
     card.style.removeProperty('--gx');
@@ -432,11 +855,26 @@ function attachStatTicker(card, stats, intervalMs = 2000) {
       syncTimer();
     }
   });
+  card.addEventListener('card-reset', () => {
+    hovered = false;
+    focused = false;
+    syncTimer();
+  });
 }
 
 // ---------- Topbar Navigation & Status ----------
 
+function syncFabVisibility() {
+  if (!fabUploadEl) return;
+  fabUploadEl.hidden = !(state.view === 'library' && Boolean(state.activeProfile));
+}
+
 function initTopbarNav() {
+  if (fabUploadEl) {
+    fabUploadEl.innerHTML = icon('plus', 26);
+    fabUploadEl.addEventListener('click', () => navigate('upload'));
+  }
+
   document.getElementById('brand-logo')?.addEventListener('click', (e) => {
     e.preventDefault();
     navigate('library');
@@ -481,13 +919,53 @@ function updateNavState() {
   navDlPill.textContent = allPaused ? `${count} paused` : `${pct}%`;
 }
 
+function activityIconName(kind) {
+  switch (kind) {
+    case 'game_start':
+      return 'play';
+    case 'game_close':
+      return 'clock';
+    case 'sync_complete':
+      return 'check';
+    case 'sync_offline':
+      return 'wifi-off';
+    case 'sync_error':
+      return 'alert-triangle';
+    case 'crash_detected':
+    case 'crash_resolved':
+      return 'alert-triangle';
+    case 'safe_shutdown':
+      return 'shield-check';
+    default:
+      return 'refresh-cw';
+  }
+}
+
+function renderActivityItemHtml(entry) {
+  const level = entry.level || 'info';
+  const iconName = activityIconName(entry.kind);
+  return `
+    <div class="activity-item level-${esc(level)}" data-log-id="${esc(entry.id)}">
+      <span class="activity-icon">${icon(iconName, 14)}</span>
+      <div class="activity-body">
+        <div class="activity-top-row">
+          <span class="activity-title">${esc(entry.title || 'Event')}</span>
+          <span class="activity-time">${esc(humanRelativeDate(entry.created_at))}</span>
+        </div>
+        ${entry.detail ? `<div class="activity-detail">${esc(entry.detail)}</div>` : ''}
+      </div>
+    </div>
+  `;
+}
+
 function renderStatusStrip() {
   const active = state.activeProfile;
+  // User first (with their avatar chip), instance label second.
   const chipInner = active
-    ? esc(monogram(active.label || active.username))
-    : icon('server', 13);
-  const labelText = active ? active.label : 'Connect instance';
-  const subText = active ? `@${active.username}` : 'Sign in';
+    ? pfpSlotHtml(active.id, active.user_id, state.currentUser?.pfp, 'profile-avatar-chip', active.username || active.label)
+    : `<span class="profile-avatar-chip">${icon('server', 13)}</span>`;
+  const labelText = active ? active.username : 'Connect instance';
+  const subText = active ? active.label : 'Sign in';
 
   let menuHtml = '';
   if (state.profileMenuOpen) {
@@ -495,7 +973,8 @@ function renderStatusStrip() {
       const isCurrent = active && p.id === active.id;
       return `
         <button type="button" class="profile-menu-item ${isCurrent ? 'active' : ''}" data-switch-profile="${esc(p.id)}">
-          <div>
+          ${pfpSlotHtml(p.id, p.user_id, isCurrent ? state.currentUser?.pfp : null, 'profile-menu-avatar', p.username)}
+          <div class="profile-menu-body">
             <div class="profile-menu-name">${esc(p.label)}</div>
             <div class="profile-menu-url">@${esc(p.username)} ${esc(p.server_url)}</div>
           </div>
@@ -508,11 +987,18 @@ function renderStatusStrip() {
       <div class="profile-menu" role="menu">
         ${items || '<div class="small muted" style="padding:8px 10px;">No saved instances yet.</div>'}
         <div class="profile-menu-sep"></div>
+        <button type="button" class="profile-menu-item" id="btn-menu-profile">
+          <span style="display:inline-flex;align-items:center;gap:8px;">${icon('user', 15)}<span>Profile &amp; avatar</span></span>
+        </button>
         <button type="button" class="profile-menu-item" id="btn-menu-add-profile">
           <span style="display:inline-flex;align-items:center;gap:8px;">${icon('plus', 15)}<span>Add instance</span></span>
         </button>
         <button type="button" class="profile-menu-item" id="btn-menu-manage-profiles">
           <span style="display:inline-flex;align-items:center;gap:8px;">${icon('settings', 15)}<span>Manage instances</span></span>
+        </button>
+        <div class="profile-menu-sep"></div>
+        <button type="button" class="profile-menu-item" id="btn-menu-safe-shutdown">
+          <span style="display:inline-flex;align-items:center;gap:8px;">${icon('shield-check', 15)}<span>Safe quit launcher</span></span>
         </button>
       </div>
     `;
@@ -520,7 +1006,7 @@ function renderStatusStrip() {
 
   profileSwitcherEl.innerHTML = `
     <button type="button" class="profile-trigger" id="btn-profile-dropdown" aria-expanded="${state.profileMenuOpen}">
-      <span class="profile-avatar-chip">${chipInner}</span>
+      ${chipInner}
       <span class="profile-trigger-meta">
         <span class="profile-trigger-label">${esc(labelText)}</span>
         <span class="profile-trigger-sub">${esc(subText)}</span>
@@ -532,6 +1018,7 @@ function renderStatusStrip() {
 
   document.getElementById('btn-profile-dropdown')?.addEventListener('click', (e) => {
     e.stopPropagation();
+    state.activityMenuOpen = false;
     state.profileMenuOpen = !state.profileMenuOpen;
     renderStatusStrip();
   });
@@ -552,6 +1039,13 @@ function renderStatusStrip() {
     });
   });
 
+  document.getElementById('btn-menu-profile')?.addEventListener('click', async () => {
+    state.profileMenuOpen = false;
+    renderStatusStrip();
+    await refreshCurrentUser();
+    navigate('profile');
+  });
+
   document.getElementById('btn-menu-add-profile')?.addEventListener('click', () => {
     state.profileMenuOpen = false;
     renderStatusStrip();
@@ -561,7 +1055,13 @@ function renderStatusStrip() {
   document.getElementById('btn-menu-manage-profiles')?.addEventListener('click', () => {
     state.profileMenuOpen = false;
     renderStatusStrip();
-    navigate('profiles');
+    navigate('settings');
+  });
+
+  document.getElementById('btn-menu-safe-shutdown')?.addEventListener('click', async () => {
+    state.profileMenuOpen = false;
+    renderStatusStrip();
+    await triggerSafeShutdownRequest();
   });
 
   // Connection & pending sync indicators
@@ -593,14 +1093,103 @@ function renderStatusStrip() {
     ? `<button type="button" class="btn btn-sm" id="btn-reconnect-now" ${state.reconnecting ? 'disabled' : ''}>${icon('refresh-cw', 13, state.reconnecting ? 'spin' : '')}<span>Reconnect</span></button>`
     : '';
 
+  const runningUploads = activeUploads();
+  const uploadPillHtml = runningUploads.length
+    ? (() => {
+        const job = runningUploads[0];
+        const pct = job.total_bytes > 0 ? Math.min(100, Math.round((job.bytes_uploaded / job.total_bytes) * 100)) : 0;
+        const paused = job.stage === 'paused';
+        return `<button type="button" class="topbar-upload-pill${paused ? ' is-paused' : ''}" id="btn-upload-pill" title="View upload progress">
+          ${icon('arrow-down', 13)}
+          <span>${runningUploads.length > 1 ? `${runningUploads.length} uploads` : `Uploading ${pct}%`}</span>
+        </button>`;
+      })()
+    : '';
+
+  const isSyncing = state.syncingGameIds.size > 0;
+  const logCount = state.activityLogs.length;
+  const activityDrawerHtml = state.activityMenuOpen
+    ? `
+      <div class="activity-drawer" role="dialog" aria-label="Sync and launch activity log">
+        <div class="activity-drawer-header">
+          <span class="activity-drawer-title">
+            ${isSyncing ? `<span class="spin-icon">${icon('refresh-cw', 14)}</span>` : icon('clock', 14)}
+            <span>Sync &amp; Launch Log</span>
+          </span>
+          <div class="activity-drawer-actions">
+            ${logCount > 0 ? `<button type="button" class="btn btn-ghost btn-sm" id="btn-clear-activity-log" style="padding:3px 8px;font-size:11.5px;">Clear</button>` : ''}
+          </div>
+        </div>
+        <div class="activity-list">
+          ${logCount > 0
+            ? state.activityLogs.slice(0, 35).map(renderActivityItemHtml).join('')
+            : '<div class="activity-empty">No game launches or save syncs recorded in this session yet.</div>'}
+        </div>
+        <div class="activity-drawer-footer">
+          <span class="small faint">${state.playingGameIds.size > 0 ? `${state.playingGameIds.size} game running · auto-sync on exit` : 'Auto-syncs saves on game close'}</span>
+          <button type="button" class="btn btn-sm" id="btn-drawer-safe-shutdown" style="padding:4px 10px;font-size:11.5px;">
+            ${icon('shield-check', 13)}<span>Safe Quit</span>
+          </button>
+        </div>
+      </div>
+    `
+    : '';
+
+  const activityWrapHtml = state.activeProfile
+    ? `
+      <div class="activity-log-wrap" id="activity-log-wrap">
+        <button type="button" class="activity-trigger${state.activityMenuOpen ? ' is-open' : ''}${isSyncing ? ' is-syncing' : ''}" id="btn-activity-log" aria-expanded="${state.activityMenuOpen}" title="View save sync & game launch log">
+          ${isSyncing ? `<span class="spin-icon">${icon('refresh-cw', 13)}</span>` : icon('clock', 13)}
+          <span>${isSyncing ? 'Syncing saves…' : 'Activity'}</span>
+          ${logCount > 0 ? `<span class="activity-count-pill">${logCount}</span>` : ''}
+        </button>
+        ${activityDrawerHtml}
+      </div>
+    `
+    : '';
+
   statusRightEl.innerHTML = `
+    ${uploadPillHtml}
     ${pendingHtml}
+    ${activityWrapHtml}
     <div class="status-pill ${conn === 'connected' ? 'is-online' : ''}" title="${state.activeProfile ? esc(state.activeProfile.server_url) : 'Not connected'}">
       <span class="status-dot ${connDotClass}"></span>
       <span>${esc(connLabel)}</span>
     </div>
     ${reconnectBtn}
   `;
+
+  document.getElementById('btn-upload-pill')?.addEventListener('click', () => navigate('upload'));
+
+  document.getElementById('btn-activity-log')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    state.profileMenuOpen = false;
+    state.activityMenuOpen = !state.activityMenuOpen;
+    renderStatusStrip();
+  });
+
+  document.getElementById('activity-log-wrap')?.querySelector('.activity-drawer')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+  });
+
+  document.getElementById('btn-clear-activity-log')?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    try {
+      await bridge.clearActivityLogs?.();
+      state.activityLogs = [];
+      renderStatusStrip();
+      if (state.view === 'game-detail') renderGameDetailView();
+    } catch (err) {
+      showToast(String(err?.message || err), 'danger', 'alert-triangle');
+    }
+  });
+
+  document.getElementById('btn-drawer-safe-shutdown')?.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    state.activityMenuOpen = false;
+    renderStatusStrip();
+    await triggerSafeShutdownRequest();
+  });
 
   document.getElementById('btn-reconnect-now')?.addEventListener('click', async () => {
     state.reconnecting = true;
@@ -633,8 +1222,9 @@ function renderStatusStrip() {
 }
 
 document.addEventListener('click', () => {
-  if (state.profileMenuOpen) {
+  if (state.profileMenuOpen || state.activityMenuOpen) {
     state.profileMenuOpen = false;
+    state.activityMenuOpen = false;
     renderStatusStrip();
   }
 });
@@ -648,8 +1238,17 @@ function destroyWaveforms() {
   activeWaveforms.clear();
 }
 
+function destroyUploadWaveforms() {
+  for (const wf of activeUploadWaveforms.values()) {
+    wf.destroy();
+  }
+  activeUploadWaveforms.clear();
+}
+
 function navigate(nextView, opts = {}) {
+  closeCssSelect();
   destroyWaveforms();
+  if (nextView !== 'upload') destroyUploadWaveforms();
   state.view = nextView;
   if (opts.gameId != null) {
     state.selectedGameId = opts.gameId;
@@ -662,11 +1261,7 @@ function renderCurrentView(animate = false) {
   if (state.view !== 'downloads') {
     destroyWaveforms();
   }
-  if (animate) {
-    viewEl.classList.remove('view-switch');
-    void viewEl.offsetWidth;
-    viewEl.classList.add('view-switch');
-  }
+  viewEl.classList.remove('view-switch');
 
   switch (state.view) {
     case 'library':
@@ -678,14 +1273,23 @@ function renderCurrentView(animate = false) {
     case 'downloads':
       renderDownloadsView();
       break;
-    case 'proton':
-      renderProtonView();
+    case 'settings':
+      renderSettingsView();
       break;
-    case 'profiles':
-      renderProfilesView();
+    case 'profile':
+      renderProfileView();
+      break;
+    case 'upload':
+      renderUploadView();
       break;
     default:
       renderLibraryView();
+  }
+
+  syncFabVisibility();
+  if (animate) {
+    void viewEl.offsetWidth;
+    viewEl.classList.add('view-switch');
   }
 
   gamepadCtrl?.onViewRendered();
@@ -700,27 +1304,16 @@ function findActiveDownloadForGame(gameId) {
   ) || null;
 }
 
-function renderLibraryView() {
-  // First-run experience mirrors OpenSync Web's clean #/login card directly
-  if (!state.activeProfile) {
-    viewEl.innerHTML = `
-      <div class="auth-wrap panel">
-        <img class="auth-logo" src="img/opensync.png" alt="OpenSync" />
-        <p class="auth-tagline">LAN game archive and save sync</p>
-        <div id="first-run-connect-host"></div>
-      </div>
-    `;
-    mountConnectForm(document.getElementById('first-run-connect-host'), {
-      fullWidthSubmit: true,
-      onSuccess: async () => {
-        await refreshAll();
-        navigate('library');
-      },
-    });
-    return;
+function ensureLibraryShell() {
+  const profileId = state.activeProfile?.id || '';
+  if (libViewShell && libViewShell.dataset.profileId === profileId) {
+    return libViewShell;
   }
-
-  viewEl.innerHTML = `
+  cardDomCache.clear();
+  const root = document.createElement('div');
+  root.className = 'lib-view-root';
+  root.dataset.profileId = profileId;
+  root.innerHTML = `
     <div class="lib-header">
       <h1 class="page-title">game library</h1>
       <div class="lib-header-controls">
@@ -737,21 +1330,31 @@ function renderLibraryView() {
             <button type="button" role="tab" class="${state.filterMode === 'installed' ? 'active' : ''}" data-filter="installed">Installed</button>
           </div>
 
-          <select class="select" id="lib-sort" aria-label="Sort games">
-            <option value="recent" ${state.sortBy === 'recent' ? 'selected' : ''}>Recently played</option>
-            <option value="newest" ${state.sortBy === 'newest' ? 'selected' : ''}>Newest first</option>
-            <option value="name" ${state.sortBy === 'name' ? 'selected' : ''}>Name A–Z</option>
-            <option value="size" ${state.sortBy === 'size' ? 'selected' : ''}>Largest first</option>
-          </select>
+          <div id="lib-sort-host"></div>
         </div>
       </div>
     </div>
     <div id="lib-grid-host"></div>
   `;
 
-  const searchInput = document.getElementById('lib-search');
-  const clearBtn = document.getElementById('lib-search-clear');
-  const sortSelect = document.getElementById('lib-sort');
+  const searchInput = root.querySelector('#lib-search');
+  const clearBtn = root.querySelector('#lib-search-clear');
+
+  libSortControl = createCssSelect({
+    ariaLabel: 'Sort games',
+    value: state.sortBy,
+    options: [
+      { value: 'recent', label: 'Recently played' },
+      { value: 'newest', label: 'Newest first' },
+      { value: 'name', label: 'Name A–Z' },
+      { value: 'size', label: 'Largest first' },
+    ],
+    onChange: (v) => {
+      state.sortBy = v;
+      renderLibraryGrid();
+    },
+  });
+  root.querySelector('#lib-sort-host').appendChild(libSortControl.element);
 
   searchInput.addEventListener('input', () => {
     state.searchQuery = searchInput.value;
@@ -767,20 +1370,60 @@ function renderLibraryView() {
     searchInput.focus();
   });
 
-  sortSelect.addEventListener('change', () => {
-    state.sortBy = sortSelect.value;
-    renderLibraryGrid();
-  });
-
-  viewEl.querySelectorAll('[data-filter]').forEach((btn) => {
+  root.querySelectorAll('[data-filter]').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.filterMode = btn.dataset.filter;
-      viewEl.querySelectorAll('[data-filter]').forEach((b) =>
+      root.querySelectorAll('[data-filter]').forEach((b) =>
         b.classList.toggle('active', b.dataset.filter === state.filterMode),
       );
       renderLibraryGrid();
     });
   });
+
+  libViewShell = root;
+  return root;
+}
+
+function renderLibraryView() {
+  syncFabVisibility();
+  // First-run experience mirrors OpenSync Web's clean #/login card directly
+  if (!state.activeProfile) {
+    libViewShell = null;
+    cardDomCache.clear();
+    viewEl.innerHTML = `
+      <div class="auth-wrap panel">
+        <img class="auth-logo" src="img/opensync-auth-2x.png" srcset="img/opensync-auth-1x.png 1x, img/opensync-auth-2x.png 2x, img/opensync-auth-3x.png 3x" width="146" alt="OpenSync" />
+        <p class="auth-tagline">LAN game archive and save sync</p>
+        <div id="first-run-connect-host"></div>
+      </div>
+    `;
+    mountConnectForm(document.getElementById('first-run-connect-host'), {
+      fullWidthSubmit: true,
+      onSuccess: async () => {
+        await refreshAll();
+        navigate('library');
+      },
+    });
+    return;
+  }
+
+  const shell = ensureLibraryShell();
+  if (viewEl.firstElementChild !== shell) {
+    viewEl.replaceChildren(shell);
+  }
+
+  const searchInput = shell.querySelector('#lib-search');
+  const clearBtn = shell.querySelector('#lib-search-clear');
+  if (searchInput && searchInput.value !== state.searchQuery) {
+    searchInput.value = state.searchQuery;
+  }
+  if (clearBtn) {
+    clearBtn.hidden = !state.searchQuery.trim();
+  }
+  shell.querySelectorAll('[data-filter]').forEach((b) =>
+    b.classList.toggle('active', b.dataset.filter === state.filterMode),
+  );
+  libSortControl?.set(state.sortBy);
 
   renderLibraryGrid();
 }
@@ -838,8 +1481,16 @@ function renderLibraryGrid() {
     return;
   }
 
-  const grid = document.createElement('div');
-  grid.className = 'game-grid';
+  let grid = host.firstElementChild?.classList?.contains('game-grid')
+    ? host.firstElementChild
+    : null;
+  if (!grid) {
+    grid = document.createElement('div');
+    grid.className = 'game-grid';
+  }
+
+  const nextCards = [];
+  const sigParts = [];
 
   for (const g of items) {
     const isPlaying = state.playingGameIds.has(g.game_id);
@@ -848,11 +1499,42 @@ function renderLibraryGrid() {
     const dlPct = dl && dl.total_bytes > 0
       ? Math.min(100, Math.round((dl.bytes_downloaded / dl.total_bytes) * 100))
       : 0;
-
     const coverUrl = state.coverCache.get(g.game_id);
+    const sig = [
+      g.game_id,
+      g.name,
+      g.total_size,
+      g.download_count,
+      g.uploader_name || '',
+      g.installed ? 1 : 0,
+      g.has_overlay ? 1 : 0,
+      g.pending_sync ? 1 : 0,
+      g.last_synced_at || '',
+      g.playtime?.total_secs || 0,
+      g.playtime?.session_count || 0,
+      g.playtime?.last_played_at || '',
+      isPlaying ? 1 : 0,
+      isSyncing ? 1 : 0,
+      dl ? `${dl.stage}:${dlPct}:${dl.paused ? 1 : 0}` : '',
+      coverUrl ? 1 : 0,
+    ].join('|');
+    sigParts.push(sig);
+
+    const cached = cardDomCache.get(g.game_id);
+    if (cached && cached.sig === sig) {
+      cached.card.classList.remove('gp-focused');
+      cached.card.style.removeProperty('--rx');
+      cached.card.style.removeProperty('--ry');
+      cached.card.style.removeProperty('--gx');
+      cached.card.style.removeProperty('--gy');
+      cached.card.dispatchEvent(new Event('card-reset'));
+      nextCards.push(cached.card);
+      continue;
+    }
+
     let coverHtml;
     if (coverUrl) {
-      coverHtml = `<img class="card-cover-img" src="${coverUrl}" alt="${esc(g.name)}" loading="lazy" />`;
+      coverHtml = `<img class="card-cover-img" src="${coverUrl}" alt="${esc(g.name)}" loading="lazy" decoding="async" />`;
     } else {
       coverHtml = `
         <div class="card-cover-placeholder" data-cover-game="${g.game_id}" data-cover-class="card-cover-img" aria-hidden="true">
@@ -947,15 +1629,25 @@ function renderLibraryGrid() {
     const actionBtn = card.querySelector('[data-card-action]');
     actionBtn?.addEventListener('click', async (e) => {
       e.stopPropagation();
-      await runCardPrimaryAction(g);
+      const latestGame = state.library.find((x) => x.game_id === g.game_id) || g;
+      await runCardPrimaryAction(latestGame);
     });
 
     attachSteamTilt(card);
     attachStatTicker(card, cardStats, 2000);
-    grid.appendChild(card);
+    cardDomCache.set(g.game_id, { sig, card });
+    nextCards.push(card);
   }
 
-  host.replaceChildren(grid);
+  const gridSig = sigParts.join('||');
+  if (grid.parentElement === host && grid.dataset.gridSig === gridSig) {
+    return;
+  }
+  grid.dataset.gridSig = gridSig;
+  grid.replaceChildren(...nextCards);
+  if (grid.parentElement !== host) {
+    host.replaceChildren(grid);
+  }
 }
 
 async function runCardPrimaryAction(g) {
@@ -976,6 +1668,7 @@ async function runCardPrimaryAction(g) {
 // ---------- View 2: Game Detail ----------
 
 function renderGameDetailView() {
+  const active = state.activeProfile;
   const g = state.library.find((x) => x.game_id === state.selectedGameId);
   if (!g) {
     navigate('library');
@@ -993,7 +1686,7 @@ function renderGameDetailView() {
   if (!coverUrl && g.has_cover) ensureCover(g);
 
   const coverInner = coverUrl
-    ? `<img src="${coverUrl}" alt="${esc(g.name)}" /><span class="cover-zoom-hint">Expand</span>`
+    ? `<img src="${coverUrl}" alt="${esc(g.name)}" decoding="async" /><span class="cover-zoom-hint">Expand</span>`
     : `<div class="card-cover-placeholder" data-cover-game="${g.game_id}" data-cover-class=""><span class="card-cover-monogram">${esc(monogram(g.name))}</span></div>`;
 
   const isWindows = g.binary_kind === 'WindowsPe';
@@ -1034,17 +1727,16 @@ function renderGameDetailView() {
   }
 
   const protonOptions = [
-    `<option value="" ${!g.proton_override ? 'selected' : ''}>${isWindows ? (state.protonInstallations[0] ? `Auto (${esc(state.protonInstallations[0].name)})` : 'Auto (Proton required)') : 'Native Linux (default)'}</option>`,
-    ...state.protonInstallations.map(
-      (p) => `<option value="${esc(p.name)}" ${g.proton_override === p.name ? 'selected' : ''}>${esc(p.name)} (${esc(protonSourceLabel(p.source))})</option>`,
-    ),
-  ].join('');
+    { value: '', label: isWindows ? (state.protonInstallations[0] ? `Auto (${state.protonInstallations[0].name})` : 'Auto (Proton required)') : 'Native Linux (default)' },
+    ...state.protonInstallations.map((p) => ({ value: p.name, label: `${p.name} (${protonSourceLabel(p.source)})` })),
+  ];
 
   const exeOptions = (g.discovered_executables || []).length
-    ? g.discovered_executables.map(
-        (ex) => `<option value="${esc(ex.rel_path)}" ${g.executable_rel_path === ex.rel_path ? 'selected' : ''}>${esc(ex.rel_path)} (${ex.kind === 'WindowsPe' ? 'Windows PE' : ex.kind === 'LinuxElf' ? 'Linux ELF' : 'Script'})</option>`,
-      ).join('')
-    : `<option value="">${g.installed ? (g.executable_rel_path || 'Auto-detect on launch') : 'Available after installation'}</option>`;
+    ? g.discovered_executables.map((ex) => ({
+        value: ex.rel_path,
+        label: `${ex.rel_path} (${ex.kind === 'WindowsPe' ? 'Windows PE' : ex.kind === 'LinuxElf' ? 'Linux ELF' : 'Script'})`,
+      }))
+    : [{ value: '', label: g.installed ? (g.executable_rel_path || 'Auto-detect on launch') : 'Available after installation' }];
 
   const req = parseSystemRequirements(g.system_requirements);
   const reqHtml = req.pairs.length
@@ -1081,7 +1773,7 @@ function renderGameDetailView() {
           ${syncBadge}
           ${runtimeBadge}
           <span class="badge">${icon('hard-drive', 12)}${esc(humanBytes(g.total_size))}</span>
-          ${g.uploader_name ? `<span class="badge">${icon('user', 12)}@${esc(g.uploader_name)}</span>` : ''}
+          ${g.uploader_name ? `<span class="badge uploader-badge">${pfpSlotHtml(active?.id, g.uploaded_by, g.uploader_pfp, 'uploader-avatar', g.uploader_name)}<span>@${esc(g.uploader_name)}</span></span>` : ''}
         </div>
 
         <div class="game-detail-actions">
@@ -1119,16 +1811,12 @@ function renderGameDetailView() {
           </div>
         ` : ''}
         <div class="field">
-          <label for="detail-proton-select">Compatibility runtime</label>
-          <select id="detail-proton-select" class="select" ${!g.installed ? 'disabled' : ''}>
-            ${protonOptions}
-          </select>
+          <label>Compatibility runtime</label>
+          <div id="detail-proton-host"></div>
         </div>
         <div class="field" style="margin-bottom:0;">
-          <label for="detail-exe-select">Launch executable</label>
-          <select id="detail-exe-select" class="select" ${!g.installed || !(g.discovered_executables || []).length ? 'disabled' : ''}>
-            ${exeOptions}
-          </select>
+          <label>Launch executable</label>
+          <div id="detail-exe-host"></div>
         </div>
       </section>
 
@@ -1142,6 +1830,17 @@ function renderGameDetailView() {
       <h2>About</h2>
       <p>${esc(g.description || 'No description provided for this game yet.')}</p>
       ${g.install_dir ? `<p class="small muted" style="margin-top:12px;">Install folder: <code>${esc(g.install_dir)}</code></p>` : ''}
+    </section>
+
+    <section class="panel">
+      <h2>Sync &amp; launch activity</h2>
+      ${(() => {
+        const gameLogs = state.activityLogs.filter((l) => l.game_id === g.game_id).slice(0, 8);
+        if (!gameLogs.length) {
+          return '<p class="small muted">No launch or save sync events recorded for this game yet. Saves auto-sync every time the game closes.</p>';
+        }
+        return `<div class="activity-list" style="max-height:240px;padding:0;">${gameLogs.map(renderActivityItemHtml).join('')}</div>`;
+      })()}
     </section>
   `;
 
@@ -1184,27 +1883,41 @@ function renderGameDetailView() {
     await quickInstallLatestGeProton();
   });
 
-  document.getElementById('detail-proton-select')?.addEventListener('change', async (e) => {
-    const val = e.target.value || null;
-    try {
-      await bridge.setGameProton(g.game_id, val);
-      g.proton_override = val;
-      showToast(val ? `Runtime set to ${val}` : 'Runtime reset to automatic', 'accent', 'cpu');
-    } catch (err) {
-      showToast(String(err?.message || err), 'danger', 'alert-triangle');
-    }
+  const protonSelect = createCssSelect({
+    ariaLabel: 'Compatibility runtime',
+    value: g.proton_override || '',
+    options: protonOptions,
+    disabled: !g.installed,
+    onChange: async (val) => {
+      const next = val || null;
+      try {
+        await bridge.setGameProton(g.game_id, next);
+        g.proton_override = next;
+        showToast(next ? `Runtime set to ${next}` : 'Runtime reset to automatic', 'accent', 'cpu');
+      } catch (err) {
+        showToast(String(err?.message || err), 'danger', 'alert-triangle');
+      }
+    },
   });
+  document.getElementById('detail-proton-host')?.appendChild(protonSelect.element);
 
-  document.getElementById('detail-exe-select')?.addEventListener('change', async (e) => {
-    const val = e.target.value || null;
-    try {
-      await bridge.setGameExecutable(g.game_id, val);
-      g.executable_rel_path = val;
-      showToast('Launch executable updated', 'accent', 'check');
-    } catch (err) {
-      showToast(String(err?.message || err), 'danger', 'alert-triangle');
-    }
+  const exeSelect = createCssSelect({
+    ariaLabel: 'Launch executable',
+    value: g.executable_rel_path || '',
+    options: exeOptions,
+    disabled: !g.installed || !(g.discovered_executables || []).length,
+    onChange: async (val) => {
+      const next = val || null;
+      try {
+        await bridge.setGameExecutable(g.game_id, next);
+        g.executable_rel_path = next;
+        showToast('Launch executable updated', 'accent', 'check');
+      } catch (err) {
+        showToast(String(err?.message || err), 'danger', 'alert-triangle');
+      }
+    },
   });
+  document.getElementById('detail-exe-host')?.appendChild(exeSelect.element);
 }
 
 // ---------- View 3: Download Manager (60fps Waveform) ----------
@@ -1220,32 +1933,35 @@ const BW_PRESETS = [
 function renderDownloadsView() {
   destroyWaveforms();
 
-  const bwOptions = BW_PRESETS.map(
-    (p) => `<option value="${p.bps}" ${state.bandwidthLimitBps === p.bps ? 'selected' : ''}>${esc(p.label)}</option>`,
-  ).join('');
-
   viewEl.innerHTML = `
     <div class="page-header-row">
       <h1 class="page-title">downloads</h1>
       <div class="bw-control">
-        <label for="dl-bw-select">Bandwidth limit</label>
-        <select id="dl-bw-select" class="select">${bwOptions}</select>
+        <label>Bandwidth limit</label>
+        <div id="dl-bw-host"></div>
       </div>
     </div>
     <div id="dl-list-host"></div>
   `;
 
-  document.getElementById('dl-bw-select')?.addEventListener('change', async (e) => {
-    const bps = Number(e.target.value || 0);
-    state.bandwidthLimitBps = bps;
-    try {
-      await bridge.setBandwidthLimit(bps);
-      const match = BW_PRESETS.find((p) => p.bps === bps);
-      showToast(`Bandwidth cap set to ${match ? match.label : humanSpeed(bps)}`, 'accent', 'settings');
-    } catch (err) {
-      showToast(String(err?.message || err), 'danger', 'alert-triangle');
-    }
-  });
+  document.getElementById('dl-bw-host')?.appendChild(
+    createCssSelect({
+      ariaLabel: 'Bandwidth limit',
+      value: String(state.bandwidthLimitBps),
+      options: BW_PRESETS.map((p) => ({ value: String(p.bps), label: p.label })),
+      onChange: async (value) => {
+        const bps = Number(value || 0);
+        state.bandwidthLimitBps = bps;
+        try {
+          await bridge.setBandwidthLimit(bps);
+          const match = BW_PRESETS.find((p) => p.bps === bps);
+          showToast(`Bandwidth cap set to ${match ? match.label : humanSpeed(bps)}`, 'accent', 'settings');
+        } catch (err) {
+          showToast(String(err?.message || err), 'danger', 'alert-triangle');
+        }
+      },
+    }).element,
+  );
 
   syncDownloadsListDom();
 }
@@ -1388,7 +2104,7 @@ function patchDownloadCard(card, job) {
         });
       } else if (isCompleted) {
         ctrlEl.innerHTML = `<button type="button" class="btn btn-sm" data-dl-proton>${icon('cpu', 14)}<span>Open Proton</span></button>`;
-        ctrlEl.querySelector('[data-dl-proton]')?.addEventListener('click', () => navigate('proton'));
+        ctrlEl.querySelector('[data-dl-proton]')?.addEventListener('click', () => navigate('settings'));
       } else if (isVerifying) {
         ctrlEl.innerHTML = `<button type="button" class="btn btn-sm" disabled>${icon('shield-check', 14)}<span>Verifying</span></button>`;
       } else if (isPaused) {
@@ -1459,9 +2175,654 @@ function syncDownloadsListDom() {
   }
 }
 
-// ---------- View 4: Proton & Compatibility ----------
+// ---------- View 3b: Upload a game ----------
 
-function renderProtonView() {
+const UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
+
+function normalizeUploadJob(raw) {
+  if (!raw) return null;
+  const stage = String(raw.status?.state ?? raw.stage ?? 'queued').toLowerCase();
+  const bps = Number(raw.bytes_per_sec || 0);
+  const remaining = Math.max(0, Number(raw.total_bytes || 0) - Number(raw.bytes_uploaded || 0));
+  return {
+    job_id: raw.id || raw.job_id,
+    name: raw.name || 'Upload',
+    game_id: raw.game_id ?? null,
+    stage,
+    error: raw.status?.error ?? raw.error ?? null,
+    bytes_uploaded: Number(raw.bytes_uploaded || 0),
+    total_bytes: Number(raw.total_bytes || 0),
+    files_uploaded: Number(raw.files_uploaded || 0),
+    total_files: Number(raw.total_files || 0),
+    current_file: raw.current_file || null,
+    bytes_per_sec: bps,
+    speed_samples: Array.isArray(raw.speed_samples) ? raw.speed_samples : [],
+    eta_secs: stage === 'uploading' && bps > 0 ? Math.ceil(remaining / bps) : null,
+  };
+}
+
+function activeUploads() {
+  return state.uploads.filter(
+    (j) => j.stage === 'queued' || j.stage === 'uploading' || j.stage === 'paused' || j.stage === 'indexing',
+  );
+}
+
+function uploadPhaseLabel(job) {
+  switch (job.stage) {
+    case 'queued': return 'Queued';
+    case 'uploading': return 'Uploading chunks';
+    case 'indexing': return 'Indexing files';
+    case 'paused': return 'Paused';
+    case 'ready': return 'Ready';
+    case 'cancelled': return 'Cancelled';
+    case 'failed': return 'Failed';
+    default: return job.stage;
+  }
+}
+
+function defaultUploadForm() {
+  return {
+    name: '',
+    description: '',
+    requirements: { os: '', cpu: '', ram: '', gpu: '', storage: '' },
+    folderPath: '',
+    files: [],
+    coverDataUrl: '',
+    coverBase64: '',
+    coverContentType: '',
+  };
+}
+
+function requirementsString(reqs) {
+  return Object.entries(reqs || {})
+    .filter(([, v]) => String(v || '').trim())
+    .map(([k, v]) => `${k.toUpperCase()}: ${String(v).trim()}`)
+    .join('\n');
+}
+
+function inferUploadName(pathOrFiles) {
+  if (Array.isArray(pathOrFiles) && pathOrFiles.length) {
+    const seg = String(pathOrFiles[0].webkitRelativePath || pathOrFiles[0].name || '').split('/')[0];
+    return seg ? seg.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim() : '';
+  }
+  const clean = String(pathOrFiles || '').trim().replace(/\/+$/, '');
+  if (!clean) return '';
+  return clean.split(/[\\/]/).pop().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function ensureUploadForm() {
+  if (!state.uploadForm) state.uploadForm = defaultUploadForm();
+  return state.uploadForm;
+}
+
+function renderUploadView() {
+  const form = ensureUploadForm();
+  const connected = Boolean(state.activeProfile);
+  viewEl.innerHTML = `
+    <div class="upload-page">
+      <div class="page-header-row">
+        <h1 class="page-title">upload game</h1>
+        <button type="button" class="btn btn-ghost btn-sm" id="up-back">${icon('arrow-left', 14)}<span>Library</span></button>
+      </div>
+
+      <section class="panel" id="up-form-panel">
+        <div class="folder-dropzone${form.files.length || form.folderPath ? ' has-files' : ''}" id="up-folder-zone" role="button" tabindex="0">
+          <div class="folder-dropzone-icon">${icon('folder', 22)}</div>
+          <div class="folder-dropzone-title">${form.folderPath || form.files.length ? 'Game folder selected' : 'Drop a game folder here, or choose one'}</div>
+          <div class="small muted" id="up-folder-summary">${form.folderPath ? esc(form.folderPath) : 'Preserves folder structure with resumable 4 MB chunked uploads'}</div>
+          <div class="upload-preview-list" id="up-preview-list" ${form.folderPath || form.files.length ? '' : 'hidden'}></div>
+        </div>
+        <div class="upload-path-row">
+          <input type="text" class="input" id="up-folder-path" placeholder="/home/you/Games/MyGame" value="${esc(form.folderPath)}" spellcheck="false" aria-label="Game folder path" />
+          <button type="button" class="btn btn-sm" id="up-folder-browse" ${connected ? '' : 'disabled'}>${icon('folder', 14)}<span>Choose folder</span></button>
+          <button type="button" class="btn btn-sm btn-ghost" id="up-folder-browser" title="Browse using the WebView folder picker">${icon('layout-grid', 14)}<span>Browser</span></button>
+          <button type="button" class="btn btn-sm btn-ghost" id="up-folder-clear">${icon('x', 14)}<span>Clear</span></button>
+        </div>
+        <input type="file" id="up-folder-input" webkitdirectory directory multiple hidden />
+
+        <div class="upload-two-col" style="margin-top:18px;">
+          <div class="field">
+            <label for="up-name">Game name <span style="color:var(--danger);">*</span></label>
+            <input type="text" class="input" id="up-name" placeholder="e.g. Cyber Runner 2077" value="${esc(form.name)}" />
+          </div>
+          <div class="field">
+            <label>Cover image (optional)</label>
+            <div class="cover-picker" id="up-cover-picker" role="button" tabindex="0">
+              ${form.coverDataUrl ? `<img class="cover-preview" src="${form.coverDataUrl}" alt="Cover preview" decoding="async" />` : ''}
+              <span class="muted small" id="up-cover-label">${form.coverDataUrl ? 'Click to replace or drop a JPG/PNG' : 'Click to choose or drop a JPG/PNG'}</span>
+              ${form.coverDataUrl ? `<button type="button" class="btn btn-sm btn-ghost" id="up-cover-remove">Remove</button>` : ''}
+              <input type="file" id="up-cover-input" accept="image/jpeg,image/png" hidden />
+            </div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="up-desc">Description (optional)</label>
+          <textarea class="input" id="up-desc" rows="3" placeholder="Short overview, controls, or install notes">${esc(form.description)}</textarea>
+        </div>
+
+        <details class="req-details" id="up-req-details" ${Object.values(form.requirements).some((v) => String(v || '').trim()) ? 'open' : ''}>
+          <summary>System requirements (optional)</summary>
+          <div class="req-grid">
+            ${['os', 'cpu', 'ram', 'gpu', 'storage'].map((k) => `
+              <div class="field" style="margin-bottom:0;">
+                <label for="up-req-${k}">${k.toUpperCase()}</label>
+                <input type="text" class="input" id="up-req-${k}" value="${esc(form.requirements[k] || '')}" placeholder="${k === 'ram' ? '8 GB' : k === 'storage' ? '20 GB available' : 'e.g. Linux 64-bit'}" />
+              </div>
+            `).join('')}
+          </div>
+        </details>
+
+        <div class="upload-actions" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <button type="button" class="btn btn-primary" id="up-start" ${connected ? '' : 'disabled'}>${icon('arrow-down', 15)}<span>Upload game</span></button>
+          <button type="button" class="btn btn-ghost" id="up-clear">Clear form</button>
+          <span class="small muted" id="up-hint">${connected ? 'Choose a folder or drop files, then enter a game name.' : 'Connect to an instance to upload.'}</span>
+        </div>
+        <div class="form-error" id="up-error" role="alert"></div>
+      </section>
+
+      <section class="panel" id="up-progress-panel" hidden>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+          <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+            <h2 style="margin:0;">Uploading</h2>
+            <span class="upload-phase-badge" id="up-phase"></span>
+            <span class="small muted" id="up-progress-name"></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;" id="up-controls"></div>
+        </div>
+        <div class="upload-progress-track"><div class="upload-progress-fill" id="up-bar"></div></div>
+        <div class="up-stats" id="up-stats"></div>
+        <div class="upload-waveform-box"><canvas class="upload-waveform-canvas" id="up-waveform"></canvas></div>
+        <div class="small muted" id="up-current-file"></div>
+        <div class="form-error" id="up-progress-error" role="alert"></div>
+      </section>
+    </div>
+  `;
+
+  // Navigation
+  document.getElementById('up-back')?.addEventListener('click', () => navigate('library'));
+
+  // Folder selection
+  const pathInput = document.getElementById('up-folder-path');
+  const folderInput = document.getElementById('up-folder-input');
+  const zone = document.getElementById('up-folder-zone');
+  const summary = document.getElementById('up-folder-summary');
+  const preview = document.getElementById('up-preview-list');
+  const nameInput = document.getElementById('up-name');
+
+  function renderFolderPreview() {
+    const hasAny = Boolean(form.folderPath || form.files.length);
+    zone.classList.toggle('has-files', hasAny);
+    preview.hidden = !hasAny;
+    if (!hasAny) {
+      preview.replaceChildren();
+      return;
+    }
+    const items = [];
+    if (form.files.length) {
+      const top = [...form.files]
+        .sort((a, b) => (b.size || 0) - (a.size || 0))
+        .slice(0, 12)
+        .map((f) => `<div class="upload-row-name">${esc(f.webkitRelativePath || f.name)} · ${esc(humanBytes(f.size))}</div>`);
+      items.push(`<div class="small muted" style="margin-bottom:4px;">${form.files.length} files · ${esc(humanBytes(form.files.reduce((s, f) => s + (f.size || 0), 0)))}</div>`, ...top);
+      if (form.files.length > 12) items.push(`<div class="small faint">+ ${form.files.length - 12} more</div>`);
+    } else {
+      items.push(`<div class="small muted">${esc(form.folderPath)}</div>`);
+    }
+    preview.innerHTML = items.join('');
+  }
+  renderFolderPreview();
+
+  function setFolderPath(path) {
+    form.folderPath = String(path || '').trim();
+    form.files = [];
+    pathInput.value = form.folderPath;
+    zone.querySelector('.folder-dropzone-title').textContent = form.folderPath ? 'Game folder selected' : 'Drop a game folder here, or choose one';
+    if (form.folderPath) {
+      summary.textContent = 'Scanning folder…';
+      bridge.scanUploadFolder?.(form.folderPath)
+        .then((scan) => {
+          summary.textContent = `${scan.file_count} files · ${esc(humanBytes(scan.total_bytes))}`;
+          if (!form.name && scan.name) {
+            form.name = scan.name;
+            nameInput.value = form.name;
+          }
+        })
+        .catch(() => {
+          summary.textContent = form.folderPath;
+        });
+    } else {
+      summary.textContent = 'Preserves folder structure with resumable 4 MB chunked uploads';
+    }
+    renderFolderPreview();
+  }
+
+  document.getElementById('up-folder-browse')?.addEventListener('click', async () => {
+    try {
+      const picked = await bridge.pickUploadFolder();
+      if (picked) setFolderPath(picked);
+    } catch (err) {
+      document.getElementById('up-error').textContent = String(err?.message || err);
+    }
+  });
+  document.getElementById('up-folder-browser')?.addEventListener('click', () => folderInput.click());
+
+  document.getElementById('up-folder-clear')?.addEventListener('click', () => {
+    form.folderPath = '';
+    form.files = [];
+    pathInput.value = '';
+    summary.textContent = 'Preserves folder structure with resumable 4 MB chunked uploads';
+    zone.querySelector('.folder-dropzone-title').textContent = 'Drop a game folder here, or choose one';
+    renderFolderPreview();
+  });
+  pathInput.addEventListener('change', () => setFolderPath(pathInput.value));
+
+  folderInput.addEventListener('change', () => {
+    const files = [...(folderInput.files || [])].filter((f) => f.webkitRelativePath);
+    if (!files.length) return;
+    applyDroppedFiles(files);
+  });
+
+  document.getElementById('up-folder-browse')?.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    folderInput.click();
+  });
+
+  let folderDragDepth = 0;
+  zone.addEventListener('dragenter', (e) => {
+    e.preventDefault();
+    folderDragDepth += 1;
+    zone.classList.add('drag-over');
+  });
+  zone.addEventListener('dragover', (e) => e.preventDefault());
+  zone.addEventListener('dragleave', () => {
+    folderDragDepth = Math.max(0, folderDragDepth - 1);
+    if (folderDragDepth === 0) zone.classList.remove('drag-over');
+  });
+  zone.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    folderDragDepth = 0;
+    zone.classList.remove('drag-over');
+    const files = await collectDroppedFiles(e.dataTransfer);
+    if (files.length) applyDroppedFiles(files);
+  });
+  zone.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      document.getElementById('up-folder-browse')?.click();
+    }
+  });
+
+  function applyDroppedFiles(files) {
+    form.files = files;
+    form.folderPath = '';
+    pathInput.value = '';
+    zone.querySelector('.folder-dropzone-title').textContent = 'Game folder selected';
+    summary.textContent = `${files.length} files · ${esc(humanBytes(files.reduce((s, f) => s + (f.size || 0), 0)))}`;
+    if (!form.name) {
+      form.name = inferUploadName(files);
+      nameInput.value = form.name;
+    }
+    renderFolderPreview();
+  }
+
+  // Metadata fields persist across navigation
+  nameInput.addEventListener('input', () => { form.name = nameInput.value; });
+  document.getElementById('up-desc').addEventListener('input', (e) => { form.description = e.target.value; });
+  for (const k of ['os', 'cpu', 'ram', 'gpu', 'storage']) {
+    document.getElementById(`up-req-${k}`).addEventListener('input', (e) => { form.requirements[k] = e.target.value; });
+  }
+
+  // Cover picker
+  const coverInput = document.getElementById('up-cover-input');
+  const coverPicker = document.getElementById('up-cover-picker');
+  const coverLabel = document.getElementById('up-cover-label');
+
+  function applyCover(file) {
+    if (!file) return;
+    if (!/^image\/(jpeg|png)$/.test(file.type)) {
+      document.getElementById('up-error').textContent = 'Cover image must be JPG or PNG.';
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result || '');
+      const comma = text.indexOf(',');
+      form.coverDataUrl = text;
+      form.coverBase64 = comma >= 0 ? text.slice(comma + 1) : text;
+      form.coverContentType = file.type;
+      renderUploadView();
+      document.getElementById('up-name')?.focus();
+    };
+    reader.readAsDataURL(file);
+  }
+  coverInput.addEventListener('change', () => applyCover(coverInput.files?.[0]));
+  coverPicker.addEventListener('click', (e) => {
+    if (e.target.closest('#up-cover-remove')) return;
+    coverInput.click();
+  });
+  coverPicker.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); coverInput.click(); }
+  });
+  document.getElementById('up-cover-remove')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    form.coverDataUrl = '';
+    form.coverBase64 = '';
+    form.coverContentType = '';
+    renderUploadView();
+  });
+  let coverDragDepth = 0;
+  coverPicker.addEventListener('dragenter', (e) => {
+    e.preventDefault();
+    coverDragDepth += 1;
+    coverPicker.classList.add('drag-over');
+  });
+  coverPicker.addEventListener('dragover', (e) => e.preventDefault());
+  coverPicker.addEventListener('dragleave', () => {
+    coverDragDepth = Math.max(0, coverDragDepth - 1);
+    if (coverDragDepth === 0) coverPicker.classList.remove('drag-over');
+  });
+  coverPicker.addEventListener('drop', (e) => {
+    e.preventDefault();
+    coverDragDepth = 0;
+    coverPicker.classList.remove('drag-over');
+    const file = [...(e.dataTransfer?.files || [])].find((f) => /^image\/(jpeg|png)$/.test(f.type));
+    if (file) applyCover(file);
+    else document.getElementById('up-error').textContent = 'Cover image must be JPG or PNG.';
+  });
+
+  // Clear
+  document.getElementById('up-clear')?.addEventListener('click', () => {
+    state.uploadForm = defaultUploadForm();
+    renderUploadView();
+    showToast('Upload form cleared', 'accent', 'x');
+  });
+
+  // Start
+  document.getElementById('up-start')?.addEventListener('click', async () => {
+    const errEl = document.getElementById('up-error');
+    errEl.textContent = '';
+    const name = String(form.name || '').trim();
+    if (!name) {
+      errEl.textContent = 'Game name is required.';
+      document.getElementById('up-name')?.focus();
+      return;
+    }
+    if (!form.folderPath && !form.files.length) {
+      errEl.textContent = 'Choose a game folder or drop files first.';
+      return;
+    }
+    const btn = document.getElementById('up-start');
+    btn.disabled = true;
+    try {
+      const jobId = await bridge.startGameUpload({
+        name,
+        description: form.description,
+        system_requirements: requirementsString(form.requirements),
+        folder: form.folderPath || null,
+        cover: form.coverBase64 || null,
+        cover_content_type: form.coverContentType || null,
+      });
+      if (!form.folderPath && form.files.length) {
+        await uploadDroppedChunks(jobId, form.files);
+      }
+      document.getElementById('up-progress-panel').hidden = false;
+      document.getElementById('up-form-panel').hidden = true;
+      updateUploadPanelForJob(jobId);
+      showToast(`Uploading ${name}`, 'accent', 'arrow-down');
+    } catch (err) {
+      errEl.textContent = String(err?.message || err);
+      btn.disabled = false;
+    }
+  });
+
+  // Restore progress panel when navigating back with an active upload
+  const active = activeUploads()[0];
+  if (active) {
+    document.getElementById('up-form-panel').hidden = true;
+    document.getElementById('up-progress-panel').hidden = false;
+    updateUploadPanelForJob(active.job_id);
+  }
+}
+
+async function collectDroppedFiles(dataTransfer) {
+  const out = [];
+  if (!dataTransfer) return out;
+  const entries = [...dataTransfer.items]
+    .map((item) => item.webkitGetAsEntry?.() || null)
+    .filter(Boolean);
+  async function walk(entry, prefix) {
+    if (entry.isFile) {
+      const file = await new Promise((resolve) => entry.file(resolve, () => resolve(null)));
+      if (!file) return;
+      const rel = prefix ? `${prefix}/${file.name}` : file.name;
+      try { Object.defineProperty(file, 'webkitRelativePath', { value: rel, configurable: true }); } catch { /* keep native */ }
+      out.push(file);
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      let batch;
+      do {
+        batch = await new Promise((resolve) => reader.readEntries(resolve, () => resolve([])));
+        const sub = prefix ? `${prefix}/${entry.name}` : entry.name;
+        for (const child of batch) await walk(child, sub);
+      } while (batch.length > 0);
+    }
+  }
+  if (entries.length) {
+    for (const entry of entries) await walk(entry, '');
+  } else {
+    for (const f of dataTransfer.files || []) {
+      try { Object.defineProperty(f, 'webkitRelativePath', { value: f.name, configurable: true }); } catch { /* keep native */ }
+      out.push(f);
+    }
+  }
+  return out;
+}
+
+async function uploadDroppedChunks(jobId, files) {
+  for (const file of files) {
+    const rel = file.webkitRelativePath || file.name;
+    const total = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK_SIZE));
+    for (let i = 0; i < total; i++) {
+      const start = i * UPLOAD_CHUNK_SIZE;
+      const end = Math.min(file.size, start + UPLOAD_CHUNK_SIZE);
+      const chunk = new Uint8Array(await file.slice(start, end).arrayBuffer());
+      await bridge.uploadGameChunk({
+        job_id: jobId,
+        rel_path: rel,
+        index: i,
+        total,
+        size: file.size,
+        chunk: Array.from(chunk),
+      });
+    }
+  }
+  await bridge.finalizeDroppedUpload(jobId);
+}
+
+function updateUploadPanelForJob(jobId) {
+  const job = state.uploads.find((j) => j.job_id === jobId);
+  const panel = document.getElementById('up-progress-panel');
+  if (!panel || !job) return;
+  const pct = job.total_bytes > 0 ? Math.min(100, (job.bytes_uploaded / job.total_bytes) * 100) : (job.stage === 'ready' ? 100 : 0);
+  const bar = document.getElementById('up-bar');
+  if (bar) bar.style.width = `${pct.toFixed(2)}%`;
+
+  const phase = document.getElementById('up-phase');
+  if (phase) {
+    phase.textContent = uploadPhaseLabel(job);
+    phase.classList.toggle('is-paused', job.stage === 'paused');
+    phase.classList.toggle('is-failed', job.stage === 'failed');
+  }
+  const nameEl = document.getElementById('up-progress-name');
+  if (nameEl) nameEl.textContent = `"${job.name}"`;
+  const statsEl = document.getElementById('up-stats');
+  if (statsEl) {
+    const eta = job.stage === 'uploading' ? humanEta(job.eta_secs) : job.stage === 'indexing' ? 'Building index…' : uploadPhaseLabel(job);
+    statsEl.innerHTML = `
+      <span><span class="num">${pct.toFixed(0)}%</span> · ${esc(humanBytes(job.bytes_uploaded))} of ${esc(humanBytes(job.total_bytes))}</span>
+      <span><span class="num">${job.files_uploaded}/${job.total_files}</span> files</span>
+      <span>${job.stage === 'paused' ? 'Paused' : esc(humanSpeed(job.bytes_per_sec))}</span>
+      <span>${esc(eta)}</span>
+    `;
+  }
+  const fileEl = document.getElementById('up-current-file');
+  if (fileEl) fileEl.textContent = job.current_file ? `Current file: ${job.current_file}` : '';
+  const errEl = document.getElementById('up-progress-error');
+  if (errEl) errEl.textContent = job.error || '';
+
+  const controls = document.getElementById('up-controls');
+  if (controls) {
+    const canPause = job.stage === 'uploading' || job.stage === 'queued' || job.stage === 'indexing';
+    const canResume = job.stage === 'paused';
+    const canCancel = ['queued', 'uploading', 'paused', 'indexing'].includes(job.stage);
+    const mode = `${canPause}|${canResume}|${canCancel}|${job.stage}`;
+    if (controls.dataset.mode !== mode) {
+      controls.dataset.mode = mode;
+      controls.innerHTML = `
+        ${canPause ? `<button type="button" class="btn btn-sm" id="up-pause">${icon('pause', 14)}<span>Pause</span></button>` : ''}
+        ${canResume ? `<button type="button" class="btn btn-sm btn-primary" id="up-resume">${icon('play', 14)}<span>Resume</span></button>` : ''}
+        ${canCancel ? `<button type="button" class="btn btn-sm btn-danger" id="up-cancel">${icon('x', 14)}<span>Cancel</span></button>` : ''}
+      `;
+      document.getElementById('up-pause')?.addEventListener('click', () => bridge.pauseUpload(job.job_id));
+      document.getElementById('up-resume')?.addEventListener('click', () => bridge.resumeUpload(job.job_id));
+      document.getElementById('up-cancel')?.addEventListener('click', () => handleCancelUpload(job.job_id));
+    }
+  }
+
+  let wf = activeUploadWaveforms.get(job.job_id);
+  const canvas = document.getElementById('up-waveform');
+  if (canvas && !wf) {
+    wf = new WaveformCanvas(canvas, job.speed_samples || [], job.stage === 'paused');
+    activeUploadWaveforms.set(job.job_id, wf);
+  }
+  if (wf) wf.update(job.speed_samples || [], job.stage === 'paused', job.stage === 'ready');
+}
+
+async function handleCancelUpload(jobId) {
+  try {
+    await bridge.cancelUpload(jobId);
+    for (const wf of activeUploadWaveforms.values()) wf.destroy();
+    activeUploadWaveforms.clear();
+    state.uploads = state.uploads.filter((j) => j.job_id !== jobId);
+    state.uploadForm = defaultUploadForm();
+    updateNavState();
+    navigate('library');
+    showToast('Upload cancelled', 'warn', 'x');
+  } catch (err) {
+    showToast(String(err?.message || err), 'danger', 'alert-triangle');
+  }
+}
+
+function upsertUploadInState(job) {
+  if (!job || !job.job_id) return null;
+  const idx = state.uploads.findIndex((j) => j.job_id === job.job_id);
+  const prev = idx !== -1 ? state.uploads[idx].stage : null;
+  if (job.stage === 'cancelled') state.uploads.splice(idx, 1);
+  else if (idx !== -1) state.uploads[idx] = job;
+  else state.uploads.unshift(job);
+  return prev;
+}
+
+// ---------- Profile name (server username) ----------
+
+async function saveProfileUsername(value, errorEl) {
+  const username = String(value || '').trim();
+  if (!username) {
+    if (errorEl) errorEl.textContent = 'Profile name cannot be empty.';
+    return false;
+  }
+  if (errorEl) errorEl.textContent = '';
+  try {
+    const profile = await bridge.changeUsername(username);
+    state.activeProfile = profile || state.activeProfile;
+    state.profiles = state.profiles.map((p) => (p.id === profile?.id ? { ...p, ...profile } : p));
+    if (state.currentUser && profile) state.currentUser.username = profile.username;
+    await refreshCurrentUser();
+    renderStatusStrip();
+    renderCurrentView();
+    showToast(`Profile name changed to ${profile?.username || username}`, 'accent', 'check');
+    return true;
+  } catch (err) {
+    if (errorEl) errorEl.textContent = formatAuthError(err);
+    else showToast(formatAuthError(err), 'danger', 'alert-triangle');
+    return false;
+  }
+}
+
+function renderAccountSetting(host) {
+  const username = state.currentUser?.username || state.activeProfile?.username || '';
+  host.innerHTML = `
+    <h2>Account / profile</h2>
+    <p class="small muted">Your <strong>profile name</strong> is your OpenSync account username. It is shown to everyone on this server and used for @mentions and save sync attribution.</p>
+    <div class="settings-dir-row">
+      <input type="text" class="input" id="account-username" value="${esc(username)}" placeholder="Your username" aria-label="Profile name" spellcheck="false" />
+      <button type="button" class="btn btn-sm btn-primary" id="account-username-save">${icon('check', 14)}<span>Save name</span></button>
+    </div>
+    <div class="form-error" id="account-username-error" role="alert"></div>
+  `;
+  const errorEl = host.querySelector('#account-username-error');
+  host.querySelector('#account-username-save')?.addEventListener('click', () => {
+    saveProfileUsername(host.querySelector('#account-username').value, errorEl);
+  });
+  host.querySelector('#account-username')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      saveProfileUsername(host.querySelector('#account-username').value, errorEl);
+    }
+  });
+}
+
+// ---------- View 4: Settings (games directory + Proton + instances) ----------
+
+function renderSettingsView() {
+  viewEl.innerHTML = `
+    <div class="page-header-row">
+      <h1 class="page-title">settings</h1>
+    </div>
+
+    <section class="panel" id="settings-account"></section>
+    <section class="panel" id="settings-games-dir"></section>
+
+    <div id="settings-proton"></div>
+    <div id="settings-instances"></div>
+  `;
+  renderAccountSetting(document.getElementById('settings-account'));
+  renderGamesDirSetting(document.getElementById('settings-games-dir'));
+  renderProtonSection(document.getElementById('settings-proton'));
+  renderProfilesSection(document.getElementById('settings-instances'));
+}
+
+function renderGamesDirSetting(host) {
+  host.innerHTML = `
+    <h2>Games directory</h2>
+    <p class="small muted">Where downloads from your OpenSync server are installed. <strong>Auto</strong> uses a <code>Games/OpenSync</code> folder in your home directory (creating <code>Games</code> if needed).</p>
+    <div class="settings-dir-row">
+      <input type="text" class="input" id="games-dir-input" value="${esc(state.gamesDir || '')}" placeholder="Auto (Games/OpenSync)" spellcheck="false" aria-label="Games directory" />
+      <button type="button" class="btn btn-sm" id="games-dir-auto">${icon('refresh-cw', 14)}<span>Auto</span></button>
+      <button type="button" class="btn btn-sm btn-primary" id="games-dir-save">${icon('check', 14)}<span>Apply</span></button>
+    </div>
+    <p class="small muted">Only new downloads use this folder — games already installed stay where they are. Changes are saved immediately.</p>
+  `;
+  host.querySelector('#games-dir-auto')?.addEventListener('click', () => applyGamesDir('auto'));
+  host.querySelector('#games-dir-save')?.addEventListener('click', () => {
+    applyGamesDir(host.querySelector('#games-dir-input').value.trim());
+  });
+}
+
+async function applyGamesDir(value) {
+  try {
+    state.gamesDir = await bridge.setGamesDir(value);
+    showToast(`Games directory: ${state.gamesDir}`, 'accent', 'folder');
+    renderCurrentView();
+  } catch (err) {
+    showToast(String(err?.message || err), 'danger', 'alert-triangle');
+  }
+}
+
+// ---------- Settings section: Proton & Compatibility ----------
+
+function renderProtonSection(host) {
   const latest = state.latestGeProton;
   const alreadyInstalled = latest
     ? state.protonInstallations.some((p) => p.name === latest.tag_name)
@@ -1505,9 +2866,9 @@ function renderProtonView() {
       </div>
     `;
 
-  viewEl.innerHTML = `
+  host.innerHTML = `
     <div class="page-header-row">
-      <h1 class="page-title">proton</h1>
+      <h2>Proton</h2>
       <button type="button" class="btn btn-sm" id="btn-rescan-proton">${icon('refresh-cw', 14)}<span>Rescan runtimes</span></button>
     </div>
 
@@ -1532,7 +2893,7 @@ function renderProtonView() {
   document.getElementById('btn-rescan-proton')?.addEventListener('click', async () => {
     try {
       state.protonInstallations = await bridge.listProtonInstallations();
-      renderProtonView();
+      renderProtonSection(host);
       showToast(`Found ${state.protonInstallations.length} Proton runtimes`, 'accent', 'cpu');
     } catch (err) {
       showToast(String(err?.message || err), 'danger', 'alert-triangle');
@@ -1542,14 +2903,14 @@ function renderProtonView() {
   document.getElementById('btn-check-ge-proton')?.addEventListener('click', async () => {
     state.checkingGeProton = true;
     state.geProtonError = null;
-    renderProtonView();
+    renderProtonSection(host);
     try {
       state.latestGeProton = await bridge.fetchLatestGeProton();
     } catch (err) {
       state.geProtonError = String(err?.message || err);
     } finally {
       state.checkingGeProton = false;
-      renderProtonView();
+      renderProtonSection(host);
     }
   });
 
@@ -1566,25 +2927,28 @@ function renderProtonView() {
   });
 }
 
-// ---------- View 5: Profiles / Instances ----------
+// ---------- Settings section: Instances ----------
 
-function renderProfilesView() {
+function renderProfilesSection(host) {
   const activeId = state.activeProfile?.id;
   const listHtml = state.profiles.length
     ? state.profiles.map((p) => {
         const isActive = p.id === activeId;
         return `
           <div class="profile-card ${isActive ? 'active' : ''}">
-            <div>
-              <div class="dl-title-row">
-                <span class="profile-menu-name">${esc(p.label)}</span>
-                ${isActive ? '<span class="badge badge-accent">Active</span>' : ''}
-                ${p.role === 'admin' ? '<span class="badge badge-warn">Admin</span>' : ''}
+            <div class="profile-card-identity">
+              ${pfpSlotHtml(p.id, p.user_id, isActive ? state.currentUser?.pfp : null, 'profile-card-avatar', p.username)}
+              <div>
+                <div class="dl-title-row">
+                  <span class="profile-menu-name">${esc(p.label)}</span>
+                  ${isActive ? '<span class="badge badge-accent">Active</span>' : ''}
+                  ${p.role === 'admin' ? '<span class="badge badge-warn">Admin</span>' : ''}
+                </div>
+                <div class="small muted">@${esc(p.username)} on ${esc(p.server_url)}</div>
               </div>
-              <div class="small muted">@${esc(p.username)} on ${esc(p.server_url)}</div>
             </div>
             <div class="profile-card-actions">
-              ${!isActive ? `<button type="button" class="btn btn-sm btn-primary" data-prof-switch="${esc(p.id)}">Switch</button>` : ''}
+              ${isActive ? `<button type="button" class="btn btn-sm" data-prof-customize="${esc(p.id)}">${icon('user', 13)}<span>Customize profile</span></button>` : `<button type="button" class="btn btn-sm btn-primary" data-prof-switch="${esc(p.id)}">Switch</button>`}
               <button type="button" class="btn btn-sm btn-danger" data-prof-delete="${esc(p.id)}" title="Remove saved instance" aria-label="Remove saved instance">${icon('trash-2', 14)}</button>
             </div>
           </div>
@@ -1598,9 +2962,9 @@ function renderProfilesView() {
       </div>
     `;
 
-  viewEl.innerHTML = `
+  host.innerHTML = `
     <div class="page-header-row">
-      <h1 class="page-title">instances</h1>
+      <h2>Instances</h2>
     </div>
 
     <div class="profiles-layout">
@@ -1621,7 +2985,7 @@ function renderProfilesView() {
     },
   });
 
-  viewEl.querySelectorAll('[data-prof-switch]').forEach((btn) => {
+  host.querySelectorAll('[data-prof-switch]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       try {
         await bridge.switchProfile(btn.dataset.profSwitch);
@@ -1633,7 +2997,14 @@ function renderProfilesView() {
     });
   });
 
-  viewEl.querySelectorAll('[data-prof-delete]').forEach((btn) => {
+  host.querySelectorAll('[data-prof-customize]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      await refreshCurrentUser();
+      navigate('profile');
+    });
+  });
+
+  host.querySelectorAll('[data-prof-delete]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const pid = btn.dataset.profDelete;
       const prof = state.profiles.find((x) => x.id === pid);
@@ -1654,6 +3025,282 @@ function renderProfilesView() {
       });
     });
   });
+}
+
+// ---------- Profile & Avatar (WebUI parity) ----------
+
+async function refreshCurrentUser() {
+  if (!state.activeProfile) {
+    state.currentUser = null;
+    return;
+  }
+  try {
+    state.currentUser = await bridge.getCurrentUserProfile();
+  } catch {
+    // Offline or session expired: keep the last known profile data when possible.
+  }
+}
+
+function readImageAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result || '');
+      const comma = text.indexOf(',');
+      resolve(comma >= 0 ? text.slice(comma + 1) : text);
+    };
+    reader.onerror = () => reject(new Error('Could not read the selected image'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function renderProfileView() {
+  if (!state.activeProfile) {
+    viewEl.innerHTML = `
+      <div class="panel empty-state">
+        <div class="empty-state-icon">${icon('user', 22)}</div>
+        <h3>Connect an instance first</h3>
+        <p>Sign in to an OpenSync server to customize your profile and avatar.</p>
+        <button type="button" class="btn btn-primary" id="profile-connect-btn">Sign in</button>
+      </div>
+    `;
+    document.getElementById('profile-connect-btn')?.addEventListener('click', openConnectModal);
+    return;
+  }
+  const user = state.currentUser;
+  if (!user) {
+    viewEl.innerHTML = `<div class="panel"><p class="muted">Loading profile…</p></div>`;
+    return;
+  }
+
+  const profile = state.activeProfile;
+  const stats = user.stats || {};
+  const customPfp = !isDefaultPfp(user.pfp);
+  const avatarHtml = pfpSlotHtml(profile.id, user.id, user.pfp, 'pfp-lg', user.username);
+
+  viewEl.innerHTML = `
+    <div class="page-header-row">
+      <h1 class="page-title">profile</h1>
+    </div>
+
+    <section class="panel profile-hero">
+      ${avatarHtml}
+      <div class="profile-hero-meta">
+        <h2>@${esc(user.username)}</h2>
+        <div class="profile-hero-badges">
+          ${user.role === 'admin' ? '<span class="badge badge-warn">admin</span>' : '<span class="badge">user</span>'}
+          <span class="small muted">Member since ${esc(fmtDate(user.created_at))}</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="profile-name-panel">
+      <h2>Profile name</h2>
+      <p class="small muted">This is your OpenSync account username, visible across your instances.</p>
+      <div class="settings-dir-row">
+        <input type="text" class="input" id="profile-username-input" value="${esc(user.username)}" aria-label="Profile name" spellcheck="false" />
+        <button type="button" class="btn btn-sm btn-primary" id="profile-username-save">${icon('check', 14)}<span>Save name</span></button>
+      </div>
+      <div class="form-error" id="username-error" role="alert"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Activity</h2>
+      <div class="kpi-strip profile-stats">
+        <div class="kpi-card">
+          <div class="kpi-label">Games uploaded</div>
+          <div class="kpi-value">${Number(stats.uploaded || 0)}</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Games downloaded</div>
+          <div class="kpi-value">${Number(stats.downloaded || 0)}</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label">Saves synced</div>
+          <div class="kpi-value">${Number(stats.synced || 0)}</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="profile-pfp-panel">
+      <h2>Profile picture</h2>
+      <div class="pfp-dropzone" id="pfp-dropzone" role="button" tabindex="0" aria-label="Upload profile picture">
+        <div class="pfp-dropzone-icon">${icon('user', 22)}</div>
+        <p class="muted small">Click to browse or drop a JPG/PNG image to update your avatar (max 8 MB).</p>
+        <input type="file" id="pfp-file" accept="image/jpeg,image/png" hidden />
+      </div>
+      ${customPfp ? `<div class="profile-actions"><button type="button" class="btn btn-ghost btn-sm" id="pfp-remove">Remove profile picture</button></div>` : ''}
+      <div class="form-error" id="pfp-error" role="alert"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Instance label</h2>
+      <p class="small muted">A friendly name for this server shown only in this launcher's profile switcher.</p>
+      <div class="settings-dir-row">
+        <input type="text" class="input" id="profile-label-input" value="${esc(profile.label)}" placeholder="Home LAN" aria-label="Instance label" />
+        <button type="button" class="btn btn-sm btn-primary" id="profile-label-save">${icon('check', 14)}<span>Save</span></button>
+      </div>
+      <div class="form-error" id="label-error" role="alert"></div>
+    </section>
+
+    <section class="panel danger-zone">
+      <h2>Danger zone</h2>
+      <p class="small muted">Permanently deletes your account and save syncs on the server. Games you uploaded stay on the server.</p>
+      <button type="button" class="btn btn-danger" id="profile-delete">${icon('trash-2', 14)}<span>Delete account</span></button>
+      <div class="form-error" id="danger-error" role="alert">${esc(state.profileDangerError || '')}</div>
+    </section>
+  `;
+
+  const dropzone = document.getElementById('pfp-dropzone');
+  const fileInput = document.getElementById('pfp-file');
+  const pfpError = document.getElementById('pfp-error');
+  let busy = false;
+
+  async function uploadFile(file) {
+    if (!file || busy) return;
+    pfpError.textContent = '';
+    if (!/^image\/(jpeg|png)$/.test(file.type)) {
+      pfpError.textContent = 'Profile picture must be a JPG or PNG image.';
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      pfpError.textContent = 'Profile picture is too large (max 8 MB).';
+      return;
+    }
+    busy = true;
+    dropzone.classList.add('is-busy');
+    const hint = dropzone.querySelector('p');
+    const originalHint = hint.textContent;
+    hint.textContent = 'Uploading…';
+    try {
+      const base64 = await readImageAsBase64(file);
+      await bridge.uploadProfilePfp(base64, file.type);
+      invalidateUserPfp(profile.id, user.id);
+      state.profileDangerError = null;
+      await refreshAll();
+      showToast('Profile picture saved', 'accent', 'check');
+    } catch (err) {
+      pfpError.textContent = formatAuthError(err);
+      hint.textContent = originalHint;
+      dropzone.classList.remove('is-busy');
+    } finally {
+      busy = false;
+    }
+  }
+
+  dropzone.addEventListener('click', () => {
+    if (!busy) fileInput.click();
+  });
+  dropzone.addEventListener('keydown', (e) => {
+    if (!busy && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      fileInput.click();
+    }
+  });
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files?.[0];
+    if (file) uploadFile(file);
+  });
+
+  let dragDepth = 0;
+  const panel = document.getElementById('profile-pfp-panel');
+  panel.addEventListener('dragenter', (e) => {
+    e.preventDefault();
+    if (busy) return;
+    dragDepth += 1;
+    panel.classList.add('drag-over');
+  });
+  panel.addEventListener('dragover', (e) => e.preventDefault());
+  panel.addEventListener('dragleave', () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) panel.classList.remove('drag-over');
+  });
+  panel.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    panel.classList.remove('drag-over');
+    const files = [...(e.dataTransfer?.files || [])];
+    const file = files.find((f) => /^image\/(jpeg|png)$/.test(f.type)) || files[0];
+    if (file) uploadFile(file);
+    else pfpError.textContent = 'Profile picture must be a JPG or PNG image.';
+  });
+
+  document.getElementById('pfp-remove')?.addEventListener('click', async () => {
+    pfpError.textContent = '';
+    try {
+      await bridge.removeProfilePfp();
+      invalidateUserPfp(profile.id, user.id);
+      await refreshAll();
+      showToast('Profile picture removed', 'accent', 'check');
+    } catch (err) {
+      pfpError.textContent = formatAuthError(err);
+    }
+  });
+
+  const usernameError = document.getElementById('username-error');
+  const usernameInput = document.getElementById('profile-username-input');
+  const saveUsername = () => saveProfileUsername(usernameInput.value, usernameError);
+  document.getElementById('profile-username-save')?.addEventListener('click', saveUsername);
+  usernameInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); saveUsername(); }
+  });
+
+  const labelError = document.getElementById('label-error');
+  document.getElementById('profile-label-save')?.addEventListener('click', async () => {
+    const value = document.getElementById('profile-label-input').value.trim();
+    labelError.textContent = '';
+    if (!value) {
+      labelError.textContent = 'Instance label cannot be empty.';
+      return;
+    }
+    try {
+      await bridge.renameProfile(value);
+      await refreshAll();
+      showToast(`Instance renamed to ${value}`, 'accent', 'check');
+    } catch (err) {
+      labelError.textContent = formatAuthError(err);
+    }
+  });
+
+  document.getElementById('profile-delete')?.addEventListener('click', () => {
+    state.profileDangerError = null;
+    openConfirmModal({
+      title: 'Delete account',
+      body: 'This permanently deletes your account and save syncs. Games you uploaded stay on the server. Continue?',
+      confirmLabel: 'Delete account',
+      danger: true,
+      onConfirm: async () => {
+        try {
+          await bridge.deleteServerAccount();
+          invalidateUserPfp(profile.id, user.id);
+          state.profileDangerError = null;
+          await refreshAll();
+          navigate('library');
+          showToast('Account deleted', 'accent', 'check');
+        } catch (err) {
+          state.profileDangerError = formatAuthError(err);
+          renderCurrentView();
+        }
+      },
+    });
+  });
+}
+
+function formatAuthError(err) {
+  let msg = String(err?.message || err || '').trim();
+  msg = msg.replace(/^api error:\s*/i, '').replace(/^server returned \d+:\s*/i, '').trim();
+  const lower = msg.toLowerCase();
+  if (lower.includes('invalid username or password') || lower.includes('invalid credentials')) {
+    return 'Invalid username or password. Check your credentials or use Create account.';
+  }
+  if (lower.includes('username already taken')) {
+    return 'That username is already taken on this server. Try Sign in instead.';
+  }
+  if (lower.startsWith('network error')) {
+    return 'Could not reach the server. Check the URL and that OpenSync is running.';
+  }
+  if (!msg) return 'Sign in failed.';
+  return msg.charAt(0).toUpperCase() + msg.slice(1);
 }
 
 function mountConnectForm(container, { onSuccess, onCancel = null, fullWidthSubmit = false }) {
@@ -1749,7 +3396,7 @@ function mountConnectForm(container, { onSuccess, onCancel = null, fullWidthSubm
         showToast(`Connected to ${label}`, 'accent', 'wifi');
         await onSuccess();
       } catch (err) {
-        errEl.textContent = String(err?.message || err);
+        errEl.textContent = formatAuthError(err);
       } finally {
         submitBtn.disabled = false;
       }
@@ -1953,19 +3600,218 @@ async function refreshLibrary() {
   }
 }
 
+// ---------- Force-Quit Save Recovery & Safe Shutdown Modals ----------
+
+function maybePromptInterruptedSession() {
+  const next = state.interruptedSessions.find(
+    (s) => s.has_unsynced_saves && !state.promptedInterruptedGameIds.has(s.game_id),
+  );
+  if (!next) return;
+  if (modalRoot.innerHTML.trim() !== '') return;
+  state.promptedInterruptedGameIds.add(next.game_id);
+  openInterruptedSessionModal(next);
+}
+
+function openInterruptedSessionModal(session) {
+  const count = Number(session.changed_files || 0) + Number(session.deleted_files || 0);
+  const sampleHtml = Array.isArray(session.sample_paths) && session.sample_paths.length
+    ? `
+      <div class="recovery-file-list">
+        ${session.sample_paths.map((p) => `<div class="recovery-file-item">${icon('file', 13)}<span>${esc(p)}</span></div>`).join('')}
+      </div>
+    `
+    : '';
+
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" id="recovery-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="recovery-modal-title">
+      <div class="modal-card" style="max-width:480px;">
+        <div class="modal-header">
+          <h2 id="recovery-modal-title" style="margin:0;display:inline-flex;align-items:center;gap:9px;">
+            <span style="color:var(--warn);display:inline-flex;">${icon('alert-triangle', 18)}</span>
+            <span>Interrupted Game Session Detected</span>
+          </h2>
+          <button type="button" class="btn btn-ghost btn-icon" id="btn-close-recovery-modal" aria-label="Close">${icon('x', 16)}</button>
+        </div>
+        <p style="margin:0 0 10px;color:var(--muted);line-height:1.5;">
+          OpenSync Launcher was force-closed while <strong style="color:var(--fg);">${esc(session.game_name)}</strong> was running.
+          We detected <strong style="color:var(--accent);">${count} modified save ${count === 1 ? 'file' : 'files'} (${humanBytes(session.changed_bytes || 0)})</strong> in the game folder.
+        </p>
+        ${sampleHtml}
+        <p class="small muted" style="margin:8px 0 0;">Would you like to sync these save changes to your OpenSync server now?</p>
+        <div class="modal-actions">
+          <button type="button" class="btn" id="btn-skip-recovery-sync">Skip save sync</button>
+          <button type="button" class="btn btn-primary" id="btn-accept-recovery-sync">${icon('refresh-cw', 14)}<span>Sync saves now</span></button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  gamepadCtrl?.onViewRendered();
+
+  const removeSessionFromState = () => {
+    state.interruptedSessions = state.interruptedSessions.filter((s) => s.game_id !== session.game_id);
+  };
+
+  document.getElementById('btn-close-recovery-modal')?.addEventListener('click', () => {
+    closeModal();
+  });
+
+  document.getElementById('btn-skip-recovery-sync')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btn-skip-recovery-sync');
+    if (btn) btn.disabled = true;
+    try {
+      await bridge.resolveInterruptedSession(session.game_id, false, false);
+      removeSessionFromState();
+      closeModal();
+      showToast(`Skipped save recovery for ${session.game_name}`, 'warn', 'clock');
+      await refreshAll();
+    } catch (err) {
+      showToast(String(err?.message || err), 'danger', 'alert-triangle');
+      closeModal();
+    }
+  });
+
+  document.getElementById('btn-accept-recovery-sync')?.addEventListener('click', async () => {
+    const btn = document.getElementById('btn-accept-recovery-sync');
+    const skipBtn = document.getElementById('btn-skip-recovery-sync');
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<span class="spin-icon">${icon('refresh-cw', 14)}</span><span>Syncing saves…</span>`;
+    }
+    if (skipBtn) skipBtn.disabled = true;
+    try {
+      const report = await bridge.resolveInterruptedSession(session.game_id, true, false);
+      removeSessionFromState();
+      closeModal();
+      const uploaded = report?.uploaded_files || session.changed_files || 1;
+      showToast(`Recovered & synced ${uploaded} save ${uploaded === 1 ? 'file' : 'files'} for ${session.game_name}`, 'accent', 'check');
+      await refreshAll();
+    } catch (err) {
+      showToast(String(err?.message || err), 'danger', 'alert-triangle');
+      closeModal();
+    }
+  });
+}
+
+async function triggerSafeShutdownRequest() {
+  try {
+    const status = await bridge.getShutdownStatus();
+    openSafeShutdownModal(status);
+  } catch (err) {
+    showToast(String(err?.message || err), 'danger', 'alert-triangle');
+  }
+}
+
+function openSafeShutdownModal(status = {}) {
+  const playingGames = Array.isArray(status.playing_games) ? status.playing_games : [];
+  const activeSyncs = Number(status.active_syncs || 0);
+  const activeDls = Number(status.active_downloads || 0);
+  const activeUps = Number(status.active_uploads || 0);
+  const hasPlaying = playingGames.length > 0;
+  const autoWaitOnly = !hasPlaying && activeSyncs > 0 && activeDls === 0 && activeUps === 0;
+
+  let statusSummary = 'All save syncs are idle. Safe shutdown will checkpoint the SQLite database before exiting.';
+  if (hasPlaying) {
+    statusSummary = `${playingGames.join(', ')} is currently running. If you quit now, your active session is preserved in SQLite and OpenSync will offer to sync any modified saves on next startup.`;
+  } else if (activeSyncs > 0) {
+    statusSummary = `Waiting for ${activeSyncs} active save ${activeSyncs === 1 ? 'sync' : 'syncs'} to finish uploading before closing…`;
+  } else if (activeDls > 0 || activeUps > 0) {
+    statusSummary = `${activeDls + activeUps} active transfer(s) will be paused cleanly and SQLite WAL will be checkpointed before exit.`;
+  }
+
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" id="shutdown-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="shutdown-modal-title">
+      <div class="modal-card" style="max-width:460px;">
+        <div class="modal-header">
+          <h2 id="shutdown-modal-title" style="margin:0;display:inline-flex;align-items:center;gap:9px;">
+            <span style="color:var(--accent);display:inline-flex;">${icon('shield-check', 18)}</span>
+            <span>Safe Shutdown</span>
+          </h2>
+          <button type="button" class="btn btn-ghost btn-icon" id="btn-close-shutdown-modal" aria-label="Close">${icon('x', 16)}</button>
+        </div>
+        <div class="shutdown-status-box ${hasPlaying ? 'is-warn' : ''}" id="shutdown-status-box">
+          <span id="shutdown-status-icon">${activeSyncs > 0 ? `<span class="spin-icon">${icon('refresh-cw', 18)}</span>` : icon('shield-check', 18)}</span>
+          <span id="shutdown-status-msg">${esc(statusSummary)}</span>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn" id="btn-cancel-safe-shutdown">Keep launcher open</button>
+          <button type="button" class="btn ${hasPlaying ? 'btn-danger' : 'btn-primary'}" id="btn-confirm-safe-shutdown">
+            ${icon('shield-check', 14)}<span>${hasPlaying ? 'Safe quit anyway' : 'Flush &amp; quit safely'}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+
+  gamepadCtrl?.onViewRendered();
+
+  document.getElementById('btn-close-shutdown-modal')?.addEventListener('click', closeModal);
+  document.getElementById('btn-cancel-safe-shutdown')?.addEventListener('click', closeModal);
+
+  const runShutdown = async (forceWhilePlaying) => {
+    const confirmBtn = document.getElementById('btn-confirm-safe-shutdown');
+    const cancelBtn = document.getElementById('btn-cancel-safe-shutdown');
+    const msgEl = document.getElementById('shutdown-status-msg');
+    const iconEl = document.getElementById('shutdown-status-icon');
+    if (confirmBtn) {
+      confirmBtn.disabled = true;
+      confirmBtn.innerHTML = `<span class="spin-icon">${icon('refresh-cw', 14)}</span><span>Finishing save sync…</span>`;
+    }
+    if (cancelBtn) cancelBtn.disabled = true;
+    if (iconEl) iconEl.innerHTML = `<span class="spin-icon">${icon('refresh-cw', 18)}</span>`;
+    if (msgEl) msgEl.textContent = 'Flushing in-flight save syncs and checkpointing SQLite WAL…';
+
+    try {
+      const res = await bridge.confirmSafeShutdown(forceWhilePlaying);
+      if (res?.completed) {
+        if (iconEl) iconEl.innerHTML = icon('check', 18);
+        if (msgEl) msgEl.textContent = 'Safe shutdown complete — SQLite WAL checkpointed.';
+        showToast('Safe shutdown complete', 'accent', 'shield-check');
+        setTimeout(() => closeModal(), 650);
+      }
+    } catch (err) {
+      showToast(String(err?.message || err), 'danger', 'alert-triangle');
+      closeModal();
+    }
+  };
+
+  document.getElementById('btn-confirm-safe-shutdown')?.addEventListener('click', () => {
+    runShutdown(true);
+  });
+
+  if (autoWaitOnly) {
+    runShutdown(false);
+  }
+}
+
 async function refreshAll() {
   const boot = await bridge.getBootstrapState();
   state.activeProfile = boot.active_profile || null;
   state.profiles = boot.profiles || [];
+  await refreshCurrentUser();
   state.connectionState = normalizeConnectionState(boot.connection_state);
   state.protonInstallations = boot.proton_installations || [];
   state.pendingSyncs = boot.pending_syncs || [];
   state.downloads = (boot.downloads || []).map(normalizeDownloadJob).filter(Boolean);
   state.bandwidthLimitBps = Number(boot.bandwidth_limit_bps || 0);
+  state.gamesDir = boot.games_dir || '';
+  if (Array.isArray(boot.activity_logs)) {
+    state.activityLogs = boot.activity_logs;
+  }
+  if (Array.isArray(boot.interrupted_sessions)) {
+    state.interruptedSessions = boot.interrupted_sessions;
+  }
   await refreshLibrary();
+  try {
+    const rawUploads = await bridge.listUploads?.();
+    state.uploads = (rawUploads || []).map(normalizeUploadJob).filter(Boolean);
+  } catch {
+    // ignore transient error
+  }
   updateNavState();
   renderStatusStrip();
   renderCurrentView();
+  maybePromptInterruptedSession();
 }
 
 function upsertDownloadInState(job) {
@@ -2032,14 +3878,35 @@ function handleLauncherEvent(evt) {
     case 'game_session_started':
     case 'gamesessionstarted': {
       state.playingGameIds.add(evt.game_id);
+      renderStatusStrip();
       renderCurrentView();
       break;
     }
     case 'sync_started':
-    case 'syncstarted': {
+    case 'syncstarted':
+    case 'game_sync_started':
+    case 'gamesyncstarted': {
+      state.playingGameIds.delete(evt.game_id);
       state.syncingGameIds.add(evt.game_id);
       const g = state.library.find((x) => x.game_id === evt.game_id);
-      showToast(`Syncing saves for ${g ? g.name : 'game'}…`, 'accent', 'refresh-cw');
+      const gName = evt.name || (g ? g.name : 'Game');
+      showLiveSyncBanner(evt.game_id, gName, evt.trigger || 'post_exit');
+      renderStatusStrip();
+      if (state.view === 'library') renderLibraryGrid();
+      else if (state.view === 'game-detail') renderGameDetailView();
+      break;
+    }
+    case 'game_sync_completed':
+    case 'gamesynccompleted': {
+      state.syncingGameIds.delete(evt.game_id);
+      const g = state.library.find((x) => x.game_id === evt.game_id);
+      const gName = evt.name || (g ? g.name : 'Game');
+      completeLiveSyncBanner(evt.game_id, gName, {
+        uploadedFiles: evt.uploaded_files || 0,
+        uploadedBytes: evt.uploaded_bytes || 0,
+        deletedPaths: evt.deleted_paths || 0,
+      });
+      renderStatusStrip();
       if (state.view === 'library') renderLibraryGrid();
       else if (state.view === 'game-detail') renderGameDetailView();
       break;
@@ -2049,13 +3916,112 @@ function handleLauncherEvent(evt) {
       state.playingGameIds.delete(evt.game_id);
       state.syncingGameIds.delete(evt.game_id);
       const g = state.library.find((x) => x.game_id === evt.game_id);
-      const gName = g ? g.name : 'game';
-      if (evt.synced) {
-        showToast(`Saves synced for ${gName}`, 'accent', 'check');
-      } else if (evt.error) {
+      const gName = evt.name || (g ? g.name : 'game');
+      if (evt.error) {
+        completeLiveSyncBanner(evt.game_id, gName, { error: evt.error });
         showToast(`Save sync queued for ${gName}: ${evt.error}`, 'warn', 'wifi-off');
+      } else if (evt.synced) {
+        completeLiveSyncBanner(evt.game_id, gName, {
+          uploadedFiles: evt.uploaded_files || 0,
+          uploadedBytes: evt.uploaded_bytes || 0,
+          deletedPaths: evt.deleted_paths || 0,
+        });
       }
       refreshAll();
+      break;
+    }
+    case 'activity_logged':
+    case 'activitylogged': {
+      if (evt.entry) {
+        state.activityLogs = [
+          evt.entry,
+          ...state.activityLogs.filter((l) => l.id !== evt.entry.id),
+        ].slice(0, 120);
+        renderStatusStrip();
+        if (state.view === 'game-detail' && state.selectedGameId === evt.entry.game_id) {
+          renderGameDetailView();
+        }
+      }
+      break;
+    }
+    case 'interrupted_session_detected':
+    case 'interruptedsessiondetected': {
+      if (evt.session) {
+        const exists = state.interruptedSessions.some((s) => s.game_id === evt.session.game_id);
+        if (!exists) state.interruptedSessions.push(evt.session);
+        maybePromptInterruptedSession();
+      }
+      break;
+    }
+    case 'shutdown_requested':
+    case 'shutdownrequested': {
+      openSafeShutdownModal(evt.status || {});
+      break;
+    }
+    case 'shutdown_progress':
+    case 'shutdownprogress': {
+      const msgEl = document.getElementById('shutdown-status-msg');
+      if (msgEl && evt.message) {
+        msgEl.textContent = evt.message;
+      }
+      break;
+    }
+    case 'upload_updated':
+    case 'uploadupdated': {
+      const job = normalizeUploadJob(evt.job);
+      if (!job) break;
+      const prevStage = upsertUploadInState(job);
+      renderStatusStrip();
+
+      if (job.stage === 'ready' && prevStage !== 'ready') {
+        for (const wf of activeUploadWaveforms.values()) wf.destroy();
+        activeUploadWaveforms.clear();
+        showToast(`${job.name} uploaded successfully`, 'accent', 'check');
+        state.uploadForm = defaultUploadForm();
+        Promise.all([refreshLibrary(), refreshDownloads()]).then(() => {
+          navigate('game-detail', { gameId: job.game_id });
+        });
+        break;
+      }
+      if (job.stage === 'failed' && prevStage !== 'failed') {
+        showToast(`Upload failed: ${job.error || 'Unknown error'}`, 'danger', 'alert-triangle');
+      }
+      if (job.stage === 'cancelled' && prevStage !== 'cancelled') {
+        showToast('Upload cancelled', 'warn', 'x');
+      }
+      if (state.view === 'upload' && activeUploads().some((j) => j.job_id === job.job_id)) {
+        updateUploadPanelForJob(job.job_id);
+      }
+      break;
+    }
+    case 'profile_updated':
+    case 'profileupdated': {
+      refreshCurrentUser()
+        .then(() => refreshLibrary())
+        .then(() => {
+          renderStatusStrip();
+          if (state.view !== 'profile' || document.activeElement?.tagName !== 'INPUT') {
+            renderCurrentView();
+          }
+        });
+      break;
+    }
+    case 'background_sync_completed':
+    case 'backgroundsynccompleted': {
+      bridge
+        .getBootstrapState()
+        .then((boot) => {
+          state.pendingSyncs = boot.pending_syncs || [];
+          state.connectionState = normalizeConnectionState(boot.connection_state);
+          return refreshLibrary();
+        })
+        .then(() => {
+          renderStatusStrip();
+          if (state.view === 'library' || state.view === 'game-detail') {
+            renderCurrentView();
+          }
+        })
+        .catch(() => {});
       break;
     }
     case 'proton_installed':
@@ -2065,7 +4031,7 @@ function handleLauncherEvent(evt) {
         if (!exists) state.protonInstallations.unshift(evt.installation);
         showToast(`${evt.installation.name} installed`, 'accent', 'cpu');
       }
-      if (state.view === 'proton' || state.view === 'game-detail') {
+      if (state.view === 'settings' || state.view === 'game-detail') {
         renderCurrentView();
       }
       break;
@@ -2098,6 +4064,10 @@ function initGamepad() {
       }
     },
     onBack: () => {
+      if (state.cssSelectOpen) {
+        closeCssSelect();
+        return;
+      }
       if (lightboxRoot.innerHTML) {
         lightboxRoot.innerHTML = '';
         gamepadCtrl?.onViewRendered();
@@ -2117,6 +4087,10 @@ function initGamepad() {
         navigate('library');
         return;
       }
+      if (state.view === 'profile' || state.view === 'upload') {
+        navigate('library');
+        return;
+      }
       if (document.activeElement?.tagName === 'INPUT') {
         document.activeElement.blur();
       }
@@ -2128,7 +4102,7 @@ function initGamepad() {
           search.focus();
           search.select();
         }
-      } else if (state.view === 'proton') {
+      } else if (state.view === 'settings') {
         document.getElementById('btn-rescan-proton')?.click();
       }
     },
@@ -2155,6 +4129,7 @@ function initGamepad() {
 async function boot() {
   initTopbarNav();
   initGamepad();
+  initScrollPerf();
   await listenEvents(handleLauncherEvent);
   await refreshAll();
 }

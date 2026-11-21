@@ -1,9 +1,14 @@
 use bytes::Bytes;
-use reqwest::header::{COOKIE, HeaderMap, HeaderValue, SET_COOKIE};
+use reqwest::header::{CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, SET_COOKIE};
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
+
+/// Path the server uses when a user has no custom profile picture.
+pub const DEFAULT_PFP_PATH: &str = "/img/blankpfp.jpg";
+/// Server cap enforced by `PUT /api/auth/me/pfp`.
+pub const MAX_PFP_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -21,6 +26,8 @@ pub enum ApiError {
     Http { status: u16, message: String },
     #[error("missing session cookie in auth response")]
     MissingCookie,
+    #[error("invalid profile picture: {0}")]
+    InvalidPfp(String),
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -134,6 +141,35 @@ pub struct OverlayInit {
     pub files: Vec<OverlayPartState>,
 }
 
+/// Resume state returned when a game upload is initialized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadInit {
+    #[serde(rename = "chunkSize")]
+    pub chunk_size: usize,
+    pub files: Vec<OverlayPartState>,
+}
+
+/// Acknowledgement for a single uploaded game chunk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkAck {
+    pub ok: bool,
+    pub done: bool,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub received: Option<usize>,
+}
+
+/// Processing state of a game being indexed on the server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameStatus {
+    pub status: String,
+    #[serde(default)]
+    pub total_size: u64,
+    #[serde(default)]
+    pub progress: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncCompleteResponse {
     pub ok: bool,
@@ -174,6 +210,11 @@ pub fn normalize_server_url(raw: &str) -> ApiResult<String> {
     if parsed.host_str().is_none() {
         return Err(ApiError::InvalidUrl("missing host in server URL".to_string()));
     }
+    // A wildcard bind address (as printed by `listening on http://0.0.0.0:3000`) is not a
+    // connectable destination on every OS; rewrite it to loopback.
+    if matches!(parsed.host_str(), Some("0.0.0.0") | Some("[::]") | Some("::")) {
+        let _ = parsed.set_host(Some("127.0.0.1"));
+    }
 
     parsed.set_fragment(None);
     parsed.set_query(None);
@@ -191,6 +232,35 @@ pub fn normalize_server_url(raw: &str) -> ApiResult<String> {
     parsed.set_path(&clean_path);
 
     Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+/// Validates a server-relative image path such as `/api/auth/users/7/pfp` and returns it
+/// normalized. Rejects traversal segments, backslashes, NUL, query/fragment suffixes and
+/// anything longer than 256 bytes so the value is safe to use as a local cache key.
+pub fn sanitize_pfp_path(raw: &str) -> Option<String> {
+    let path = raw.trim();
+    if path.is_empty()
+        || !path.starts_with('/')
+        || path.len() > 256
+        || path.contains('\\')
+        || path.contains('\0')
+        || path.contains("..")
+        || path.contains('?')
+        || path.contains('#')
+    {
+        return None;
+    }
+    if !path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+    {
+        return None;
+    }
+    // Every segment must be non-empty (no double slashes).
+    if path.split('/').skip(1).any(str::is_empty) {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 impl OpenSyncClient {
@@ -296,6 +366,129 @@ impl OpenSyncClient {
             .await?;
         let data: MeResp = parse_json(res).await?;
         Ok(data.user)
+    }
+
+    /// Fetches raw profile-picture bytes plus their MIME type. `None` is returned for the
+    /// default avatar, a missing path, an unsafe path, or when the server has no image (404).
+    pub async fn fetch_pfp(
+        &self,
+        pfp_path: Option<&str>,
+        user_id: i64,
+    ) -> ApiResult<Option<(Vec<u8>, String)>> {
+        let Some(raw) = pfp_path else {
+            return Ok(None);
+        };
+        let raw = raw.trim();
+        if raw.is_empty() || raw == DEFAULT_PFP_PATH {
+            return Ok(None);
+        }
+        let Some(path) = sanitize_pfp_path(raw) else {
+            return Ok(None);
+        };
+        // The path is only ever used against this server, never as a local filesystem path.
+        // If the server ever handed us a non-image URL, ignore it instead of caching JSON.
+        if path != format!("/api/auth/users/{user_id}/pfp") {
+            return Ok(None);
+        }
+
+        let res = self
+            .http
+            .get(self.url(&path))
+            .headers(self.auth_headers())
+            .send()
+            .await?;
+        let status = res.status();
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(ApiError::Unauthorized);
+        }
+        if !status.is_success() {
+            let message = extract_error_message(status, res).await;
+            return Err(ApiError::Http {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        let content_type = res
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase())
+            .filter(|s| s == "image/jpeg" || s == "image/png");
+        let Some(content_type) = content_type else {
+            return Ok(None);
+        };
+        Ok(Some((res.bytes().await?.to_vec(), content_type)))
+    }
+
+    /// Uploads raw JPG/PNG bytes to the active account's profile picture.
+    /// Returns the server-relative path used to fetch the new image.
+    pub async fn upload_pfp(&self, bytes: Vec<u8>, content_type: &str) -> ApiResult<String> {
+        let ct = content_type.trim().to_ascii_lowercase();
+        if ct != "image/jpeg" && ct != "image/png" {
+            return Err(ApiError::InvalidPfp(
+                "profile picture must be image/jpeg or image/png".to_string(),
+            ));
+        }
+        if bytes.is_empty() {
+            return Err(ApiError::InvalidPfp("profile picture is empty".to_string()));
+        }
+        if bytes.len() > MAX_PFP_BYTES {
+            return Err(ApiError::InvalidPfp(format!(
+                "profile picture too large (max {} MB)",
+                MAX_PFP_BYTES / (1024 * 1024)
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct PfpResp {
+            pfp: String,
+        }
+        let mut headers = self.auth_headers();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_str(&ct).map_err(|_| ApiError::InvalidPfp(ct.clone()))?,
+        );
+        let res = self
+            .http
+            .put(self.url("/api/auth/me/pfp"))
+            .headers(headers)
+            .body(bytes)
+            .send()
+            .await?;
+        let data: PfpResp = parse_json(res).await?;
+        Ok(data.pfp)
+    }
+
+    /// Removes the active account's custom profile picture and returns the default path.
+    pub async fn remove_pfp(&self) -> ApiResult<String> {
+        #[derive(Deserialize)]
+        struct PfpResp {
+            pfp: String,
+        }
+        let res = self
+            .http
+            .delete(self.url("/api/auth/me/pfp"))
+            .headers(self.auth_headers())
+            .send()
+            .await?;
+        let data: PfpResp = parse_json(res).await?;
+        Ok(data.pfp)
+    }
+
+    /// Permanently deletes the active account on the server (server-side guards, such as the
+    /// last-admin rule, are surfaced as `ApiError::Http`).
+    pub async fn delete_me(&self) -> ApiResult<()> {
+        let res = self
+            .http
+            .delete(self.url("/api/auth/me"))
+            .headers(self.auth_headers())
+            .send()
+            .await?;
+        check_status(res).await?;
+        Ok(())
     }
 
     pub async fn list_games(&self) -> ApiResult<Vec<Game>> {
@@ -444,6 +637,178 @@ impl OpenSyncClient {
         })
     }
 
+    /// Changes the active account's username. Server-side validation failures (empty name,
+    /// case-insensitive collision) are surfaced verbatim as `ApiError::Http`.
+    pub async fn update_username(&self, username: &str) -> ApiResult<User> {
+        #[derive(Deserialize)]
+        struct UserResp {
+            user: User,
+        }
+        let res = self
+            .http
+            .patch(self.url("/api/auth/me"))
+            .headers(self.auth_headers())
+            .json(&serde_json::json!({ "username": username }))
+            .send()
+            .await?;
+        let data: UserResp = parse_json(res).await?;
+        Ok(data.user)
+    }
+
+    /// Creates a new game entry. The returned game starts in `processing` state.
+    pub async fn create_game(
+        &self,
+        name: &str,
+        description: &str,
+        system_requirements: &str,
+    ) -> ApiResult<Game> {
+        #[derive(Deserialize)]
+        struct GameResp {
+            game: Game,
+        }
+        let res = self
+            .http
+            .post(self.url("/api/games"))
+            .headers(self.auth_headers())
+            .json(&serde_json::json!({
+                "name": name,
+                "description": description,
+                "system_requirements": system_requirements,
+            }))
+            .send()
+            .await?;
+        let data: GameResp = parse_json(res).await?;
+        Ok(data.game)
+    }
+
+    /// Uploads cover art for a game. Only JPEG and PNG are accepted.
+    pub async fn upload_game_cover(
+        &self,
+        game_id: i64,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> ApiResult<String> {
+        let ct = content_type.trim().to_ascii_lowercase();
+        if ct != "image/jpeg" && ct != "image/png" {
+            return Err(ApiError::Http {
+                status: 400,
+                message: "cover must be image/jpeg or image/png".to_string(),
+            });
+        }
+        #[derive(Deserialize)]
+        struct CoverResp {
+            cover: String,
+        }
+        let mut headers = self.auth_headers();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_str(&ct)
+                .map_err(|_| ApiError::InvalidUrl(content_type.to_string()))?,
+        );
+        let res = self
+            .http
+            .post(self.url(&format!("/api/games/{game_id}/cover")))
+            .headers(headers)
+            .body(bytes)
+            .send()
+            .await?;
+        let data: CoverResp = parse_json(res).await?;
+        Ok(data.cover)
+    }
+
+    /// Starts a chunked game upload and retrieves the server's chunk size and resume state.
+    pub async fn upload_game_init(&self, game_id: i64) -> ApiResult<UploadInit> {
+        let res = self
+            .http
+            .post(self.url(&format!("/api/games/{game_id}/upload/init")))
+            .headers(self.auth_headers())
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        parse_json(res).await
+    }
+
+    /// Uploads one ordered chunk of a game file. Returns `ResumeRequired` on a 409 so callers
+    /// can restart from the chunk count reported by the server.
+    pub async fn upload_game_chunk(
+        &self,
+        game_id: i64,
+        rel_path: &str,
+        index: usize,
+        total: usize,
+        declared_size: u64,
+        chunk: Bytes,
+    ) -> ApiResult<ChunkAck> {
+        let mut headers = self.auth_headers();
+        headers.insert(
+            "x-path",
+            HeaderValue::from_str(&urlencoding::encode(rel_path))
+                .map_err(|_| ApiError::InvalidUrl(rel_path.to_string()))?,
+        );
+        headers.insert(
+            "x-index",
+            HeaderValue::from_str(&index.to_string()).unwrap(),
+        );
+        headers.insert(
+            "x-total",
+            HeaderValue::from_str(&total.to_string()).unwrap(),
+        );
+        headers.insert(
+            "x-size",
+            HeaderValue::from_str(&declared_size.to_string()).unwrap(),
+        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+
+        let res = self
+            .http
+            .post(self.url(&format!("/api/games/{game_id}/files")))
+            .headers(headers)
+            .body(chunk)
+            .send()
+            .await?;
+
+        let status = res.status();
+        if status == StatusCode::CONFLICT {
+            let v: serde_json::Value = res.json().await.unwrap_or_default();
+            let received = v.get("received").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+            return Err(ApiError::ResumeRequired { received });
+        }
+        parse_json(res).await
+    }
+
+    /// Tells the server that all chunks were sent and indexing may begin.
+    pub async fn upload_game_complete(&self, game_id: i64) -> ApiResult<()> {
+        let res = self
+            .http
+            .post(self.url(&format!("/api/games/{game_id}/upload/complete")))
+            .headers(self.auth_headers())
+            .send()
+            .await?;
+        check_status(res).await?;
+        Ok(())
+    }
+
+    pub async fn get_game_status(&self, game_id: i64) -> ApiResult<GameStatus> {
+        let res = self
+            .http
+            .get(self.url(&format!("/api/games/{game_id}/status")))
+            .headers(self.auth_headers())
+            .send()
+            .await?;
+        parse_json(res).await
+    }
+
+    pub async fn delete_game(&self, game_id: i64) -> ApiResult<()> {
+        let res = self
+            .http
+            .delete(self.url(&format!("/api/games/{game_id}")))
+            .headers(self.auth_headers())
+            .send()
+            .await?;
+        check_status(res).await?;
+        Ok(())
+    }
+
     pub async fn sync_complete(
         &self,
         game_id: i64,
@@ -469,7 +834,16 @@ async fn extract_auth(res: Response) -> ApiResult<(User, String)> {
     struct AuthResp {
         user: User,
     }
-    let res = check_status(res).await?;
+    // Login/register failures must surface the server's real message (e.g. "invalid username
+    // or password") rather than the generic session-expired `Unauthorized` variant.
+    let status = res.status();
+    if !status.is_success() {
+        let message = extract_error_message(status, res).await;
+        return Err(ApiError::Http {
+            status: status.as_u16(),
+            message,
+        });
+    }
     let cookie = res
         .headers()
         .get_all(SET_COOKIE)
@@ -571,9 +945,38 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_wildcard_bind_address_to_loopback() {
+        assert_eq!(
+            normalize_server_url("http://0.0.0.0:3000").unwrap(),
+            "http://127.0.0.1:3000"
+        );
+        assert_eq!(
+            normalize_server_url("0.0.0.0:3000/#/").unwrap(),
+            "http://127.0.0.1:3000"
+        );
+    }
+
+    #[test]
     fn rejects_empty_or_invalid_schemes() {
         assert!(normalize_server_url("   ").is_err());
         assert!(normalize_server_url("ftp://127.0.0.1:3000").is_err());
+    }
+
+    #[test]
+    fn sanitizes_pfp_paths() {
+        assert_eq!(
+            sanitize_pfp_path(" /api/auth/users/7/pfp ").as_deref(),
+            Some("/api/auth/users/7/pfp")
+        );
+        assert_eq!(
+            sanitize_pfp_path(DEFAULT_PFP_PATH).as_deref(),
+            Some(DEFAULT_PFP_PATH)
+        );
+        assert!(sanitize_pfp_path("/api/auth/users/../7/pfp").is_none());
+        assert!(sanitize_pfp_path("C:\\users\\pfp.png").is_none());
+        assert!(sanitize_pfp_path("/img/pfp.png?q=1").is_none());
+        assert!(sanitize_pfp_path("api/auth/users/7/pfp").is_none());
+        assert!(sanitize_pfp_path("").is_none());
     }
 
     #[test]

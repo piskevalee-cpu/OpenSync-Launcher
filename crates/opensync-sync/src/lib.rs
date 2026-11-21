@@ -81,6 +81,15 @@ pub struct SyncReport {
     pub skipped_unchanged: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalSaveInspection {
+    pub has_changes: bool,
+    pub changed_files: usize,
+    pub deleted_files: usize,
+    pub changed_bytes: u64,
+    pub sample_paths: Vec<String>,
+}
+
 /// Scans `root` recursively and computes SHA-256 hashes in parallel via `rayon`.
 pub fn scan_folder_parallel(root: &Path) -> SyncResult<Vec<LocalFile>> {
     if !root.exists() {
@@ -315,4 +324,119 @@ async fn upload_file_chunked(
     }
 
     Ok(())
+}
+
+/// Inspects a local game installation directory to determine whether there are unsynced save
+/// changes (used when recovering from an interrupted / force-quit game session).
+///
+/// - When `clean_manifest` is available (online), computes the exact SHA-256 diff against the
+///   clean manifest. If `last_synced_at` is set, filters to files modified since `last_synced_at`
+///   (with a 1-second grace window for filesystem mtime granularity) or any deletions.
+/// - When `clean_manifest` is `None` (offline), falls back to checking whether any file in
+///   `install_dir` has an mtime newer than `baseline_time`.
+pub fn inspect_unsynced_saves(
+    install_dir: &Path,
+    clean_manifest: Option<&GameManifest>,
+    last_synced_at: Option<std::time::SystemTime>,
+    session_started_at: Option<std::time::SystemTime>,
+) -> SyncResult<LocalSaveInspection> {
+    if !install_dir.exists() {
+        return Ok(LocalSaveInspection::default());
+    }
+
+    if let Some(manifest) = clean_manifest {
+        let local_files = scan_folder_parallel(install_dir)?;
+        let diff = compute_diff(&local_files, manifest);
+        if diff.is_empty() {
+            return Ok(LocalSaveInspection::default());
+        }
+
+        let uploads: Vec<&DiffUpload> = if let Some(last_sync) = last_synced_at {
+            let cutoff = last_sync
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap_or(last_sync);
+            let recent: Vec<&DiffUpload> = diff
+                .uploads
+                .iter()
+                .filter(|u| {
+                    std::fs::metadata(&u.abs_path)
+                        .and_then(|m| m.modified())
+                        .map(|mtime| mtime >= cutoff)
+                        .unwrap_or(true)
+                })
+                .collect();
+            recent
+        } else {
+            diff.uploads.iter().collect()
+        };
+
+        let changed_files = uploads.len();
+        let deleted_files = diff.deletions.len();
+        let changed_bytes: u64 = uploads.iter().map(|u| u.size).sum();
+        let has_changes = changed_files > 0 || deleted_files > 0;
+        let mut sample_paths: Vec<String> = uploads
+            .iter()
+            .take(5)
+            .map(|u| u.rel_path.clone())
+            .collect();
+        if sample_paths.len() < 5 {
+            for del in diff.deletions.iter().take(5 - sample_paths.len()) {
+                sample_paths.push(format!("{del} (deleted)"));
+            }
+        }
+        return Ok(LocalSaveInspection {
+            has_changes,
+            changed_files,
+            deleted_files,
+            changed_bytes,
+            sample_paths,
+        });
+    }
+
+    // Offline fallback: compare file modification times against `last_synced_at` or `session_started_at`.
+    let baseline = last_synced_at.or(session_started_at);
+    let Some(base) = baseline else {
+        return Ok(LocalSaveInspection::default());
+    };
+    let cutoff = base
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or(base);
+
+    let mut changed_files = 0usize;
+    let mut changed_bytes = 0u64;
+    let mut sample_paths = Vec::new();
+
+    for entry in WalkDir::new(install_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+    {
+        let abs = entry.path();
+        let Ok(rel) = abs.strip_prefix(install_dir) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str.ends_with(".part") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata()
+            && let Ok(mtime) = meta.modified()
+            && mtime >= cutoff
+        {
+            changed_files += 1;
+            changed_bytes += meta.len();
+            if sample_paths.len() < 5 {
+                sample_paths.push(rel_str);
+            }
+        }
+    }
+
+    Ok(LocalSaveInspection {
+        has_changes: changed_files > 0,
+        changed_files,
+        deleted_files: 0,
+        changed_bytes,
+        sample_paths,
+    })
 }

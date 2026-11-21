@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use launcher_db::{DbError, InstalledGame, LauncherDb, PlaySession};
+use launcher_db::{ActiveSessionRecord, DbError, InstalledGame, LauncherDb, PlaySession};
 use opensync_api::OpenSyncClient;
 use opensync_proton::{
     LaunchCommandSpec, ProtonError, ProtonInstallation, build_launch_command, discover_executables,
@@ -168,6 +168,23 @@ pub async fn launch_and_track(
     proton: Option<&ProtonInstallation>,
     options: LaunchOptions,
 ) -> RunnerResult<SessionOutcome> {
+    launch_and_track_with_hook(db, client, game, proton, options, |_, _| {}).await
+}
+
+/// Same as [`launch_and_track`], plus a callback invoked the instant the child game process
+/// exits (before any post-exit settle delay or differential save sync runs) so callers can
+/// immediately transition UI state and activity logs from `Playing` to `Auto-syncing saves…`.
+pub async fn launch_and_track_with_hook<F>(
+    db: &LauncherDb,
+    client: Option<&OpenSyncClient>,
+    game: &InstalledGame,
+    proton: Option<&ProtonInstallation>,
+    options: LaunchOptions,
+    on_process_exit: F,
+) -> RunnerResult<SessionOutcome>
+where
+    F: FnOnce(u64, Option<i32>),
+{
     let spec = resolve_launch_command(game, proton, &options.prefixes_root, &options.extra_args)?;
 
     let mut cmd = Command::new(&spec.program);
@@ -182,6 +199,19 @@ pub async fn launch_and_track(
     let mono_start = Instant::now();
     let mut clock = SessionClock::start(started_at);
     let mut child = cmd.spawn()?;
+    let pid = child.id();
+
+    let _ = db.upsert_active_session(&ActiveSessionRecord {
+        profile_id: game.profile_id.clone(),
+        game_id: game.game_id,
+        game_name: game.name.clone(),
+        install_dir: game.install_dir.clone(),
+        runtime: spec.runtime_label.clone(),
+        pid,
+        started_at,
+        last_heartbeat_at: started_at,
+        active_secs: 0,
+    });
 
     let status: ExitStatus = loop {
         tokio::select! {
@@ -190,7 +220,14 @@ pub async fn launch_and_track(
                 break res?;
             }
             _ = tokio::time::sleep(options.heartbeat_interval) => {
-                clock.tick(Utc::now(), mono_start.elapsed());
+                let now = Utc::now();
+                clock.tick(now, mono_start.elapsed());
+                let _ = db.heartbeat_active_session(
+                    &game.profile_id,
+                    game.game_id,
+                    now,
+                    clock.active_secs(),
+                );
             }
         }
     };
@@ -198,6 +235,8 @@ pub async fn launch_and_track(
     let ended_at = Utc::now();
     // Ensure very short sessions that still ran (> 0ms) record at least their rounded active seconds.
     let active_secs = clock.active_secs();
+    on_process_exit(active_secs, status.code());
+
     let mut session = db.record_play_session(
         &game.profile_id,
         game.game_id,
@@ -236,6 +275,8 @@ pub async fn launch_and_track(
             }
         }
     };
+
+    let _ = db.clear_active_session(&game.profile_id, game.game_id);
 
     Ok(SessionOutcome {
         exit_code: status.code(),

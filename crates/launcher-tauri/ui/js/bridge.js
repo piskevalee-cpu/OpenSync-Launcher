@@ -17,6 +17,22 @@ function svgDataUrl(svg) {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg.trim())}`;
 }
 
+function mockPfpDataUrl(label, hue = 140) {
+  const initial = String(label || 'U').trim().slice(0, 1).toUpperCase();
+  return svgDataUrl(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="hsl(${hue}, 62%, 32%)"/>
+          <stop offset="100%" stop-color="#0b1412"/>
+        </linearGradient>
+      </defs>
+      <rect width="96" height="96" rx="48" fill="url(#g)"/>
+      <text x="48" y="61" text-anchor="middle" font-family="Inter, sans-serif" font-size="40" font-weight="700" fill="#d9ffe4">${initial}</text>
+    </svg>
+  `);
+}
+
 const PREVIEW_COVERS = {
   1: svgDataUrl(`
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 900">
@@ -206,7 +222,10 @@ function createMockRuntime() {
   };
 
   let bandwidthLimit = 0;
+  let gamesDir = '/home/user/Games/OpenSync';
   let nextJobSeq = 2;
+  const uploads = [];
+  let nextUploadSeq = 1;
 
   const profiles = [
     {
@@ -233,6 +252,38 @@ function createMockRuntime() {
 
   let activeProfileId = profiles[0].id;
   let connectionState = { status: 'connected' };
+
+  // Cached avatars keyed by (profile_id, user_id), mirroring the Rust disk cache.
+  const pfpStore = new Map();
+  pfpStore.set(`${profiles[0].id}_1`, mockPfpDataUrl('valerio'));
+  pfpStore.set(`${profiles[0].id}_3`, mockPfpDataUrl('marco', 210));
+  pfpStore.set(`${profiles[0].id}_4`, mockPfpDataUrl('elena', 320));
+
+  let currentUser = {
+    id: 1,
+    username: 'valerio',
+    role: 'admin',
+    created_at: profiles[0].created_at,
+    pfp: '/api/auth/users/1/pfp',
+    stats: { uploaded: 12, downloaded: 28, synced: 9 },
+  };
+
+  function syncCurrentUser() {
+    const active = profiles.find((p) => p.id === activeProfileId);
+    if (!active) {
+      currentUser = null;
+      return;
+    }
+    const hasPfp = pfpStore.has(`${active.id}_${active.user_id}`);
+    currentUser = {
+      id: active.user_id,
+      username: active.username,
+      role: active.role,
+      created_at: active.created_at,
+      pfp: hasPfp ? `/api/auth/users/${active.user_id}/pfp` : '/img/blankpfp.jpg',
+      stats: currentUser?.stats || { uploaded: 0, downloaded: 0, synced: 0 },
+    };
+  }
 
   const protonInstallations = [
     {
@@ -264,6 +315,63 @@ function createMockRuntime() {
       reason: 'Server unreachable at session exit',
     },
   ];
+
+  let nextLogId = 4;
+  const activityLogs = [
+    {
+      id: 3,
+      profile_id: 'prof-home-lan',
+      game_id: 1,
+      game_name: 'Fogwoods',
+      kind: 'sync_complete',
+      level: 'accent',
+      title: 'Auto-synced Fogwoods',
+      detail: '2 uploaded (184.0 KB) · 312 unchanged',
+      created_at: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
+    },
+    {
+      id: 2,
+      profile_id: 'prof-home-lan',
+      game_id: 1,
+      game_name: 'Fogwoods',
+      kind: 'game_close',
+      level: 'info',
+      title: 'Closed Fogwoods',
+      detail: 'Played 42m 15s · Auto-syncing saves…',
+      created_at: new Date(Date.now() - 12 * 60 * 1000 - 2000).toISOString(),
+    },
+    {
+      id: 1,
+      profile_id: 'prof-home-lan',
+      game_id: 1,
+      game_name: 'Fogwoods',
+      kind: 'game_start',
+      level: 'info',
+      title: 'Started Fogwoods',
+      detail: 'Runtime: native',
+      created_at: new Date(Date.now() - 54 * 60 * 1000).toISOString(),
+    },
+  ];
+
+  const interruptedSessions = [];
+  const playingMockGames = new Set();
+
+  function pushMockActivity({ game_id = null, game_name = null, kind, level = 'info', title, detail = '' }) {
+    const entry = {
+      id: nextLogId++,
+      profile_id: activeProfileId || 'prof-home-lan',
+      game_id,
+      game_name,
+      kind,
+      level,
+      title,
+      detail,
+      created_at: new Date().toISOString(),
+    };
+    activityLogs.unshift(entry);
+    emit({ type: 'activity_logged', entry: { ...entry } });
+    return entry;
+  }
 
   const games = [
     {
@@ -440,6 +548,18 @@ function createMockRuntime() {
     },
   ];
 
+  for (const game of games) {
+    const uploaderId = game.uploader_name === 'valerio'
+      ? 1
+      : game.uploader_name === 'marco'
+        ? 3
+        : 4;
+    game.uploaded_by = uploaderId;
+    game.uploader_pfp = pfpStore.has(`${activeProfileId}_${uploaderId}`)
+      ? `/api/auth/users/${uploaderId}/pfp`
+      : '/img/blankpfp.jpg';
+  }
+
   const sampleFiles = [
     'Data/Pak/city_night_04.pak',
     'Data/Pak/sector_09_lighting.pak',
@@ -558,6 +678,91 @@ function createMockRuntime() {
     }
   }, 250);
 
+  // Live 200ms simulation tick for active uploads (browser preview only).
+  function mockUploadSamples(baseBps, count = 12) {
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      const wave = Math.sin(i * 0.4) * 0.1 + Math.cos(i * 0.19) * 0.06;
+      out.push({ elapsed_ms: i * 200, bytes_per_sec: Math.max(0, baseBps * (0.9 + wave)) });
+    }
+    return out;
+  }
+
+  setInterval(() => {
+    for (const job of uploads) {
+      if (job.status.state !== 'uploading') continue;
+      const base = 48_000_000;
+      const wave = Math.sin(job._phase * 0.5) * 0.12 + (Math.random() - 0.5) * 0.05;
+      const bps = Math.max(4_000_000, base * (0.95 + wave));
+      const delta = Math.round(bps * 0.2);
+      job.bytes_uploaded = Math.min(job.total_bytes, job.bytes_uploaded + delta);
+      job.bytes_per_sec = bps;
+      job.files_uploaded = Math.min(job.total_files, Math.floor((job.bytes_uploaded / Math.max(1, job.total_bytes)) * job.total_files));
+      const lastElapsed = job.speed_samples.length ? job.speed_samples[job.speed_samples.length - 1].elapsed_ms : 0;
+      job.speed_samples.push({ elapsed_ms: lastElapsed + 200, bytes_per_sec: bps });
+      if (job.speed_samples.length > 60) job.speed_samples.shift();
+      job._phase += 1;
+      if (job.bytes_uploaded >= job.total_bytes) {
+        job.status = { state: 'indexing' };
+        job.bytes_per_sec = 0;
+        job.current_file = 'Building manifest…';
+        emit({ type: 'upload_updated', job: cloneUploadJob(job) });
+        setTimeout(() => {
+          if (job.status.state !== 'indexing') return;
+          job.status = { state: 'ready' };
+          job.current_file = null;
+          if (!job.game_id) {
+            const gid = Math.max(0, ...games.map((g) => g.game_id)) + 1;
+            job.game_id = gid;
+            games.unshift({
+              game_id: gid,
+              name: job.name,
+              slug: String(job.name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `game-${gid}`,
+              description: job.description || '',
+              system_requirements: job.system_requirements || '',
+              uploader_name: currentUser?.username || 'you',
+              uploaded_by: currentUser?.id || 1,
+              created_at: new Date().toISOString(),
+              status: 'ready',
+              total_size: job.total_bytes,
+              download_count: 0,
+              has_cover: Boolean(job.cover),
+              has_overlay: false,
+              installed: false,
+              install_dir: null,
+              executable_rel_path: null,
+              discovered_executables: [],
+              binary_kind: 'LinuxElf',
+              proton_override: null,
+              last_synced_at: null,
+              pending_sync: false,
+              playtime: { total_secs: 0, session_count: 0, last_played_at: null },
+            });
+          }
+          emit({ type: 'upload_updated', job: cloneUploadJob(job) });
+        }, 1100);
+      } else {
+        emit({ type: 'upload_updated', job: cloneUploadJob(job) });
+      }
+    }
+  }, 200);
+
+  function cloneUploadJob(j) {
+    return {
+      id: j.id,
+      name: j.name,
+      game_id: j.game_id,
+      status: { ...j.status },
+      bytes_uploaded: j.bytes_uploaded,
+      total_bytes: j.total_bytes,
+      files_uploaded: j.files_uploaded,
+      total_files: j.total_files,
+      current_file: j.current_file,
+      bytes_per_sec: j.bytes_per_sec,
+      speed_samples: j.speed_samples.slice(-60),
+    };
+  }
+
   return {
     async invoke(cmd, args = {}) {
       switch (cmd) {
@@ -573,7 +778,24 @@ function createMockRuntime() {
               .map((s) => ({ ...s })),
             downloads: downloads.map(cloneJob),
             bandwidth_limit_bps: bandwidthLimit,
+            games_dir: gamesDir,
+            activity_logs: activityLogs
+              .filter((l) => l.profile_id === activeProfileId)
+              .map((l) => ({ ...l })),
+            interrupted_sessions: interruptedSessions
+              .filter((s) => s.profile_id === activeProfileId)
+              .map((s) => ({ ...s, sample_paths: [...(s.sample_paths || [])] })),
           };
+        }
+
+        case 'get_games_dir':
+          return gamesDir;
+
+        case 'set_games_dir': {
+          const raw = String(args.path || '').trim();
+          if (!raw) throw new Error('Games directory cannot be empty');
+          gamesDir = raw === 'auto' ? '/home/user/Games/OpenSync' : raw;
+          return gamesDir;
         }
 
         case 'connect_profile': {
@@ -591,6 +813,7 @@ function createMockRuntime() {
             existing.label = label;
             existing.last_connected_at = new Date().toISOString();
             activeProfileId = existing.id;
+            syncCurrentUser();
             connectionState = { status: 'connected' };
             emit({ type: 'connection_changed', state: { ...connectionState } });
             return { ...existing };
@@ -607,6 +830,7 @@ function createMockRuntime() {
           };
           profiles.unshift(prof);
           activeProfileId = prof.id;
+          syncCurrentUser();
           connectionState = { status: 'connected' };
           emit({ type: 'connection_changed', state: { ...connectionState } });
           return { ...prof };
@@ -617,6 +841,7 @@ function createMockRuntime() {
           if (!found) throw new Error('Profile not found');
           activeProfileId = found.id;
           found.last_connected_at = new Date().toISOString();
+          syncCurrentUser();
           connectionState = { status: 'connected' };
           emit({ type: 'connection_changed', state: { ...connectionState } });
           return { ...found };
@@ -627,10 +852,89 @@ function createMockRuntime() {
           if (idx !== -1) profiles.splice(idx, 1);
           if (activeProfileId === args.profile_id) {
             activeProfileId = profiles[0]?.id || null;
+            syncCurrentUser();
             connectionState = activeProfileId ? { status: 'connected' } : { status: 'disconnected' };
             emit({ type: 'connection_changed', state: { ...connectionState } });
           }
           return true;
+        }
+
+        case 'get_current_user_profile': {
+          if (!currentUser) throw new Error('Not connected to an instance');
+          return { ...currentUser, stats: { ...currentUser.stats } };
+        }
+
+        case 'get_user_pfp_data_url': {
+          return pfpStore.get(`${activeProfileId}_${args.user_id}`) || null;
+        }
+
+        case 'upload_profile_pfp': {
+          if (!currentUser) throw new Error('Not connected to an instance');
+          let bytes;
+          if (Array.isArray(args.payload)) {
+            bytes = Uint8Array.from(args.payload);
+          } else {
+            const raw = String(args.payload || '').trim();
+            const b64 = raw.includes(',') ? raw.slice(raw.indexOf(',') + 1) : raw;
+            const decoded = atob(b64);
+            bytes = Uint8Array.from(decoded, (c) => c.charCodeAt(0));
+          }
+          if (!bytes.length) throw new Error('profile picture is empty');
+          if (bytes.length > 8 * 1024 * 1024) {
+            throw new Error('profile picture too large (max 8 MB)');
+          }
+          const ct = String(args.content_type || '').toLowerCase();
+          if (ct !== 'image/jpeg' && ct !== 'image/png') {
+            throw new Error('profile picture must be image/jpeg or image/png');
+          }
+          let binary = '';
+          for (const b of bytes) binary += String.fromCharCode(b);
+          const dataUrl = `data:${ct};base64,${btoa(binary)}`;
+          pfpStore.set(`${activeProfileId}_${currentUser.id}`, dataUrl);
+          currentUser.pfp = `/api/auth/users/${currentUser.id}/pfp`;
+          for (const g of games) {
+            if (g.uploaded_by === currentUser.id) g.uploader_pfp = currentUser.pfp;
+          }
+          emit({ type: 'profile_updated', profile: profiles.find((p) => p.id === activeProfileId) });
+          return currentUser.pfp;
+        }
+
+        case 'remove_profile_pfp': {
+          if (!currentUser) throw new Error('Not connected to an instance');
+          pfpStore.delete(`${activeProfileId}_${currentUser.id}`);
+          currentUser.pfp = '/img/blankpfp.jpg';
+          for (const g of games) {
+            if (g.uploaded_by === currentUser.id) g.uploader_pfp = currentUser.pfp;
+          }
+          emit({ type: 'profile_updated', profile: profiles.find((p) => p.id === activeProfileId) });
+          return currentUser.pfp;
+        }
+
+        case 'delete_server_account': {
+          if (!currentUser) throw new Error('Not connected to an instance');
+          const admins = profiles.filter((p) => p.role === 'admin');
+          if (currentUser.role === 'admin' && admins.length <= 1) {
+            throw new Error('api error: server returned 400: cannot delete the last admin');
+          }
+          const idx = profiles.findIndex((p) => p.id === activeProfileId);
+          if (idx !== -1) profiles.splice(idx, 1);
+          pfpStore.delete(`${activeProfileId}_${currentUser.id}`);
+          activeProfileId = profiles[0]?.id || null;
+          syncCurrentUser();
+          connectionState = activeProfileId ? { status: 'connected' } : { status: 'disconnected' };
+          emit({ type: 'connection_changed', state: { ...connectionState } });
+          return true;
+        }
+
+        case 'rename_profile': {
+          const target = profiles.find((p) => p.id === activeProfileId);
+          if (!target) throw new Error('No active profile');
+          const label = String(args.label || '').trim();
+          if (!label) throw new Error('Instance label cannot be empty');
+          target.label = label;
+          const updated = { ...target };
+          emit({ type: 'profile_updated', profile: updated });
+          return updated;
         }
 
         case 'reconnect_now': {
@@ -731,14 +1035,38 @@ function createMockRuntime() {
         case 'launch_game': {
           const g = games.find((x) => x.game_id === args.game_id);
           if (!g || !g.installed) throw new Error('Game is not installed');
+          playingMockGames.add(g.game_id);
+          const runtime = g.proton_override || (g.binary_kind === 'windows_pe' ? 'GE-Proton9-25' : 'native');
+          pushMockActivity({
+            game_id: g.game_id,
+            game_name: g.name,
+            kind: 'game_start',
+            level: 'info',
+            title: `Started ${g.name}`,
+            detail: `Runtime: ${runtime}`,
+          });
           emit({
             type: 'game_session_started',
             game_id: g.game_id,
             name: g.name,
           });
-          // Simulate a live play session that exits after 3.2s and auto-syncs saves
+          // Simulate a live play session that exits after 2.6s and auto-syncs saves
           setTimeout(() => {
-            emit({ type: 'sync_started', game_id: g.game_id });
+            playingMockGames.delete(g.game_id);
+            pushMockActivity({
+              game_id: g.game_id,
+              game_name: g.name,
+              kind: 'game_close',
+              level: 'info',
+              title: `Closed ${g.name}`,
+              detail: 'Played 4m · Auto-syncing saves…',
+            });
+            emit({
+              type: 'game_sync_started',
+              game_id: g.game_id,
+              name: g.name,
+              trigger: 'post_exit',
+            });
             setTimeout(() => {
               const durationSecs = 240;
               g.playtime.total_secs += durationSecs;
@@ -746,30 +1074,75 @@ function createMockRuntime() {
               g.playtime.last_played_at = new Date().toISOString();
               g.last_synced_at = new Date().toISOString();
               g.pending_sync = false;
+              g.has_overlay = true;
               const pIdx = pendingSyncs.findIndex((p) => p.game_id === g.game_id);
               if (pIdx !== -1) pendingSyncs.splice(pIdx, 1);
 
+              pushMockActivity({
+                game_id: g.game_id,
+                game_name: g.name,
+                kind: 'sync_complete',
+                level: 'accent',
+                title: `Auto-synced ${g.name}`,
+                detail: '2 uploaded (184.0 KB) · 148 unchanged',
+              });
+              emit({
+                type: 'game_sync_completed',
+                game_id: g.game_id,
+                name: g.name,
+                trigger: 'post_exit',
+                uploaded_files: 2,
+                uploaded_bytes: 188416,
+                deleted_paths: 0,
+              });
               emit({
                 type: 'game_session_ended',
                 game_id: g.game_id,
+                name: g.name,
                 duration_secs: durationSecs,
                 synced: true,
+                uploaded_files: 2,
+                uploaded_bytes: 188416,
+                deleted_paths: 0,
                 error: null,
               });
-            }, 1200);
-          }, 3200);
+            }, 1350);
+          }, 2600);
           return true;
         }
 
         case 'sync_game_now': {
           const g = games.find((x) => x.game_id === args.game_id);
           if (!g || !g.installed) throw new Error('Game is not installed');
+          emit({
+            type: 'game_sync_started',
+            game_id: g.game_id,
+            name: g.name,
+            trigger: 'manual',
+          });
           await new Promise((r) => setTimeout(r, 900));
           g.last_synced_at = new Date().toISOString();
           g.pending_sync = false;
           g.has_overlay = true;
           const pIdx = pendingSyncs.findIndex((p) => p.game_id === g.game_id);
           if (pIdx !== -1) pendingSyncs.splice(pIdx, 1);
+          pushMockActivity({
+            game_id: g.game_id,
+            game_name: g.name,
+            kind: 'sync_complete',
+            level: 'accent',
+            title: `Synced saves for ${g.name}`,
+            detail: '3 uploaded (288.0 KB) · 148 unchanged',
+          });
+          emit({
+            type: 'game_sync_completed',
+            game_id: g.game_id,
+            name: g.name,
+            trigger: 'manual',
+            uploaded_files: 3,
+            uploaded_bytes: 294912,
+            deleted_paths: 0,
+          });
           return {
             uploaded_files: 3,
             uploaded_bytes: 294912,
@@ -841,6 +1214,285 @@ function createMockRuntime() {
           return job.id;
         }
 
+        case 'change_username': {
+          if (!currentUser) throw new Error('Not connected to an instance');
+          const next = String(args.username || '').trim();
+          if (!next) throw new Error('Profile name cannot be empty');
+          if (profiles.some((p) => p.id !== activeProfileId && p.username.toLowerCase() === next.toLowerCase())) {
+            throw new Error('server returned 409: username already taken');
+          }
+          currentUser.username = next;
+          for (const p of profiles) {
+            if (p.id === activeProfileId || p.user_id === currentUser.id) p.username = next;
+          }
+          const updated = profiles.find((p) => p.id === activeProfileId);
+          emit({ type: 'profile_updated', profile: updated });
+          return updated;
+        }
+
+        case 'pick_upload_folder': {
+          return '/home/user/Games/My Game';
+        }
+
+        case 'scan_upload_folder': {
+          const raw = String(args.path || '').trim();
+          if (!raw) throw new Error('Folder path is empty');
+          const name = raw.replace(/\/+$/, '').split(/[\\/]/).pop() || 'Game';
+          return {
+            file_count: 42,
+            total_bytes: 1_374_000_000,
+            name: name.replace(/[_-]+/g, ' ').trim(),
+            top_files: [
+              'Data/Pak/main.pak',
+              'Data/Textures/hd_4k.dds',
+              'Bin/game.exe',
+              'Data/Audio/ost.bank',
+            ],
+          };
+        }
+
+        case 'start_game_upload': {
+          if (!currentUser) throw new Error('Not connected to an instance');
+          const name = String(args.name || '').trim();
+          if (!name) throw new Error('Game name is required');
+          const total = 320_000_000 + Math.floor(Math.random() * 180_000_000);
+          const job = {
+            id: `up-${nextUploadSeq++}`,
+            name,
+            game_id: null,
+            description: String(args.description || ''),
+            system_requirements: String(args.system_requirements || ''),
+            cover: Boolean(args.cover),
+            status: { state: 'uploading' },
+            bytes_uploaded: 0,
+            total_bytes: total,
+            files_uploaded: 0,
+            total_files: 48,
+            current_file: 'Data/Pak/main.pak',
+            bytes_per_sec: 48_000_000,
+            speed_samples: mockUploadSamples(48_000_000, 10),
+            _phase: 0,
+          };
+          uploads.unshift(job);
+          emit({ type: 'upload_updated', job: cloneUploadJob(job) });
+          return job.id;
+        }
+
+        case 'upload_game_chunk': {
+          const job = uploads.find((u) => u.id === args.job_id);
+          if (!job) throw new Error('Upload job not found');
+          return true;
+        }
+
+        case 'finalize_dropped_upload': {
+          const job = uploads.find((u) => u.id === args.job_id);
+          if (!job) throw new Error('Upload job not found');
+          return true;
+        }
+
+        case 'pause_upload': {
+          const job = uploads.find((u) => u.id === args.job_id);
+          if (job && (job.status.state === 'uploading' || job.status.state === 'queued')) {
+            job.status = { state: 'paused' };
+            job.bytes_per_sec = 0;
+            emit({ type: 'upload_updated', job: cloneUploadJob(job) });
+            return true;
+          }
+          return false;
+        }
+
+        case 'resume_upload': {
+          const job = uploads.find((u) => u.id === args.job_id);
+          if (job && job.status.state === 'paused') {
+            job.status = { state: 'uploading' };
+            emit({ type: 'upload_updated', job: cloneUploadJob(job) });
+            return true;
+          }
+          return false;
+        }
+
+        case 'cancel_upload': {
+          const idx = uploads.findIndex((u) => u.id === args.job_id);
+          if (idx !== -1) {
+            const [job] = uploads.splice(idx, 1);
+            job.status = { state: 'cancelled' };
+            job.bytes_per_sec = 0;
+            emit({ type: 'upload_updated', job: cloneUploadJob(job) });
+            return true;
+          }
+          return false;
+        }
+
+        case 'list_uploads': {
+          return uploads.map(cloneUploadJob);
+        }
+
+        case 'list_activity_logs': {
+          const limit = Number(args.limit || 80);
+          return activityLogs
+            .filter((l) => l.profile_id === activeProfileId)
+            .slice(0, limit)
+            .map((l) => ({ ...l }));
+        }
+
+        case 'clear_activity_logs': {
+          for (let i = activityLogs.length - 1; i >= 0; i--) {
+            if (activityLogs[i].profile_id === activeProfileId) {
+              activityLogs.splice(i, 1);
+            }
+          }
+          return true;
+        }
+
+        case 'list_interrupted_sessions': {
+          return interruptedSessions
+            .filter((s) => s.profile_id === activeProfileId)
+            .map((s) => ({ ...s, sample_paths: [...(s.sample_paths || [])] }));
+        }
+
+        case 'resolve_interrupted_session': {
+          const idx = interruptedSessions.findIndex((s) => s.game_id === args.game_id);
+          const session = idx !== -1 ? interruptedSessions.splice(idx, 1)[0] : null;
+          const g = games.find((x) => x.game_id === args.game_id);
+          const gName = session?.game_name || g?.name || `Game #${args.game_id}`;
+          if (!args.sync_saves) {
+            pushMockActivity({
+              game_id: args.game_id,
+              game_name: gName,
+              kind: 'crash_resolved',
+              level: 'info',
+              title: `Dismissed save recovery for ${gName}`,
+              detail: 'Local save files kept on disk without uploading',
+            });
+            return null;
+          }
+          emit({
+            type: 'game_sync_started',
+            game_id: args.game_id,
+            name: gName,
+            trigger: 'recovery',
+          });
+          await new Promise((r) => setTimeout(r, 950));
+          if (g) {
+            g.last_synced_at = new Date().toISOString();
+            g.pending_sync = false;
+            g.has_overlay = true;
+          }
+          const uploadedFiles = session?.changed_files || 2;
+          const uploadedBytes = session?.changed_bytes || 245760;
+          pushMockActivity({
+            game_id: args.game_id,
+            game_name: gName,
+            kind: 'sync_complete',
+            level: 'accent',
+            title: `Recovered & synced saves for ${gName}`,
+            detail: `${uploadedFiles} uploaded (${(uploadedBytes / 1024).toFixed(1)} KB)`,
+          });
+          emit({
+            type: 'game_sync_completed',
+            game_id: args.game_id,
+            name: gName,
+            trigger: 'recovery',
+            uploaded_files: uploadedFiles,
+            uploaded_bytes: uploadedBytes,
+            deleted_paths: 0,
+          });
+          return {
+            uploaded_files: uploadedFiles,
+            uploaded_bytes: uploadedBytes,
+            deleted_paths: 0,
+            skipped_unchanged: 120,
+          };
+        }
+
+        case 'get_shutdown_status': {
+          const playingNames = [...playingMockGames].map(
+            (id) => games.find((g) => g.game_id === id)?.name || `Game #${id}`,
+          );
+          const activeDls = downloads.filter((d) =>
+            ['queued', 'downloading', 'verifying'].includes(d.status?.state),
+          ).length;
+          const activeUps = uploads.filter((u) =>
+            ['queued', 'uploading', 'indexing'].includes(u.status?.state),
+          ).length;
+          return {
+            active_syncs: 0,
+            playing_games: playingNames,
+            active_downloads: activeDls,
+            active_uploads: activeUps,
+            ready_to_exit: playingNames.length === 0 && activeDls === 0 && activeUps === 0,
+          };
+        }
+
+        case 'confirm_safe_shutdown': {
+          const playingNames = [...playingMockGames].map(
+            (id) => games.find((g) => g.game_id === id)?.name || `Game #${id}`,
+          );
+          if (!args.force_while_playing && playingNames.length > 0) {
+            return {
+              completed: false,
+              active_syncs_remaining: 0,
+              playing_games: playingNames,
+              wal_checkpointed: false,
+            };
+          }
+          emit({
+            type: 'shutdown_progress',
+            stage: 'waiting_for_sync',
+            active_syncs: 0,
+            message: 'Checkpointing SQLite WAL and flushing session state…',
+          });
+          await new Promise((r) => setTimeout(r, 450));
+          pushMockActivity({
+            kind: 'safe_shutdown',
+            level: 'info',
+            title: 'Safe shutdown completed',
+            detail: 'In-flight save syncs flushed and SQLite WAL checkpointed',
+          });
+          emit({
+            type: 'shutdown_progress',
+            stage: 'ready',
+            active_syncs: 0,
+            message: 'Safe shutdown complete',
+          });
+          return {
+            completed: true,
+            active_syncs_remaining: 0,
+            playing_games: playingNames,
+            wal_checkpointed: true,
+          };
+        }
+
+        case 'simulate_interrupted_session': {
+          const g = games.find((x) => x.game_id === (args.game_id || 1)) || games[0];
+          const dto = {
+            profile_id: activeProfileId || 'prof-home-lan',
+            game_id: g.game_id,
+            game_name: g.name,
+            install_dir: g.install_dir || `/home/user/Games/OpenSync/${g.slug}`,
+            runtime: g.proton_override || 'native',
+            started_at: new Date(Date.now() - 25 * 60 * 1000).toISOString(),
+            last_heartbeat_at: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+            active_secs: 1380,
+            has_unsynced_saves: true,
+            changed_files: 2,
+            deleted_files: 0,
+            changed_bytes: 245760,
+            sample_paths: ['saves/slot1.sav', 'saves/autosave_checkpoint.dat'],
+          };
+          interruptedSessions.push(dto);
+          pushMockActivity({
+            game_id: g.game_id,
+            game_name: g.name,
+            kind: 'crash_detected',
+            level: 'warn',
+            title: `Interrupted session detected for ${g.name}`,
+            detail: '2 unsynced save file(s) (240.0 KB) found after unexpected close',
+          });
+          emit({ type: 'interrupted_session_detected', session: { ...dto } });
+          return dto;
+        }
+
         default:
           throw new Error(`Unknown command: ${cmd}`);
       }
@@ -873,10 +1525,20 @@ export async function listenEvents(handler) {
 
 export const bridge = {
   getBootstrapState: () => invokeCmd('get_bootstrap_state'),
+  getGamesDir: () => invokeCmd('get_games_dir'),
+  setGamesDir: (path) => invokeCmd('set_games_dir', { path }),
   connectProfile: ({ label, server_url, username, password, register = false }) =>
     invokeCmd('connect_profile', { label, server_url, username, password, register }),
   switchProfile: (profile_id) => invokeCmd('switch_profile', { profile_id }),
   deleteProfile: (profile_id) => invokeCmd('delete_profile', { profile_id }),
+  getCurrentUserProfile: () => invokeCmd('get_current_user_profile'),
+  getUserPfpDataUrl: (pfp_path, user_id) =>
+    invokeCmd('get_user_pfp_data_url', { pfp_path, user_id }),
+  uploadProfilePfp: (payload, content_type) =>
+    invokeCmd('upload_profile_pfp', { payload, content_type }),
+  removeProfilePfp: () => invokeCmd('remove_profile_pfp'),
+  deleteServerAccount: () => invokeCmd('delete_server_account'),
+  renameProfile: (label) => invokeCmd('rename_profile', { label }),
   reconnectNow: () => invokeCmd('reconnect_now'),
   listLibrary: () => invokeCmd('list_library'),
   getGameCoverDataUrl: (game_id) => invokeCmd('get_game_cover_data_url', { game_id }),
@@ -899,4 +1561,33 @@ export const bridge = {
   listProtonInstallations: () => invokeCmd('list_proton_installations'),
   fetchLatestGeProton: () => invokeCmd('fetch_latest_ge_proton'),
   downloadGeProton: (release) => invokeCmd('download_ge_proton', { release }),
+  changeUsername: (username) => invokeCmd('change_username', { username }),
+  pickUploadFolder: () => invokeCmd('pick_upload_folder'),
+  scanUploadFolder: (path) => invokeCmd('scan_upload_folder', { path }),
+  startGameUpload: ({ name, description, system_requirements, folder, cover, cover_content_type }) =>
+    invokeCmd('start_game_upload', {
+      name,
+      description,
+      system_requirements,
+      folder,
+      cover,
+      cover_content_type,
+    }),
+  uploadGameChunk: ({ job_id, rel_path, index, total, size, chunk }) =>
+    invokeCmd('upload_game_chunk', { job_id, rel_path, index, total, size, chunk }),
+  finalizeDroppedUpload: (job_id) => invokeCmd('finalize_dropped_upload', { job_id }),
+  pauseUpload: (job_id) => invokeCmd('pause_upload', { job_id }),
+  resumeUpload: (job_id) => invokeCmd('resume_upload', { job_id }),
+  cancelUpload: (job_id) => invokeCmd('cancel_upload', { job_id }),
+  listUploads: () => invokeCmd('list_uploads'),
+  listActivityLogs: (limit = 80) => invokeCmd('list_activity_logs', { limit }),
+  clearActivityLogs: () => invokeCmd('clear_activity_logs'),
+  listInterruptedSessions: () => invokeCmd('list_interrupted_sessions'),
+  resolveInterruptedSession: (game_id, sync_saves = true, force = false) =>
+    invokeCmd('resolve_interrupted_session', { game_id, sync_saves, force }),
+  getShutdownStatus: () => invokeCmd('get_shutdown_status'),
+  confirmSafeShutdown: (force_while_playing = false) =>
+    invokeCmd('confirm_safe_shutdown', { force_while_playing }),
+  simulateInterruptedSession: (game_id = 1) =>
+    invokeCmd('simulate_interrupted_session', { game_id }),
 };

@@ -4,14 +4,14 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenSync Launcher</title>
-  <link rel="icon" type="image/png" href="img/opensync-squares.png" />
+  <link rel="icon" type="image/png" href="img/favicon.png" />
   <link rel="stylesheet" href="css/launcher.css" />
 </head>
 <body>
   <div class="shell" id="app-shell">
     <header class="topbar" id="topbar">
       <a href="#library" class="logo" id="brand-logo" title="OpenSync Library" aria-label="OpenSync Library">
-        <img src="img/opensync.png" alt="OpenSync" />
+        <img src="img/opensync-nav-2x.png" srcset="img/opensync-nav-1x.png 1x, img/opensync-nav-2x.png 2x, img/opensync-nav-3x.png 3x" height="34" alt="OpenSync" />
       </a>
 
       <nav class="nav" id="main-nav" aria-label="Primary navigation">
@@ -20,8 +20,7 @@
           <span>downloads</span>
           <span class="nav-dl-pill" id="nav-dl-pill" hidden></span>
         </a>
-        <a href="#proton" class="nav-link" data-view="proton">proton</a>
-        <a href="#profiles" class="nav-link" data-view="profiles">instances</a>
+        <a href="#settings" class="nav-link" data-view="settings">settings</a>
       </nav>
 
       <div class="topbar-user" id="topbar-user">
@@ -31,12 +30,14 @@
     </header>
 
     <main id="view" class="workspace" tabindex="-1"></main>
+    <button type="button" class="fab-upload" id="fab-upload" aria-label="Upload a game" title="Upload a game" hidden></button>
   </div>
 
   <footer class="gamepad-bar" id="gamepad-bar" aria-live="polite" hidden></footer>
 
   <div id="modal-root"></div>
   <div id="lightbox-root"></div>
+  <div id="sync-banner-root" class="sync-banner-stack" aria-live="polite"></div>
   <div id="toast-root" class="toast-stack" aria-live="polite"></div>
 
   <script type="module" src="js/app.js"></script>

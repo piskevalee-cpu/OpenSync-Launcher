@@ -7,13 +7,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use walkdir::WalkDir;
 
 const LOCAL_FILE_HEADER_SIG: u32 = 0x0403_4b50;
 const DATA_DESCRIPTOR_SIG: [u8; 4] = [0x50, 0x4b, 0x07, 0x08];
@@ -143,6 +144,372 @@ impl DownloadControl {
     pub fn snapshot(&self) -> TransferProgress {
         self.progress.lock().unwrap().clone()
     }
+}
+
+/// Live progress of a chunked folder upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadProgress {
+    pub bytes_uploaded: u64,
+    pub total_bytes: u64,
+    pub files_uploaded: usize,
+    pub total_files: usize,
+    pub current_file: Option<String>,
+    pub bytes_per_sec: f64,
+    pub paused: bool,
+    pub speed_samples: Vec<SpeedSample>,
+}
+
+#[derive(Debug)]
+struct UploadRate {
+    started: Instant,
+    last_sample: Instant,
+    bytes_since_sample: u64,
+}
+
+/// Pause/cancel/progress handle shared by all file workers of a folder upload.
+#[derive(Debug, Clone)]
+pub struct UploadControl {
+    paused: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    progress: Arc<Mutex<UploadProgress>>,
+    rate: Arc<Mutex<UploadRate>>,
+}
+
+impl UploadControl {
+    pub fn new(total_bytes: u64, total_files: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            paused: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new(UploadProgress {
+                bytes_uploaded: 0,
+                total_bytes,
+                files_uploaded: 0,
+                total_files,
+                current_file: None,
+                bytes_per_sec: 0.0,
+                paused: false,
+                speed_samples: Vec::new(),
+            })),
+            rate: Arc::new(Mutex::new(UploadRate {
+                started: now,
+                last_sample: now,
+                bytes_since_sample: 0,
+            })),
+        }
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+        self.progress.lock().unwrap().paused = true;
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.progress.lock().unwrap().paused = false;
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub fn paused_flag(&self) -> Arc<AtomicBool> {
+        self.paused.clone()
+    }
+
+    pub fn cancelled_flag(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+
+    pub fn snapshot(&self) -> UploadProgress {
+        self.progress.lock().unwrap().clone()
+    }
+
+    pub fn set_total_bytes(&self, total: u64) {
+        self.progress.lock().unwrap().total_bytes = total;
+    }
+
+    pub fn set_total_files(&self, total: usize) {
+        self.progress.lock().unwrap().total_files = total;
+    }
+
+    pub fn set_current_file(&self, path: Option<String>) {
+        self.progress.lock().unwrap().current_file = path;
+    }
+
+    pub fn set_bytes_per_sec(&self, bytes_per_sec: f64) {
+        self.progress.lock().unwrap().bytes_per_sec = bytes_per_sec;
+    }
+
+    /// Records bytes that have left the client and refreshes the rolling speed telemetry
+    /// roughly every 100 ms (last 60 samples are retained for the waveform).
+    pub fn add_bytes(&self, bytes: u64) {
+        let mut rate = self.rate.lock().unwrap();
+        let dt = rate.last_sample.elapsed();
+        let sample = if dt >= Duration::from_millis(100) {
+            let bps = if dt.as_secs_f64() > 0.0 {
+                rate.bytes_since_sample as f64 / dt.as_secs_f64()
+            } else {
+                0.0
+            };
+            Some(SpeedSample {
+                elapsed_ms: rate.started.elapsed().as_millis() as u64,
+                bytes_per_sec: bps,
+            })
+        } else {
+            None
+        };
+        if sample.is_some() {
+            rate.last_sample = Instant::now();
+            rate.bytes_since_sample = 0;
+        }
+        rate.bytes_since_sample += bytes;
+        drop(rate);
+
+        let mut progress = self.progress.lock().unwrap();
+        progress.bytes_uploaded += bytes;
+        if let Some(sample) = sample {
+            progress.bytes_per_sec = sample.bytes_per_sec;
+            progress.speed_samples.push(sample);
+            if progress.speed_samples.len() > 60 {
+                progress.speed_samples.remove(0);
+            }
+        }
+    }
+
+    pub fn finish_file(&self) {
+        self.progress.lock().unwrap().files_uploaded += 1;
+    }
+}
+
+/// Result of a successful chunked folder upload (never calls `upload/complete`).
+#[derive(Debug, Clone)]
+pub struct UploadOutcome {
+    pub files: Vec<(String, u64)>,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct UploadSpec {
+    path: PathBuf,
+    rel: String,
+    size: u64,
+}
+
+const UPLOAD_WORKERS: usize = 6;
+/// Number of 4 MB chunks kept in flight per file (current + prefetched next).
+const UPLOAD_BUFFER_CHUNKS: usize = 2;
+
+fn chunk_total(size: u64, chunk_size: usize) -> usize {
+    if size == 0 {
+        1
+    } else {
+        size.div_ceil(chunk_size as u64) as usize
+    }
+}
+
+fn is_hidden_entry(entry: &walkdir::DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+/// Recursively uploads a folder's files in parallel, largest first, using bounded read-ahead
+/// double buffering. Already-received chunks (from `upload/init`) are skipped. The caller is
+/// responsible for calling `upload_game_complete` after this returns.
+pub async fn upload_folder(
+    client: &OpenSyncClient,
+    game_id: i64,
+    root: &Path,
+    control: &UploadControl,
+) -> TransferResult<UploadOutcome> {
+    let init = client.upload_game_init(game_id).await?;
+    let chunk_size = init.chunk_size.max(1);
+    let received_by_path: HashMap<&str, usize> = init
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.received))
+        .collect();
+
+    let mut specs = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            // tempdir roots (e.g. `/tmp/.tmpXXXX`) are hidden too — only filter descendants.
+            e.depth() == 0 || !is_hidden_entry(e)
+        })
+    {
+        let entry = entry.map_err(|e| io::Error::other(e.to_string()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        if name.ends_with(".part") {
+            continue;
+        }
+        let Ok(rel_path) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let rel_raw = rel_path.to_string_lossy();
+        if safe_rel_path(&rel_raw).is_err() {
+            continue;
+        }
+        specs.push(UploadSpec {
+            path: entry.path().to_path_buf(),
+            rel: rel_raw.replace('\\', "/"),
+            size: entry
+                .metadata()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .len(),
+        });
+    }
+
+    // LPT: largest files first so a single multi-chunk file cannot hold up the tail.
+    specs.sort_by(|a, b| b.size.cmp(&a.size));
+    control.set_total_files(specs.len());
+    control.set_total_bytes(specs.iter().map(|f| f.size).sum());
+
+    // Count resumed chunks as already transferred so progress ends at 100%.
+    for spec in &specs {
+        let total = chunk_total(spec.size, chunk_size);
+        let done = received_by_path
+            .get(spec.rel.as_str())
+            .copied()
+            .unwrap_or(0)
+            .min(total);
+        if done > 0 {
+            control.add_bytes((done as u64 * chunk_size as u64).min(spec.size));
+            if done >= total {
+                control.finish_file();
+            }
+        }
+    }
+
+    let results: Vec<TransferResult<(String, u64)>> = futures_util::stream::iter(specs)
+        .map(|spec| {
+            let client = client.clone();
+            let control = control.clone();
+            let received = received_by_path
+                .get(spec.rel.as_str())
+                .copied()
+                .unwrap_or(0);
+            async move {
+                upload_one_file(
+                    &client,
+                    game_id,
+                    &spec,
+                    chunk_size,
+                    &control,
+                    received,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(UPLOAD_WORKERS)
+        .collect()
+        .await;
+
+    let mut files = Vec::with_capacity(results.len());
+    for result in results {
+        files.push(result?);
+    }
+    let total_bytes = files.iter().map(|(_, size)| *size).sum();
+    Ok(UploadOutcome {
+        files,
+        total_bytes,
+    })
+}
+
+async fn upload_one_file(
+    client: &OpenSyncClient,
+    game_id: i64,
+    spec: &UploadSpec,
+    chunk_size: usize,
+    control: &UploadControl,
+    received: usize,
+) -> TransferResult<(String, u64)> {
+    let total = chunk_total(spec.size, chunk_size);
+    let start = received.min(total);
+    control.set_current_file(Some(spec.rel.clone()));
+    if start >= total {
+        return Ok((spec.rel.clone(), spec.size));
+    }
+
+    let path = spec.path.clone();
+    let size = spec.size;
+    let cancelled = control.cancelled_flag();
+    let (tx, mut rx) = mpsc::channel::<(usize, Bytes)>(UPLOAD_BUFFER_CHUNKS);
+    // Disk reads run on the blocking pool while the previous chunk is in flight on reqwest's
+    // persistent connection. Bounded channel = read-ahead double buffering.
+    let reader = tokio::task::spawn_blocking(move || -> io::Result<()> {
+        let mut file = File::open(&path)?;
+        for index in start..total {
+            if cancelled.load(Ordering::SeqCst) {
+                break;
+            }
+            let offset = (index * chunk_size) as u64;
+            let len = chunk_size.min(size.saturating_sub(offset) as usize);
+            let mut buf = vec![0u8; len];
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut buf)?;
+            if tx.blocking_send((index, Bytes::from(buf))).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+
+    let mut result: TransferResult<()> = Ok(());
+    for _ in start..total {
+        loop {
+            if control.is_cancelled() {
+                result = Err(TransferError::Cancelled);
+                break;
+            }
+            if !control.is_paused() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if result.is_err() {
+            break;
+        }
+
+        let Some((index, data)) = rx.recv().await else {
+            result = Err(TransferError::Cancelled);
+            break;
+        };
+        control.add_bytes(data.len() as u64);
+        if let Err(err) =
+            client
+                .upload_game_chunk(game_id, &spec.rel, index, total, spec.size, data)
+                .await
+        {
+            result = Err(err.into());
+            break;
+        }
+    }
+
+    if result.is_err() {
+        reader.abort();
+    }
+    let _ = reader.await;
+    result?;
+    control.finish_file();
+    Ok((spec.rel.clone(), spec.size))
 }
 
 #[derive(Debug, Clone)]

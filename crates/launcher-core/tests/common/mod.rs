@@ -5,6 +5,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +20,8 @@ pub struct MockGame {
     pub slug: String,
     pub files: HashMap<String, Vec<u8>>,
     pub corrupt_download_file: Option<String>,
+    pub uploaded_by: Option<i64>,
+    pub uploader_name: Option<String>,
 }
 
 #[derive(Default)]
@@ -35,7 +38,19 @@ pub struct MockServerState {
     pub parts: HashMap<(i64, i64), HashMap<String, Vec<u8>>>,
     /// (user_id, game_id) -> deleted paths
     pub deletions: HashMap<(i64, i64), Vec<String>>,
+    /// user_id -> (avatar bytes, content type)
+    pub pfps: HashMap<i64, (Vec<u8>, String)>,
+    /// user_id -> RFC3339 account creation date
+    pub created_at: HashMap<i64, String>,
+    /// user_id -> (games uploaded, games downloaded, saves synced)
+    pub stats: HashMap<i64, (u64, u64, u64)>,
     pub sync_complete_calls: usize,
+    /// (game_id, rel_path) -> bytes received so far for chunked game uploads
+    pub upload_parts: HashMap<(i64, String), Vec<u8>>,
+    /// game_id -> processing status (defaults to "ready" for games added by `add_game`)
+    pub game_status: HashMap<i64, String>,
+    /// Optional artificial per-chunk delay (used by pause/cancel tests).
+    pub chunk_delay_ms: u64,
 }
 
 pub struct MockOpenSyncServer {
@@ -87,11 +102,52 @@ impl MockOpenSyncServer {
 
     pub fn add_user(&self, id: i64, username: &str, password: &str) -> String {
         let cookie = format!("ohs=tok-{username}-{id}");
-        self.state.lock().unwrap().users.insert(
+        let mut st = self.state.lock().unwrap();
+        st.users.insert(
             username.to_string(),
             (id, password.to_string(), cookie.clone()),
         );
+        st.created_at
+            .insert(id, "2026-01-01T00:00:00Z".to_string());
+        st.stats.insert(id, (0, 0, 0));
         cookie
+    }
+
+    /// Sets a user's avatar as it would be stored by `PUT /api/auth/me/pfp`.
+    pub fn set_user_pfp(&self, user_id: i64, bytes: Vec<u8>, content_type: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .pfps
+            .insert(user_id, (bytes, content_type.to_string()));
+    }
+
+    pub fn user_pfp(&self, user_id: i64) -> Option<(Vec<u8>, String)> {
+        self.state.lock().unwrap().pfps.get(&user_id).cloned()
+    }
+
+    pub fn set_user_stats(&self, user_id: i64, uploaded: u64, downloaded: u64, synced: u64) {
+        self.state
+            .lock()
+            .unwrap()
+            .stats
+            .insert(user_id, (uploaded, downloaded, synced));
+    }
+
+    pub fn set_user_created_at(&self, user_id: i64, created_at: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .created_at
+            .insert(user_id, created_at.to_string());
+    }
+
+    pub fn is_user_deleted(&self, username: &str) -> bool {
+        !self.state.lock().unwrap().users.contains_key(username)
+    }
+
+    pub fn user_count(&self) -> usize {
+        self.state.lock().unwrap().users.len()
     }
 
     pub fn add_game(&self, id: i64, name: &str, slug: &str, files: Vec<(&str, Vec<u8>)>) {
@@ -107,8 +163,19 @@ impl MockOpenSyncServer {
                 slug: slug.to_string(),
                 files: map,
                 corrupt_download_file: None,
+                uploaded_by: None,
+                uploader_name: None,
             },
         );
+    }
+
+    /// Attaches an uploader to a game so `/api/games` can expose `uploaded_by`,
+    /// `uploader_name` and `uploader_pfp` like the real server does.
+    pub fn set_game_uploader(&self, game_id: i64, user_id: i64, username: &str) {
+        if let Some(g) = self.state.lock().unwrap().games.get_mut(&game_id) {
+            g.uploaded_by = Some(user_id);
+            g.uploader_name = Some(username.to_string());
+        }
     }
 
     pub fn set_corrupt_download(&self, game_id: i64, rel_path: &str) {
@@ -155,6 +222,27 @@ impl MockOpenSyncServer {
 
     pub fn sync_count(&self) -> usize {
         self.state.lock().unwrap().sync_complete_calls
+    }
+
+    pub fn set_chunk_delay_ms(&self, ms: u64) {
+        self.state.lock().unwrap().chunk_delay_ms = ms;
+    }
+
+    pub fn game_files(&self, game_id: i64) -> Option<HashMap<String, Vec<u8>>> {
+        self.state
+            .lock()
+            .unwrap()
+            .games
+            .get(&game_id)
+            .map(|g| g.files.clone())
+    }
+
+    pub fn game_status(&self, game_id: i64) -> Option<String> {
+        self.state.lock().unwrap().game_status.get(&game_id).cloned()
+    }
+
+    pub fn username_exists(&self, username: &str) -> bool {
+        self.state.lock().unwrap().users.contains_key(username)
     }
 }
 
@@ -229,6 +317,13 @@ async fn handle_conn(
         .split_once('?')
         .map(|(p, q)| (p.to_string(), q.to_string()))
         .unwrap_or((full_target, String::new()));
+
+    if method == "POST" && path.ends_with("/files") {
+        let delay = state.lock().unwrap().chunk_delay_ms;
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+    }
 
     let (status, ct, extra_headers, resp_body) =
         route(&method, &path, &query, &headers, &body, &state);
@@ -335,6 +430,18 @@ fn route(
     };
 
     if method == "GET" && path == "/api/auth/me" {
+        let st = state.lock().unwrap();
+        let pfp = if st.pfps.contains_key(&user_id) {
+            format!("/api/auth/users/{user_id}/pfp")
+        } else {
+            "/img/blankpfp.jpg".to_string()
+        };
+        let (uploaded, downloaded, synced) = *st.stats.get(&user_id).unwrap_or(&(0, 0, 0));
+        let created_at = st
+            .created_at
+            .get(&user_id)
+            .cloned()
+            .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_string());
         return json_resp(
             "200 OK",
             json!({
@@ -342,9 +449,126 @@ fn route(
                     "id": user_id,
                     "username": username,
                     "role": if user_id == 1 { "admin" } else { "user" },
+                    "created_at": created_at,
+                    "pfp": pfp,
+                    "stats": {
+                        "uploaded": uploaded,
+                        "downloaded": downloaded,
+                        "synced": synced,
+                    }
                 }
             }),
         );
+    }
+
+    if method == "PATCH" && path == "/api/auth/me" {
+        let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+        let new_name = parsed["username"].as_str().unwrap_or("").trim().to_string();
+        if new_name.is_empty() {
+            return json_resp("400 Bad Request", json!({ "error": "username is required" }));
+        }
+        let mut st = state.lock().unwrap();
+        if st.users.iter().any(|(name, (id, _, _))| {
+            *id != user_id && name.eq_ignore_ascii_case(&new_name)
+        }) {
+            return json_resp("409 Conflict", json!({ "error": "username already taken" }));
+        }
+        let (id, pass, cookie) = st
+            .users
+            .remove(&username)
+            .unwrap_or((user_id, String::new(), String::new()));
+        st.users.insert(new_name.clone(), (id, pass, cookie));
+
+        let pfp = if st.pfps.contains_key(&id) {
+            format!("/api/auth/users/{id}/pfp")
+        } else {
+            "/img/blankpfp.jpg".to_string()
+        };
+        let (uploaded, downloaded, synced) = *st.stats.get(&id).unwrap_or(&(0, 0, 0));
+        let created_at = st
+            .created_at
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| "2026-01-01T00:00:00Z".to_string());
+        return json_resp(
+            "200 OK",
+            json!({
+                "user": {
+                    "id": id,
+                    "username": new_name,
+                    "role": if id == 1 { "admin" } else { "user" },
+                    "created_at": created_at,
+                    "pfp": pfp,
+                    "stats": {
+                        "uploaded": uploaded,
+                        "downloaded": downloaded,
+                        "synced": synced,
+                    }
+                }
+            }),
+        );
+    }
+
+    if method == "PUT" && path == "/api/auth/me/pfp" {
+        let ct = headers.get("content-type").map(String::as_str).unwrap_or("");
+        if ct != "image/jpeg" && ct != "image/png" {
+            return json_resp(
+                "400 Bad Request",
+                json!({ "error": "pfp must be image/jpeg or image/png" }),
+            );
+        }
+        if body.len() > 8 * 1024 * 1024 {
+            return json_resp(
+                "413 Payload Too Large",
+                json!({ "error": "pfp too large (max 8 MB)" }),
+            );
+        }
+        state
+            .lock()
+            .unwrap()
+            .pfps
+            .insert(user_id, (body.to_vec(), ct.to_string()));
+        return json_resp(
+            "200 OK",
+            json!({ "ok": true, "pfp": format!("/api/auth/users/{user_id}/pfp") }),
+        );
+    }
+
+    if method == "DELETE" && path == "/api/auth/me/pfp" {
+        let mut st = state.lock().unwrap();
+        st.pfps.remove(&user_id);
+        return json_resp(
+            "200 OK",
+            json!({ "ok": true, "pfp": "/img/blankpfp.jpg" }),
+        );
+    }
+
+    if method == "GET" && path.starts_with("/api/auth/users/") && path.ends_with("/pfp") {
+        let raw = path
+            .trim_start_matches("/api/auth/users/")
+            .trim_end_matches("/pfp");
+        let Ok(uid) = raw.parse::<i64>() else {
+            return json_resp("400 Bad Request", json!({ "error": "invalid user id" }));
+        };
+        return match state.lock().unwrap().pfps.get(&uid).cloned() {
+            Some((bytes, ct)) => ("200 OK", ct, vec![], bytes),
+            None => ("404 Not Found", "application/json".to_string(), vec![], Vec::new()),
+        };
+    }
+
+    if method == "DELETE" && path == "/api/auth/me" {
+        let mut st = state.lock().unwrap();
+        if user_id == 1 && st.users.values().any(|(id, _, _)| *id == 1) {
+            return json_resp(
+                "400 Bad Request",
+                json!({ "error": "cannot delete the last admin" }),
+            );
+        }
+        st.users.remove(&username);
+        st.pfps.remove(&user_id);
+        st.stats.remove(&user_id);
+        st.created_at.remove(&user_id);
+        return json_resp("200 OK", json!({ "ok": true }));
     }
 
     if method == "GET" && path == "/api/games" {
@@ -358,12 +582,22 @@ fn route(
                     .overlays
                     .get(&(user_id, g.id))
                     .is_some_and(|m| !m.is_empty());
+                let uploader_pfp = g.uploaded_by.map(|uid| {
+                    if st.pfps.contains_key(&uid) {
+                        format!("/api/auth/users/{uid}/pfp")
+                    } else {
+                        "/img/blankpfp.jpg".to_string()
+                    }
+                });
                 json!({
                     "id": g.id,
                     "name": g.name,
                     "slug": g.slug,
                     "status": "ready",
                     "total_size": total_size,
+                    "uploaded_by": g.uploaded_by,
+                    "uploader_name": g.uploader_name,
+                    "uploader_pfp": uploader_pfp,
                     "has_overlay": has_overlay,
                     "download_count": 0,
                     "created_at": "2026-01-01T00:00:00Z",
@@ -371,6 +605,52 @@ fn route(
             })
             .collect();
         return json_resp("200 OK", json!({ "games": games }));
+    }
+
+    if method == "POST" && path == "/api/games" {
+        let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+        let name = parsed["name"].as_str().unwrap_or("").trim().to_string();
+        let _description = parsed["description"].as_str().unwrap_or("").to_string();
+        let _system_requirements = parsed["system_requirements"].as_str().unwrap_or("").to_string();
+        if name.is_empty() {
+            return json_resp("400 Bad Request", json!({ "error": "name is required" }));
+        }
+        let mut st = state.lock().unwrap();
+        let id = st.games.keys().copied().max().unwrap_or(100) + 1;
+        let slug = format!("{}-{}", name.to_lowercase().replace(' ', "-"), id);
+        st.games.insert(
+            id,
+            MockGame {
+                id,
+                name: name.clone(),
+                slug: slug.clone(),
+                files: HashMap::new(),
+                corrupt_download_file: None,
+                uploaded_by: Some(user_id),
+                uploader_name: Some(username.clone()),
+            },
+        );
+        st.game_status.insert(id, "processing".to_string());
+        return json_resp(
+            "201 Created",
+            json!({
+                "game": {
+                    "id": id,
+                    "name": name,
+                    "slug": slug,
+                    "cover": null,
+                    "description": "",
+                    "system_requirements": "",
+                    "status": "processing",
+                    "total_size": 0,
+                    "uploaded_by": user_id,
+                    "uploader_name": username,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "download_count": 0,
+                    "has_overlay": false,
+                }
+            }),
+        );
     }
 
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -392,6 +672,13 @@ fn route(
                 .map(|m| m.values().map(|v| v.len() as u64).sum())
                 .unwrap_or(0);
             let del_count = dels.map(|d| d.len()).unwrap_or(0);
+            let uploader_pfp = g.uploaded_by.map(|uid| {
+                if st.pfps.contains_key(&uid) {
+                    format!("/api/auth/users/{uid}/pfp")
+                } else {
+                    "/img/blankpfp.jpg".to_string()
+                }
+            });
             return json_resp(
                 "200 OK",
                 json!({
@@ -401,6 +688,9 @@ fn route(
                         "slug": g.slug,
                         "status": "ready",
                         "total_size": total_size,
+                        "uploaded_by": g.uploaded_by,
+                        "uploader_name": g.uploader_name,
+                        "uploader_pfp": uploader_pfp,
                         "has_overlay": ov_files > 0 || del_count > 0,
                         "download_count": 0,
                         "created_at": "2026-01-01T00:00:00Z",
@@ -414,6 +704,134 @@ fn route(
                     }
                 }),
             );
+        }
+
+        if method == "DELETE" && segs.len() == 3 {
+            let mut st = state.lock().unwrap();
+            st.games.remove(&game_id);
+            st.game_status.remove(&game_id);
+            st.covers.remove(&game_id);
+            st.upload_parts.retain(|(gid, _), _| *gid != game_id);
+            return json_resp("200 OK", json!({ "ok": true }));
+        }
+
+        if method == "GET" && segs.len() == 4 && segs[3] == "status" {
+            let st = state.lock().unwrap();
+            let status = st
+                .game_status
+                .get(&game_id)
+                .cloned()
+                .unwrap_or_else(|| "ready".to_string());
+            let total_size = st
+                .games
+                .get(&game_id)
+                .map(|g| g.files.values().map(|v| v.len() as u64).sum::<u64>())
+                .unwrap_or(0);
+            return json_resp(
+                "200 OK",
+                json!({ "status": status, "total_size": total_size, "progress": null }),
+            );
+        }
+
+        if method == "POST" && segs.len() == 4 && segs[3] == "cover" {
+            let ct = headers.get("content-type").map(String::as_str).unwrap_or("");
+            if ct != "image/jpeg" && ct != "image/png" {
+                return json_resp(
+                    "400 Bad Request",
+                    json!({ "error": "cover must be image/jpeg or image/png" }),
+                );
+            }
+            state
+                .lock()
+                .unwrap()
+                .covers
+                .insert(game_id, (body.to_vec(), ct.to_string()));
+            return json_resp(
+                "200 OK",
+                json!({ "ok": true, "cover": format!("/api/games/{game_id}/cover") }),
+            );
+        }
+
+        if method == "POST" && segs.len() == 4 && segs[3] == "files" {
+            let rel_path = urlencoding::decode(headers.get("x-path").map(String::as_str).unwrap_or(""))
+                .unwrap_or_default()
+                .to_string();
+            let index: usize = headers
+                .get("x-index")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let total: usize = headers
+                .get("x-total")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+                .max(1);
+            let declared_size: usize = headers
+                .get("x-size")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+
+            let mut st = state.lock().unwrap();
+            if !st.games.contains_key(&game_id) {
+                return json_resp("404 Not Found", json!({ "error": "game not found" }));
+            }
+            let expected_offset = index * TEST_CHUNK_SIZE;
+            let mismatch_received = {
+                let part = st
+                    .upload_parts
+                    .entry((game_id, rel_path.clone()))
+                    .or_default();
+                if part.len() != expected_offset {
+                    Some(part.len().div_ceil(TEST_CHUNK_SIZE))
+                } else {
+                    part.extend_from_slice(body);
+                    None
+                }
+            };
+            if let Some(received) = mismatch_received {
+                return json_resp(
+                    "409 Conflict",
+                    json!({ "error": "chunk out of order", "received": received }),
+                );
+            }
+            if index + 1 == total {
+                let full = st
+                    .upload_parts
+                    .remove(&(game_id, rel_path.clone()))
+                    .unwrap_or_default();
+                if full.len() != declared_size {
+                    return json_resp("400 Bad Request", json!({ "error": "size mismatch" }));
+                }
+                if let Some(game) = st.games.get_mut(&game_id) {
+                    game.files.insert(rel_path, full);
+                }
+                return json_resp("200 OK", json!({ "ok": true, "done": true }));
+            }
+            return json_resp(
+                "200 OK",
+                json!({ "ok": true, "done": false, "received": index + 1 }),
+            );
+        }
+
+        if method == "POST" && segs.len() == 5 && segs[3] == "upload" && segs[4] == "init" {
+            let st = state.lock().unwrap();
+            let files: Vec<serde_json::Value> = st
+                .upload_parts
+                .iter()
+                .filter(|((gid, _), _)| *gid == game_id)
+                .map(|((_, path), bytes)| {
+                    json!({ "path": path, "received": bytes.len().div_ceil(TEST_CHUNK_SIZE) })
+                })
+                .collect();
+            return json_resp(
+                "200 OK",
+                json!({ "chunkSize": TEST_CHUNK_SIZE, "files": files }),
+            );
+        }
+
+        if method == "POST" && segs.len() == 5 && segs[3] == "upload" && segs[4] == "complete" {
+            let mut st = state.lock().unwrap();
+            st.game_status.insert(game_id, "ready".to_string());
+            return json_resp("202 Accepted", json!({ "status": "processing" }));
         }
 
         if method == "GET" && segs.len() == 4 && segs[3] == "cover" {

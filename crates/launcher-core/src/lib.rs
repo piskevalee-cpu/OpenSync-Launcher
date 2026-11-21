@@ -1,28 +1,31 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use launcher_db::{
-    DbError, InstalledGame, LauncherDb, PendingSync, PlaytimeSummary, Profile, SecretStore,
+    ActiveSessionRecord, ActivityLogEntry, DbError, InstalledGame, LauncherDb, PendingSync,
+    PlaytimeSummary, Profile, SecretStore,
 };
-use opensync_api::{ApiError, Game, OpenSyncClient};
+use opensync_api::{ApiError, Game, OpenSyncClient, User};
 use opensync_proton::{
     GeProtonRelease, ProtonError, ProtonInstallation, default_proton_search_roots,
     detect_proton_in_roots, discover_executables, download_and_install_ge_proton_with_control,
 };
 use opensync_runner::{
-    LaunchOptions, PostExitSyncStatus, RunnerError, SessionOutcome, launch_and_track,
+    LaunchOptions, PostExitSyncStatus, RunnerError, SessionOutcome, launch_and_track_with_hook,
 };
-use opensync_sync::{SyncError, SyncReport, sync_game_saves};
+use opensync_sync::{SyncError, SyncReport, inspect_unsynced_saves, sync_game_saves};
 use opensync_transfer::{
-    DownloadControl, DownloadOutcome, SpeedSample, TransferError, download_and_extract_game,
-    safe_rel_path,
+    DownloadControl, DownloadOutcome, SpeedSample, TransferError, UploadControl, UploadOutcome,
+    download_and_extract_game, safe_rel_path, upload_folder,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, broadcast};
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -45,6 +48,8 @@ pub enum CoreError {
     NoActiveProfile,
     #[error("profile not found: {0}")]
     ProfileNotFound(String),
+    #[error("upload job not found: {0}")]
+    UploadNotFound(String),
     #[error("game {0} is not installed for the active profile")]
     GameNotInstalled(i64),
     #[error("reconnect failed after {attempts} attempts: {last_error}")]
@@ -121,6 +126,67 @@ pub struct DownloadJobSnapshot {
     pub speed_samples: Vec<SpeedSample>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UploadStatus {
+    Queued,
+    Uploading,
+    Indexing,
+    Paused,
+    Ready,
+    Failed { error: String },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadJobSnapshot {
+    pub id: String,
+    pub name: String,
+    pub game_id: Option<i64>,
+    pub status: UploadStatus,
+    pub bytes_uploaded: u64,
+    pub total_bytes: u64,
+    pub files_uploaded: usize,
+    pub total_files: usize,
+    pub current_file: Option<String>,
+    pub bytes_per_sec: f64,
+    pub speed_samples: Vec<SpeedSample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterruptedSessionDto {
+    pub profile_id: String,
+    pub game_id: i64,
+    pub game_name: String,
+    pub install_dir: String,
+    pub runtime: String,
+    pub started_at: DateTime<Utc>,
+    pub last_heartbeat_at: DateTime<Utc>,
+    pub active_secs: u64,
+    pub has_unsynced_saves: bool,
+    pub changed_files: usize,
+    pub deleted_files: usize,
+    pub changed_bytes: u64,
+    pub sample_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShutdownStatusDto {
+    pub active_syncs: usize,
+    pub playing_games: Vec<String>,
+    pub active_downloads: usize,
+    pub active_uploads: usize,
+    pub ready_to_exit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShutdownResultDto {
+    pub completed: bool,
+    pub active_syncs_remaining: usize,
+    pub playing_games: Vec<String>,
+    pub wal_checkpointed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LauncherEvent {
@@ -130,15 +196,66 @@ pub enum LauncherEvent {
     DownloadUpdated {
         job: DownloadJobSnapshot,
     },
+    UploadUpdated {
+        job: UploadJobSnapshot,
+    },
     GameSessionStarted {
         game_id: i64,
         name: String,
     },
     GameSessionEnded {
         game_id: i64,
+        name: String,
         duration_secs: u64,
         synced: bool,
+        uploaded_files: usize,
+        uploaded_bytes: u64,
+        deleted_paths: usize,
         error: Option<String>,
+    },
+    /// Emitted when a differential save sync starts (post-exit auto-sync, manual sync,
+    /// or crash-recovery sync).
+    GameSyncStarted {
+        game_id: i64,
+        name: String,
+        trigger: String,
+    },
+    /// Emitted when a differential save sync completes.
+    GameSyncCompleted {
+        game_id: i64,
+        name: String,
+        trigger: String,
+        uploaded_files: usize,
+        uploaded_bytes: u64,
+        deleted_paths: usize,
+    },
+    /// Emitted whenever a new persistent activity log entry is recorded.
+    ActivityLogged {
+        entry: ActivityLogEntry,
+    },
+    /// Emitted on startup when an interrupted (force-quit) game session is detected.
+    InterruptedSessionDetected {
+        session: InterruptedSessionDto,
+    },
+    /// Emitted when the user or OS requests a window close while work is active.
+    ShutdownRequested {
+        status: ShutdownStatusDto,
+    },
+    /// Emitted during safe shutdown while flushing active save syncs and SQLite WAL.
+    ShutdownProgress {
+        stage: String,
+        active_syncs: usize,
+        message: String,
+    },
+    /// A saved profile's display label or avatar changed; consumers should refresh their
+    /// profile snapshot and cached avatars.
+    ProfileUpdated {
+        profile: Profile,
+    },
+    /// One background auto-sync pass finished (emitted even when nothing changed).
+    BackgroundSyncCompleted {
+        synced_games: usize,
+        flushed_pending: usize,
     },
     ProtonInstalled {
         installation: ProtonInstallation,
@@ -168,6 +285,13 @@ pub struct ReconnectOutcome {
     pub flushed_syncs: usize,
 }
 
+/// Result of a single background auto-sync pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackgroundSyncOutcome {
+    pub synced_games: usize,
+    pub flushed_pending: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct LauncherPaths {
     pub library_root: PathBuf,
@@ -188,6 +312,22 @@ impl LauncherPaths {
     }
 }
 
+/// Default destination for downloaded games: `<Games>/OpenSync` in the user's home dir.
+/// Checks `Games` then `games`; if neither exists, falls back to creating `Games/OpenSync`.
+pub fn default_games_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME")
+        && !home.trim().is_empty()
+    {
+        let home = PathBuf::from(home);
+        let games = [home.join("Games"), home.join("games")]
+            .into_iter()
+            .find(|p| p.is_dir())
+            .unwrap_or_else(|| home.join("Games"));
+        return games.join("OpenSync");
+    }
+    PathBuf::from("Games").join("OpenSync")
+}
+
 struct ActiveSession {
     profile: Profile,
     client: OpenSyncClient,
@@ -200,15 +340,53 @@ struct ActiveDownloadEntry {
     control: DownloadControl,
 }
 
+struct ActiveUploadEntry {
+    seq: u64,
+    snapshot: UploadJobSnapshot,
+    control: UploadControl,
+    staging_root: Option<PathBuf>,
+    /// Next expected byte offset for each staged file (used by `stage_upload_chunk`).
+    staged_offsets: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+pub struct SyncActivityGuard {
+    counter: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+}
+
+impl Drop for SyncActivityGuard {
+    fn drop(&mut self) {
+        let prev = self.counter.fetch_sub(1, Ordering::SeqCst);
+        if prev <= 1 {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
 pub struct LauncherCore {
     db: LauncherDb,
     secrets: Arc<dyn SecretStore>,
     paths: LauncherPaths,
+    library_root: StdRwLock<PathBuf>,
     active: RwLock<Option<ActiveSession>>,
     events: broadcast::Sender<LauncherEvent>,
     downloads: StdRwLock<HashMap<String, ActiveDownloadEntry>>,
+    uploads: StdRwLock<HashMap<String, ActiveUploadEntry>>,
     bandwidth_limit: AtomicU64,
     next_job_seq: AtomicU64,
+    /// (profile_id, game_id) pairs with a live game session. Background sync and offline
+    /// queue flushing must never touch these games' save folders mid-session.
+    playing_games: Mutex<HashSet<(String, i64)>>,
+    /// Tracks interrupted sessions already logged during this process run.
+    notified_interrupted: Mutex<HashSet<(String, i64)>>,
+    /// Number of save sync operations currently in flight.
+    active_syncs: Arc<AtomicUsize>,
+    /// Notified whenever `active_syncs` drops to 0.
+    sync_idle_notify: Arc<Notify>,
+    /// Set to `true` once safe shutdown begins so new background auto-syncs do not start.
+    shutting_down: AtomicBool,
+    /// Serializes background auto-sync passes so the 30s ticker can never overlap itself.
+    background_sync_lock: AsyncMutex<()>,
 }
 
 impl LauncherCore {
@@ -217,13 +395,39 @@ impl LauncherCore {
         Self {
             db,
             secrets,
+            library_root: StdRwLock::new(paths.library_root.clone()),
             paths,
             active: RwLock::new(None),
             events,
             downloads: StdRwLock::new(HashMap::new()),
+            uploads: StdRwLock::new(HashMap::new()),
             bandwidth_limit: AtomicU64::new(0),
             next_job_seq: AtomicU64::new(1),
+            playing_games: Mutex::new(HashSet::new()),
+            notified_interrupted: Mutex::new(HashSet::new()),
+            active_syncs: Arc::new(AtomicUsize::new(0)),
+            sync_idle_notify: Arc::new(Notify::new()),
+            shutting_down: AtomicBool::new(false),
+            background_sync_lock: AsyncMutex::new(()),
         }
+    }
+
+    /// Registers an in-flight save sync operation and returns an RAII guard that decrements
+    /// the counter and wakes any safe-shutdown waiter when dropped.
+    pub fn begin_sync_activity(&self) -> SyncActivityGuard {
+        self.active_syncs.fetch_add(1, Ordering::SeqCst);
+        SyncActivityGuard {
+            counter: Arc::clone(&self.active_syncs),
+            notify: Arc::clone(&self.sync_idle_notify),
+        }
+    }
+
+    pub fn active_sync_count(&self) -> usize {
+        self.active_syncs.load(Ordering::SeqCst)
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::SeqCst)
     }
 
     pub fn db(&self) -> &LauncherDb {
@@ -232,6 +436,20 @@ impl LauncherCore {
 
     pub fn paths(&self) -> &LauncherPaths {
         &self.paths
+    }
+
+    /// Current destination root for downloaded games.
+    pub fn games_dir(&self) -> PathBuf {
+        self.library_root.read().unwrap().clone()
+    }
+
+    /// Persists and switches the destination for future downloads. Existing installs
+    /// keep their absolute `install_dir` from SQLite and are unaffected.
+    pub fn set_games_dir(&self, path: PathBuf) -> CoreResult<PathBuf> {
+        std::fs::create_dir_all(&path)?;
+        self.db.set_setting("games_dir", &path.to_string_lossy())?;
+        *self.library_root.write().unwrap() = path.clone();
+        Ok(path)
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<LauncherEvent> {
@@ -259,6 +477,97 @@ impl LauncherCore {
 
     pub async fn active_profile(&self) -> Option<Profile> {
         self.active.read().await.as_ref().map(|a| a.profile.clone())
+    }
+
+    /// Marks a game as actively running so background sync leaves its save files alone,
+    /// and persists an `active_sessions` record in SQLite so a force-quit or crash while
+    /// playing is automatically detected on the next launcher startup.
+    pub fn mark_game_playing(&self, profile_id: &str, game_id: i64) {
+        self.playing_games
+            .lock()
+            .unwrap()
+            .insert((profile_id.to_string(), game_id));
+        if self.db.get_active_session(profile_id, game_id).ok().flatten().is_none()
+            && let Ok(Some(inst)) = self.db.get_installed_game(profile_id, game_id)
+        {
+            let now = Utc::now();
+            let _ = self.db.upsert_active_session(&ActiveSessionRecord {
+                profile_id: profile_id.to_string(),
+                game_id,
+                game_name: inst.name,
+                install_dir: inst.install_dir,
+                runtime: "native".to_string(),
+                pid: None,
+                started_at: now,
+                last_heartbeat_at: now,
+                active_secs: 0,
+            });
+        }
+    }
+
+    /// Clears the live-session marker and removes the SQLite `active_sessions` record
+    /// once a game exits cleanly.
+    pub fn mark_game_stopped(&self, profile_id: &str, game_id: i64) {
+        self.playing_games
+            .lock()
+            .unwrap()
+            .remove(&(profile_id.to_string(), game_id));
+        let _ = self.db.clear_active_session(profile_id, game_id);
+    }
+
+    /// True while the given game is running under the given profile, or has an unresolved
+    /// force-quit session in `active_sessions` awaiting user confirmation.
+    pub fn is_game_playing(&self, profile_id: &str, game_id: i64) -> bool {
+        if self
+            .playing_games
+            .lock()
+            .unwrap()
+            .contains(&(profile_id.to_string(), game_id))
+        {
+            return true;
+        }
+        self.db
+            .get_active_session(profile_id, game_id)
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_activity(
+        &self,
+        profile_id: &str,
+        game_id: Option<i64>,
+        game_name: Option<&str>,
+        kind: &str,
+        level: &str,
+        title: &str,
+        detail: &str,
+    ) -> Option<ActivityLogEntry> {
+        let entry = self
+            .db
+            .append_activity_log(profile_id, game_id, game_name, kind, level, title, detail)
+            .ok()?;
+        self.emit(LauncherEvent::ActivityLogged {
+            entry: entry.clone(),
+        });
+        Some(entry)
+    }
+
+    pub async fn list_activity_logs(&self, limit: usize) -> CoreResult<Vec<ActivityLogEntry>> {
+        let Some(profile) = self.active_profile().await else {
+            return Ok(Vec::new());
+        };
+        Ok(self.db.list_activity_logs(&profile.id, limit)?)
+    }
+
+    pub async fn clear_activity_logs(&self) -> CoreResult<()> {
+        let profile = self
+            .active_profile()
+            .await
+            .ok_or(CoreError::NoActiveProfile)?;
+        self.db.clear_activity_logs(&profile.id)?;
+        Ok(())
     }
 
     pub fn list_profiles(&self) -> CoreResult<Vec<Profile>> {
@@ -389,29 +698,36 @@ impl LauncherCore {
         self.secrets.delete(profile_id)?;
         self.db.delete_profile(profile_id)?;
 
-        let profile_lib_dir = self.paths.library_root.join(profile_id);
+        let profile_lib_dir = self.games_dir().join(profile_id);
         if profile_lib_dir.exists() {
             tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&profile_lib_dir))
                 .await
                 .map_err(|e| std::io::Error::other(format!("cleanup task panicked: {e}")))??;
         }
 
-        // Best-effort cleanup of cached covers belonging to this profile.
-        let covers_dir = self.paths.cache_dir.join("covers");
-        let prefix = format!("{profile_id}_");
-        if covers_dir.is_dir() {
-            let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(entries) = std::fs::read_dir(&covers_dir) {
-                    for entry in entries.filter_map(Result::ok) {
-                        if let Some(name) = entry.file_name().to_str()
-                            && name.starts_with(&prefix)
-                        {
-                            let _ = std::fs::remove_file(entry.path());
+        // Best-effort cleanup of cached covers and avatars belonging to this profile.
+        let caches = [
+            self.paths.cache_dir.join("covers"),
+            self.paths.cache_dir.join("pfps"),
+        ];
+        let prefix = format!("{}_", safe_cache_component(profile_id));
+        for dir in caches {
+            if dir.is_dir() {
+                let dir_clone = dir.clone();
+                let prefix_clone = prefix.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(entries) = std::fs::read_dir(&dir_clone) {
+                        for entry in entries.filter_map(Result::ok) {
+                            if let Some(name) = entry.file_name().to_str()
+                                && name.starts_with(&prefix_clone)
+                            {
+                                let _ = std::fs::remove_file(entry.path());
+                            }
                         }
                     }
-                }
-            })
-            .await;
+                })
+                .await;
+            }
         }
 
         let cleared_active = {
@@ -428,6 +744,142 @@ impl LauncherCore {
         }
 
         Ok(())
+    }
+
+    /// Fetches the active account's public profile (including stats and avatar path) from
+    /// `/api/auth/me`.
+    pub async fn get_current_user_profile(&self) -> CoreResult<User> {
+        let client = self.active_client().await?;
+        Ok(client.me().await?)
+    }
+
+    /// Renames the local display label of the active saved profile and emits `ProfileUpdated`.
+    pub async fn rename_profile(&self, label: &str) -> CoreResult<Profile> {
+        let profile = self
+            .active_profile()
+            .await
+            .ok_or(CoreError::NoActiveProfile)?;
+        let updated = self.db.rename_profile(&profile.id, label)?;
+        self.replace_active_profile(updated.clone()).await;
+        Ok(updated)
+    }
+
+    /// Changes the active account's username on the server and persists the new value in the
+    /// saved profile. A server-side collision returns the server's error message verbatim.
+    pub async fn change_username(&self, username: &str) -> CoreResult<Profile> {
+        let (profile, client) = self.active_profile_and_client().await?;
+        let user = client.update_username(username).await?;
+        let updated = self
+            .db
+            .update_profile_username(&profile.id, &user.username)?;
+        self.replace_active_profile(updated.clone()).await;
+        Ok(updated)
+    }
+
+    /// Reads a user's avatar from the on-disk cache, falling back to the server. The cache is
+    /// keyed by `(profile_id, user_id)` so avatars remain available while offline, and a
+    /// default/missing image is reported as `None` (the UI then shows a monogram).
+    pub async fn fetch_cached_user_pfp(
+        &self,
+        pfp_path: Option<&str>,
+        user_id: i64,
+    ) -> CoreResult<Option<(Vec<u8>, String)>> {
+        let profile = self
+            .active_profile()
+            .await
+            .ok_or(CoreError::NoActiveProfile)?;
+        let dir = self.paths.cache_dir.join("pfps");
+        let base = pfp_cache_base(&profile.id, user_id);
+        let mime_path = dir.join(format!("{base}.mime"));
+
+        if let Ok(ct_raw) = std::fs::read_to_string(&mime_path) {
+            let ct = ct_raw.trim().to_string();
+            let data_path = dir.join(format!("{base}.{}", ext_for_mime(&ct)));
+            if let Ok(bytes) = std::fs::read(&data_path)
+                && !bytes.is_empty()
+            {
+                return Ok(Some((bytes, ct)));
+            }
+        }
+
+        let client = self.active_client().await?;
+        let Some((bytes, content_type)) = client.fetch_pfp(pfp_path, user_id).await? else {
+            return Ok(None);
+        };
+        let dir_clone = dir.clone();
+        let base_clone = base.clone();
+        let bytes_clone = bytes.clone();
+        let ct_clone = content_type.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            std::fs::create_dir_all(&dir_clone)?;
+            std::fs::write(
+                dir_clone.join(format!("{base_clone}.{}", ext_for_mime(&ct_clone))),
+                &bytes_clone,
+            )?;
+            std::fs::write(dir_clone.join(format!("{base_clone}.mime")), &ct_clone)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("pfp cache write panicked: {e}")))??;
+
+        Ok(Some((bytes, content_type)))
+    }
+
+    /// Uploads raw JPG/PNG bytes for the active account, refreshes the local avatar cache and
+    /// emits `ProfileUpdated`. Returns the server-relative path of the new image.
+    pub async fn upload_active_profile_pfp(
+        &self,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> CoreResult<String> {
+        let (profile, client) = self.active_profile_and_client().await?;
+        let pfp_path = client.upload_pfp(bytes, content_type).await?;
+        self.clear_cached_user_pfp(&profile.id, profile.user_id);
+        // Warm the cache immediately so the new avatar works offline on the next launch.
+        let _ = self
+            .fetch_cached_user_pfp(Some(&pfp_path), profile.user_id)
+            .await;
+        self.emit(LauncherEvent::ProfileUpdated { profile });
+        Ok(pfp_path)
+    }
+
+    /// Removes the active account's avatar, clears its cache entry and emits `ProfileUpdated`.
+    pub async fn remove_active_profile_pfp(&self) -> CoreResult<String> {
+        let (profile, client) = self.active_profile_and_client().await?;
+        let pfp_path = client.remove_pfp().await?;
+        self.clear_cached_user_pfp(&profile.id, profile.user_id);
+        self.emit(LauncherEvent::ProfileUpdated { profile });
+        Ok(pfp_path)
+    }
+
+    /// Deletes the active account on the server (surfacing errors such as the last-admin
+    /// guard), then forgets its local profile, session, library and cache.
+    pub async fn delete_active_account(&self) -> CoreResult<()> {
+        let profile = self
+            .active_profile()
+            .await
+            .ok_or(CoreError::NoActiveProfile)?;
+        let client = self.active_client().await?;
+        client.delete_me().await?;
+        self.delete_profile(&profile.id).await
+    }
+
+    fn clear_cached_user_pfp(&self, profile_id: &str, user_id: i64) {
+        let dir = self.paths.cache_dir.join("pfps");
+        let base = pfp_cache_base(profile_id, user_id);
+        for ext in ["mime", "jpg", "png", "bin"] {
+            let _ = std::fs::remove_file(dir.join(format!("{base}.{ext}")));
+        }
+    }
+
+    async fn replace_active_profile(&self, profile: Profile) {
+        {
+            let mut guard = self.active.write().await;
+            if let Some(active) = guard.as_mut() {
+                active.profile = profile.clone();
+            }
+        }
+        self.emit(LauncherEvent::ProfileUpdated { profile });
     }
 
     /// Checks whether the active profile's server is currently reachable and marks the
@@ -628,8 +1080,7 @@ impl LauncherCore {
         let verify_clean = fresh || !detail.overlay.has_overlay;
 
         let install_dir = self
-            .paths
-            .library_root
+            .games_dir()
             .join(&profile.id)
             .join(&detail.game.slug);
 
@@ -672,8 +1123,7 @@ impl LauncherCore {
         let initial_total = detail.game.total_size;
 
         let install_dir = self
-            .paths
-            .library_root
+            .games_dir()
             .join(&profile.id)
             .join(&game_slug);
 
@@ -1156,6 +1606,516 @@ impl LauncherCore {
         items.into_iter().map(|(_, s)| s).collect()
     }
 
+    /// Creates a new game on the server and starts a tracked upload job. When `folder` is
+    /// supplied the whole tree is uploaded in the background; otherwise a local staging area
+    /// is created for chunk-by-chunk posting followed by `finalize_dropped_upload`.
+    pub async fn start_game_upload(
+        self: &Arc<Self>,
+        name: &str,
+        description: &str,
+        system_requirements: &str,
+        folder: Option<&str>,
+        cover: Option<(Vec<u8>, String)>,
+    ) -> CoreResult<String> {
+        let (_, client) = self.active_profile_and_client().await?;
+        let game = client
+            .create_game(name, description, system_requirements)
+            .await?;
+        if let Some((bytes, content_type)) = cover {
+            client
+                .upload_game_cover(game.id, bytes, &content_type)
+                .await?;
+        }
+
+        let job_id = Uuid::new_v4().to_string();
+        let seq = self.next_job_seq.fetch_add(1, Ordering::Relaxed);
+        let control = UploadControl::new(0, 0);
+        let snapshot = UploadJobSnapshot {
+            id: job_id.clone(),
+            name: name.to_string(),
+            game_id: Some(game.id),
+            status: UploadStatus::Queued,
+            bytes_uploaded: 0,
+            total_bytes: 0,
+            files_uploaded: 0,
+            total_files: 0,
+            current_file: None,
+            bytes_per_sec: 0.0,
+            speed_samples: Vec::new(),
+        };
+        let staging_root = folder.is_none().then(|| {
+            self.paths
+                .cache_dir
+                .join("uploads")
+                .join(&job_id)
+        });
+        if let Some(root) = &staging_root {
+            std::fs::create_dir_all(root.join("files"))?;
+        }
+        {
+            let mut map = self.uploads.write().unwrap();
+            map.insert(
+                job_id.clone(),
+                ActiveUploadEntry {
+                    seq,
+                    snapshot: snapshot.clone(),
+                    control: control.clone(),
+                    staging_root,
+                    staged_offsets: Arc::new(Mutex::new(HashMap::new())),
+                },
+            );
+        }
+        self.emit(LauncherEvent::UploadUpdated { job: snapshot });
+
+        if let Some(folder) = folder {
+            self.spawn_upload_pipeline(
+                job_id.clone(),
+                game.id,
+                client,
+                PathBuf::from(folder),
+                None,
+            );
+        }
+        Ok(job_id)
+    }
+
+    /// Stages one chunk of a drag-and-drop upload inside the job's local `files/` directory.
+    /// Returns `true` once the final chunk of a file has been written and renamed into place.
+    pub fn stage_upload_chunk(
+        &self,
+        job_id: &str,
+        rel_path: &str,
+        index: usize,
+        total: usize,
+        size: u64,
+        chunk: &[u8],
+    ) -> CoreResult<bool> {
+        let safe = safe_rel_path(rel_path)?;
+        if total == 0 {
+            return Err(CoreError::Io(io::Error::other("total must be greater than zero")));
+        }
+        let (root, offsets, control) = {
+            let map = self.uploads.read().unwrap();
+            let entry = map
+                .get(job_id)
+                .ok_or_else(|| CoreError::UploadNotFound(job_id.to_string()))?;
+            let root = entry
+                .staging_root
+                .clone()
+                .ok_or_else(|| CoreError::UploadNotFound(job_id.to_string()))?;
+            (root, Arc::clone(&entry.staged_offsets), entry.control.clone())
+        };
+        let mut offsets = offsets.lock().unwrap();
+        // The per-file byte count tracked in the entry is the source of truth: JS chunkers use
+        // fixed-size chunks with a smaller tail, so `size / total` is not a reliable stride.
+        let current = offsets.get(rel_path).copied().unwrap_or(0);
+        if (current == 0 && index != 0) || current.saturating_add(chunk.len()) > size as usize {
+            return Err(CoreError::Io(io::Error::other(format!(
+                "chunk out of order for {rel_path}: offset {current}, index {index}"
+            ))));
+        }
+
+        let files_root = root.join("files");
+        let final_path = files_root.join(&safe);
+        let part_path = files_root.join(format!("{}.part", safe.to_string_lossy()));
+        if let Some(parent) = final_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&part_path)?;
+            file.write_all(chunk)?;
+            file.flush()?;
+        }
+        let new_offset = current + chunk.len();
+        offsets.insert(rel_path.to_string(), new_offset);
+
+        if index + 1 != total {
+            return Ok(false);
+        }
+        if new_offset as u64 != size {
+            return Err(CoreError::Io(io::Error::other(format!(
+                "size mismatch for {rel_path}: expected {size}, got {new_offset}"
+            ))));
+        }
+        std::fs::rename(&part_path, &final_path)?;
+
+        control.set_current_file(Some(rel_path.to_string()));
+        control.add_bytes(size);
+        control.finish_file();
+        self.update_upload_snapshot(job_id, |snap| {
+            snap.total_bytes += size;
+            snap.total_files += 1;
+            snap.bytes_uploaded = control.snapshot().bytes_uploaded;
+            snap.current_file = Some(rel_path.to_string());
+        });
+        Ok(true)
+    }
+
+    /// Starts the upload pipeline for a drag-and-drop job whose chunks have been staged.
+    pub async fn finalize_dropped_upload(self: &Arc<Self>, job_id: &str) -> CoreResult<()> {
+        let (root, game_id) = {
+            let map = self.uploads.read().unwrap();
+            let entry = map
+                .get(job_id)
+                .ok_or_else(|| CoreError::UploadNotFound(job_id.to_string()))?;
+            let root = entry
+                .staging_root
+                .clone()
+                .ok_or_else(|| CoreError::UploadNotFound(job_id.to_string()))?;
+            let game_id = entry
+                .snapshot
+                .game_id
+                .ok_or_else(|| CoreError::UploadNotFound(job_id.to_string()))?;
+            (root, game_id)
+        };
+        let client = self.active_client().await?;
+        // Chunks are staged under `<job>/files/`; the uploader must walk that directory so
+        // relative paths do not pick up a spurious `files/` prefix.
+        self.spawn_upload_pipeline(job_id.to_string(), game_id, client, root.join("files"), Some(root));
+        Ok(())
+    }
+
+    /// Common background pipeline: chunked upload -> indexing -> `ready` polling.
+    fn spawn_upload_pipeline(
+        self: &Arc<Self>,
+        job_id: String,
+        game_id: i64,
+        client: OpenSyncClient,
+        root: PathBuf,
+        cleanup_root: Option<PathBuf>,
+    ) {
+        let core = Arc::clone(self);
+        let Some(control) = self
+            .uploads
+            .read()
+            .unwrap()
+            .get(&job_id)
+            .map(|entry| entry.control.clone())
+        else {
+            return;
+        };
+
+        if control.is_cancelled() {
+            core.cancel_upload_job(&job_id, &client, game_id);
+            return;
+        }
+        if !control.is_paused() {
+            core.update_upload_snapshot(&job_id, |snap| {
+                if !matches!(snap.status, UploadStatus::Cancelled) {
+                    snap.status = UploadStatus::Uploading;
+                }
+            });
+        }
+
+        tokio::spawn(async move {
+            let poll_core = Arc::clone(&core);
+            let poll_jid = job_id.clone();
+            let poll_ctrl = control.clone();
+            let ticker = tokio::spawn(async move {
+                let mut last_bytes = u64::MAX;
+                let mut last_files = usize::MAX;
+                let mut last_file: Option<String> = None;
+                let mut last_samples = usize::MAX;
+                let mut last_paused = false;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let up = poll_ctrl.snapshot();
+                    let changed = up.bytes_uploaded != last_bytes
+                        || up.files_uploaded != last_files
+                        || up.current_file != last_file
+                        || up.speed_samples.len() != last_samples
+                        || up.paused != last_paused;
+                    if changed {
+                        last_bytes = up.bytes_uploaded;
+                        last_files = up.files_uploaded;
+                        last_file = up.current_file.clone();
+                        last_samples = up.speed_samples.len();
+                        last_paused = up.paused;
+                        let is_paused = poll_ctrl.is_paused();
+                        poll_core.update_upload_snapshot(&poll_jid, |snap| {
+                            if !matches!(
+                                snap.status,
+                                UploadStatus::Ready
+                                    | UploadStatus::Failed { .. }
+                                    | UploadStatus::Cancelled
+                                    | UploadStatus::Indexing
+                            ) {
+                                snap.status = if is_paused {
+                                    UploadStatus::Paused
+                                } else {
+                                    UploadStatus::Uploading
+                                };
+                            }
+                            snap.bytes_uploaded = up.bytes_uploaded;
+                            if up.total_bytes > 0 {
+                                snap.total_bytes = up.total_bytes;
+                            }
+                            snap.files_uploaded = up.files_uploaded;
+                            if up.total_files > 0 {
+                                snap.total_files = up.total_files;
+                            }
+                            snap.current_file = up.current_file;
+                            snap.bytes_per_sec = if is_paused { 0.0 } else { up.bytes_per_sec };
+                            snap.speed_samples = up.speed_samples;
+                        });
+                    }
+                }
+            });
+
+            let result = upload_folder(&client, game_id, &root, &control).await;
+            ticker.abort();
+            let _ = ticker.await;
+
+            match result {
+                Ok(outcome) => {
+                    core.update_upload_snapshot(&job_id, |snap| {
+                        if !matches!(snap.status, UploadStatus::Cancelled) {
+                            snap.status = UploadStatus::Indexing;
+                            snap.bytes_per_sec = 0.0;
+                            snap.current_file = None;
+                        }
+                    });
+                    if let Err(err) = core
+                        .finish_upload_indexing(&job_id, &client, game_id, &outcome, &control)
+                        .await
+                    {
+                        if matches!(err, CoreError::Transfer(TransferError::Cancelled))
+                            || control.is_cancelled()
+                        {
+                            core.cancel_upload_job(&job_id, &client, game_id);
+                        } else {
+                            core.update_upload_snapshot(&job_id, |snap| {
+                                snap.status = UploadStatus::Failed {
+                                    error: err.to_string(),
+                                };
+                                snap.bytes_per_sec = 0.0;
+                            });
+                        }
+                    }
+                }
+                Err(TransferError::Cancelled) => {
+                    core.cancel_upload_job(&job_id, &client, game_id);
+                }
+                Err(err) => {
+                    if control.is_cancelled() {
+                        core.cancel_upload_job(&job_id, &client, game_id);
+                    } else {
+                        core.update_upload_snapshot(&job_id, |snap| {
+                            snap.status = UploadStatus::Failed {
+                                error: err.to_string(),
+                            };
+                            snap.bytes_per_sec = 0.0;
+                        });
+                    }
+                }
+            }
+
+            if let Some(cleanup_root) = cleanup_root {
+                let _ =
+                    tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cleanup_root)).await;
+            }
+        });
+    }
+
+    async fn finish_upload_indexing(
+        &self,
+        job_id: &str,
+        client: &OpenSyncClient,
+        game_id: i64,
+        outcome: &UploadOutcome,
+        control: &UploadControl,
+    ) -> CoreResult<()> {
+        client.upload_game_complete(game_id).await?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if control.is_cancelled() {
+                return Err(CoreError::Transfer(TransferError::Cancelled));
+            }
+            match client.get_game_status(game_id).await {
+                Ok(status) if status.status == "ready" => break,
+                Ok(status)
+                    if status.status.contains("fail")
+                        || status.status.contains("error") =>
+                {
+                    return Err(CoreError::Api(ApiError::Http {
+                        status: 500,
+                        message: format!("game processing failed: {}", status.status),
+                    }));
+                }
+                Ok(_) => {}
+                Err(ApiError::Network(_)) => {}
+                Err(err) => return Err(err.into()),
+            }
+            if Instant::now() >= deadline {
+                return Err(CoreError::Api(ApiError::Http {
+                    status: 408,
+                    message: "timed out waiting for game indexing".to_string(),
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        let samples = control.snapshot().speed_samples;
+        self.update_upload_snapshot(job_id, |snap| {
+            if matches!(snap.status, UploadStatus::Cancelled) {
+                return;
+            }
+            snap.status = UploadStatus::Ready;
+            snap.bytes_uploaded = outcome.total_bytes;
+            snap.total_bytes = outcome.total_bytes;
+            snap.files_uploaded = outcome.files.len();
+            snap.total_files = outcome.files.len();
+            snap.current_file = None;
+            snap.bytes_per_sec = 0.0;
+            snap.speed_samples = samples;
+        });
+        Ok(())
+    }
+
+    fn cancel_upload_job(self: &Arc<Self>, job_id: &str, client: &OpenSyncClient, game_id: i64) {
+        let client = client.clone();
+        let core = Arc::clone(self);
+        let job_id = job_id.to_string();
+        tokio::spawn(async move {
+            // Best-effort cleanup of the incomplete game on the server.
+            let _ = client.delete_game(game_id).await;
+            core.finalize_upload_cancelled(&job_id);
+        });
+    }
+
+    pub async fn pause_upload(&self, job_id: &str) -> bool {
+        let updated = {
+            let mut map = self.uploads.write().unwrap();
+            let Some(entry) = map.get_mut(job_id) else {
+                return false;
+            };
+            if !matches!(
+                entry.snapshot.status,
+                UploadStatus::Queued | UploadStatus::Uploading
+            ) {
+                return false;
+            }
+            entry.control.pause();
+            entry.snapshot.status = UploadStatus::Paused;
+            entry.snapshot.bytes_per_sec = 0.0;
+            entry.snapshot.clone()
+        };
+        self.emit(LauncherEvent::UploadUpdated { job: updated });
+        true
+    }
+
+    pub async fn resume_upload(&self, job_id: &str) -> bool {
+        let updated = {
+            let mut map = self.uploads.write().unwrap();
+            let Some(entry) = map.get_mut(job_id) else {
+                return false;
+            };
+            if !matches!(entry.snapshot.status, UploadStatus::Paused) {
+                return false;
+            }
+            entry.control.resume();
+            entry.snapshot.status = UploadStatus::Uploading;
+            entry.snapshot.clone()
+        };
+        self.emit(LauncherEvent::UploadUpdated { job: updated });
+        true
+    }
+
+    pub async fn cancel_upload(&self, job_id: &str) -> bool {
+        let updated = {
+            let mut map = self.uploads.write().unwrap();
+            let Some(entry) = map.get_mut(job_id) else {
+                return false;
+            };
+            if !matches!(
+                entry.snapshot.status,
+                UploadStatus::Queued | UploadStatus::Uploading | UploadStatus::Paused | UploadStatus::Indexing
+            ) {
+                return false;
+            }
+            entry.control.cancel();
+            entry.snapshot.status = UploadStatus::Cancelled;
+            entry.snapshot.bytes_per_sec = 0.0;
+            entry.snapshot.clone()
+        };
+        self.emit(LauncherEvent::UploadUpdated { job: updated });
+        true
+    }
+
+    /// Returns a snapshot of all tracked uploads in insertion order.
+    pub async fn list_uploads(&self) -> Vec<UploadJobSnapshot> {
+        let map = self.uploads.read().unwrap();
+        let mut items: Vec<(u64, UploadJobSnapshot)> = map
+            .values()
+            .map(|entry| {
+                let mut snap = entry.snapshot.clone();
+                if matches!(
+                    snap.status,
+                    UploadStatus::Uploading | UploadStatus::Paused | UploadStatus::Indexing
+                ) {
+                    let up = entry.control.snapshot();
+                    snap.bytes_uploaded = up.bytes_uploaded.max(snap.bytes_uploaded);
+                    if up.total_bytes > 0 {
+                        snap.total_bytes = up.total_bytes;
+                    }
+                    snap.files_uploaded = up.files_uploaded.max(snap.files_uploaded);
+                    if up.total_files > 0 {
+                        snap.total_files = up.total_files;
+                    }
+                    if up.current_file.is_some() {
+                        snap.current_file = up.current_file;
+                    }
+                    if !matches!(snap.status, UploadStatus::Paused) {
+                        snap.bytes_per_sec = up.bytes_per_sec;
+                    }
+                    if !up.speed_samples.is_empty() {
+                        snap.speed_samples = up.speed_samples;
+                    }
+                }
+                (entry.seq, snap)
+            })
+            .collect();
+        items.sort_by_key(|(seq, _)| *seq);
+        items.into_iter().map(|(_, snap)| snap).collect()
+    }
+
+    fn update_upload_snapshot<F>(&self, job_id: &str, mutate: F)
+    where
+        F: FnOnce(&mut UploadJobSnapshot),
+    {
+        let updated = {
+            let mut map = self.uploads.write().unwrap();
+            let Some(entry) = map.get_mut(job_id) else {
+                return;
+            };
+            mutate(&mut entry.snapshot);
+            entry.snapshot.clone()
+        };
+        self.emit(LauncherEvent::UploadUpdated { job: updated });
+    }
+
+    fn finalize_upload_cancelled(&self, job_id: &str) {
+        let maybe_updated = {
+            let mut map = self.uploads.write().unwrap();
+            let Some(entry) = map.get_mut(job_id) else {
+                return;
+            };
+            if matches!(entry.snapshot.status, UploadStatus::Cancelled) {
+                None
+            } else {
+                entry.snapshot.status = UploadStatus::Cancelled;
+                entry.snapshot.bytes_per_sec = 0.0;
+                Some(entry.snapshot.clone())
+            }
+        };
+        if let Some(job) = maybe_updated {
+            self.emit(LauncherEvent::UploadUpdated { job });
+        }
+    }
+
     /// Uninstalls a downloaded game for the active profile by removing its install directory
     /// from disk and deleting its database record.
     pub async fn uninstall_game(&self, game_id: i64) -> CoreResult<()> {
@@ -1256,33 +2216,177 @@ impl LauncherCore {
             .get_installed_game(&profile.id, game_id)?
             .ok_or(CoreError::GameNotInstalled(game_id))?;
 
-        let report =
-            sync_game_saves(&client, game_id, &installed.install_dir, force_mass_deletion).await?;
-        self.db
-            .update_game_synced_at(&profile.id, game_id, Utc::now())?;
-        self.db.clear_pending_sync(&profile.id, game_id)?;
-        Ok(report)
+        let _sync_guard = self.begin_sync_activity();
+        self.emit(LauncherEvent::GameSyncStarted {
+            game_id,
+            name: installed.name.clone(),
+            trigger: "manual".to_string(),
+        });
+
+        match sync_game_saves(&client, game_id, &installed.install_dir, force_mass_deletion).await {
+            Ok(report) => {
+                self.db
+                    .update_game_synced_at(&profile.id, game_id, Utc::now())?;
+                self.db.clear_pending_sync(&profile.id, game_id)?;
+                let detail = format_sync_report_detail(&report);
+                let _ = self.record_activity(
+                    &profile.id,
+                    Some(game_id),
+                    Some(&installed.name),
+                    "sync_complete",
+                    "accent",
+                    &format!("Synced saves for {}", installed.name),
+                    &detail,
+                );
+                self.emit(LauncherEvent::GameSyncCompleted {
+                    game_id,
+                    name: installed.name.clone(),
+                    trigger: "manual".to_string(),
+                    uploaded_files: report.uploaded_files,
+                    uploaded_bytes: report.uploaded_bytes,
+                    deleted_paths: report.deleted_paths,
+                });
+                Ok(report)
+            }
+            Err(err) => {
+                let _ = self.record_activity(
+                    &profile.id,
+                    Some(game_id),
+                    Some(&installed.name),
+                    "sync_error",
+                    "danger",
+                    &format!("Save sync failed for {}", installed.name),
+                    &err.to_string(),
+                );
+                Err(err.into())
+            }
+        }
     }
 
     /// Flushes all offline queued save syncs for the active profile.
     pub async fn flush_pending_syncs(&self) -> CoreResult<usize> {
+        if self.is_shutting_down() {
+            return Ok(0);
+        }
         let (profile, client) = self.active_profile_and_client().await?;
         let pending = self.db.list_pending_syncs(&profile.id)?;
         let mut flushed = 0usize;
         for item in pending {
-            if let Some(installed) = self.db.get_installed_game(&profile.id, item.game_id)?
-                && sync_game_saves(&client, item.game_id, &installed.install_dir, false)
-                    .await
-                    .is_ok()
-            {
-                let _ = self
-                    .db
-                    .update_game_synced_at(&profile.id, item.game_id, Utc::now());
-                let _ = self.db.clear_pending_sync(&profile.id, item.game_id);
-                flushed += 1;
+            if self.is_game_playing(&profile.id, item.game_id) {
+                continue;
+            }
+            if let Some(installed) = self.db.get_installed_game(&profile.id, item.game_id)? {
+                let _sync_guard = self.begin_sync_activity();
+                if let Ok(report) =
+                    sync_game_saves(&client, item.game_id, &installed.install_dir, false).await
+                {
+                    let _ =
+                        self.db
+                            .update_game_synced_at(&profile.id, item.game_id, Utc::now());
+                    let _ = self.db.clear_pending_sync(&profile.id, item.game_id);
+                    let _ = self.record_activity(
+                        &profile.id,
+                        Some(item.game_id),
+                        Some(&installed.name),
+                        "sync_complete",
+                        "accent",
+                        &format!("Flushed queued save sync for {}", installed.name),
+                        &format_sync_report_detail(&report),
+                    );
+                    flushed += 1;
+                }
             }
         }
         Ok(flushed)
+    }
+
+    /// Runs one background auto-sync pass. Connectivity is probed when the session is offline
+    /// or pending syncs exist; once online, pending syncs are flushed and every installed game
+    /// that is not currently playing gets a differential save sync. Failures for individual
+    /// games are ignored so one bad game cannot block the rest.
+    pub async fn run_background_auto_sync_once(&self) -> CoreResult<BackgroundSyncOutcome> {
+        if self.is_shutting_down() {
+            return Ok(BackgroundSyncOutcome::default());
+        }
+        let _guard = self.background_sync_lock.lock().await;
+        if self.is_shutting_down() {
+            return Ok(BackgroundSyncOutcome::default());
+        }
+        let Some(profile) = self.active_profile().await else {
+            return Ok(BackgroundSyncOutcome::default());
+        };
+        let client = self.active_client().await?;
+        let pending = self.db.list_pending_syncs(&profile.id).unwrap_or_default();
+        let needs_probe =
+            self.connection_state().await != ConnectionState::Connected || !pending.is_empty();
+        if needs_probe && !self.probe_connection().await? {
+            return Ok(BackgroundSyncOutcome::default());
+        }
+
+        let flushed_pending = self.flush_pending_syncs().await.unwrap_or(0);
+        let mut synced_games = 0usize;
+        let installed = self.db.list_installed_games(&profile.id).unwrap_or_default();
+        for game in installed {
+            if self.is_shutting_down() {
+                break;
+            }
+            if self.is_game_playing(&profile.id, game.game_id) {
+                continue;
+            }
+            let _sync_guard = self.begin_sync_activity();
+            if let Ok(report) =
+                sync_game_saves(&client, game.game_id, &game.install_dir, false).await
+            {
+                let _ = self
+                    .db
+                    .update_game_synced_at(&profile.id, game.game_id, Utc::now());
+                let _ = self.db.clear_pending_sync(&profile.id, game.game_id);
+                if report.uploaded_files > 0 || report.deleted_paths > 0 {
+                    let _ = self.record_activity(
+                        &profile.id,
+                        Some(game.game_id),
+                        Some(&game.name),
+                        "sync_complete",
+                        "accent",
+                        &format!("Background auto-synced {}", game.name),
+                        &format_sync_report_detail(&report),
+                    );
+                }
+                synced_games += 1;
+            }
+        }
+
+        let outcome = BackgroundSyncOutcome {
+            synced_games,
+            flushed_pending,
+        };
+        self.emit(LauncherEvent::BackgroundSyncCompleted {
+            synced_games: outcome.synced_games,
+            flushed_pending: outcome.flushed_pending,
+        });
+        Ok(outcome)
+    }
+
+    /// Starts the periodic auto-sync loop. The first pass runs immediately, then once per
+    /// `interval`. The returned handle may be aborted by the caller.
+    pub fn spawn_background_auto_sync(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let core = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if core.is_shutting_down() {
+                    break;
+                }
+                if let Err(err) = core.run_background_auto_sync_once().await {
+                    tracing::warn!(error = %err, "background auto-sync pass failed");
+                }
+            }
+        })
     }
 
     /// Launches a downloaded game, tracks screen time with suspend protection, and automatically
@@ -1314,36 +2418,569 @@ impl LauncherCore {
             .and_then(|name| proton_list.iter().find(|p| p.name == name))
             .or_else(|| proton_list.first());
 
+        let runtime_label = chosen_proton
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "native".to_string());
+
+        // Guard the live session: background auto-sync and queued-flush must not touch this
+        // game's save folder while it is running.
+        self.mark_game_playing(&profile.id, game_id);
+        let _ = self.record_activity(
+            &profile.id,
+            Some(game_id),
+            Some(&installed.name),
+            "game_start",
+            "info",
+            &format!("Started {}", installed.name),
+            &format!("Runtime: {runtime_label}"),
+        );
         self.emit(LauncherEvent::GameSessionStarted {
             game_id,
             name: installed.name.clone(),
         });
 
+        let auto_sync_on_close = options.auto_sync_on_close;
+        let game_name_for_hook = installed.name.clone();
+        let profile_id_for_hook = profile.id.clone();
+        let mut post_exit_sync_guard: Option<SyncActivityGuard> = None;
+
         let sync_client = if connected { Some(&client) } else { None };
-        match launch_and_track(&self.db, sync_client, &installed, chosen_proton, options).await {
+        let result = launch_and_track_with_hook(
+            &self.db,
+            sync_client,
+            &installed,
+            chosen_proton,
+            options,
+            |active_secs, _exit_code| {
+                let dur_label = format_duration_brief(active_secs);
+                if auto_sync_on_close {
+                    post_exit_sync_guard = Some(self.begin_sync_activity());
+                    let _ = self.record_activity(
+                        &profile_id_for_hook,
+                        Some(game_id),
+                        Some(&game_name_for_hook),
+                        "game_close",
+                        "info",
+                        &format!("Closed {}", game_name_for_hook),
+                        &format!("Played {dur_label} · Auto-syncing saves…"),
+                    );
+                    self.emit(LauncherEvent::GameSyncStarted {
+                        game_id,
+                        name: game_name_for_hook.clone(),
+                        trigger: "post_exit".to_string(),
+                    });
+                } else {
+                    let _ = self.record_activity(
+                        &profile_id_for_hook,
+                        Some(game_id),
+                        Some(&game_name_for_hook),
+                        "game_close",
+                        "info",
+                        &format!("Closed {}", game_name_for_hook),
+                        &format!("Played {dur_label}"),
+                    );
+                }
+            },
+        )
+        .await;
+
+        drop(post_exit_sync_guard);
+        self.mark_game_stopped(&profile.id, game_id);
+
+        match result {
             Ok(outcome) => {
-                let error = match &outcome.sync_status {
-                    PostExitSyncStatus::QueuedOffline(msg) => Some(msg.clone()),
-                    PostExitSyncStatus::Synced(_) | PostExitSyncStatus::SkippedDisabled => None,
-                };
+                let (uploaded_files, uploaded_bytes, deleted_paths, error) =
+                    match &outcome.sync_status {
+                        PostExitSyncStatus::Synced(report) => {
+                            let detail = format_sync_report_detail(report);
+                            let _ = self.record_activity(
+                                &profile.id,
+                                Some(game_id),
+                                Some(&installed.name),
+                                "sync_complete",
+                                "accent",
+                                &format!("Auto-synced {}", installed.name),
+                                &detail,
+                            );
+                            self.emit(LauncherEvent::GameSyncCompleted {
+                                game_id,
+                                name: installed.name.clone(),
+                                trigger: "post_exit".to_string(),
+                                uploaded_files: report.uploaded_files,
+                                uploaded_bytes: report.uploaded_bytes,
+                                deleted_paths: report.deleted_paths,
+                            });
+                            (
+                                report.uploaded_files,
+                                report.uploaded_bytes,
+                                report.deleted_paths,
+                                None,
+                            )
+                        }
+                        PostExitSyncStatus::QueuedOffline(msg) => {
+                            let _ = self.record_activity(
+                                &profile.id,
+                                Some(game_id),
+                                Some(&installed.name),
+                                "sync_offline",
+                                "warn",
+                                &format!("Queued offline save sync for {}", installed.name),
+                                msg,
+                            );
+                            (0, 0, 0, Some(msg.clone()))
+                        }
+                        PostExitSyncStatus::SkippedDisabled => (0, 0, 0, None),
+                    };
+
                 self.emit(LauncherEvent::GameSessionEnded {
                     game_id,
+                    name: installed.name.clone(),
                     duration_secs: outcome.session.duration_secs,
                     synced: outcome.session.synced,
+                    uploaded_files,
+                    uploaded_bytes,
+                    deleted_paths,
                     error,
                 });
                 Ok(outcome)
             }
             Err(err) => {
+                let msg = err.to_string();
+                let _ = self.record_activity(
+                    &profile.id,
+                    Some(game_id),
+                    Some(&installed.name),
+                    "sync_error",
+                    "danger",
+                    &format!("Launch failed for {}", installed.name),
+                    &msg,
+                );
                 self.emit(LauncherEvent::GameSessionEnded {
                     game_id,
+                    name: installed.name.clone(),
                     duration_secs: 0,
                     synced: false,
-                    error: Some(err.to_string()),
+                    uploaded_files: 0,
+                    uploaded_bytes: 0,
+                    deleted_paths: 0,
+                    error: Some(msg),
                 });
                 Err(err.into())
             }
         }
+    }
+
+    /// Inspects SQLite `active_sessions` for any game sessions that were left open because the
+    /// launcher was force-quit or crashed while playing.
+    ///
+    /// - If an interrupted session has unsynced local save changes, returns it in the result list
+    ///   (and keeps the row in `active_sessions` until [`resolve_interrupted_session`] is called)
+    ///   so the UI can offer to sync the user's saves.
+    /// - If an interrupted session has zero local save changes, automatically records the
+    ///   recovered play session, clears the `active_sessions` row, and logs the clean recovery.
+    pub async fn detect_interrupted_sessions(&self) -> CoreResult<Vec<InterruptedSessionDto>> {
+        let Some(profile) = self.active_profile().await else {
+            return Ok(Vec::new());
+        };
+        let (client, connected) = {
+            let guard = self.active.read().await;
+            match guard.as_ref() {
+                Some(a) => (Some(a.client.clone()), a.state == ConnectionState::Connected),
+                None => (None, false),
+            }
+        };
+
+        let active_rows = self.db.list_active_sessions(&profile.id)?;
+        if active_rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let live_in_memory: HashSet<(String, i64)> =
+            self.playing_games.lock().unwrap().clone();
+
+        let mut out = Vec::new();
+        for rec in active_rows {
+            // Skip any game currently running inside this live launcher process.
+            if live_in_memory.contains(&(rec.profile_id.clone(), rec.game_id)) {
+                continue;
+            }
+
+            let installed = self
+                .db
+                .get_installed_game(&profile.id, rec.game_id)
+                .ok()
+                .flatten();
+            let last_synced_sys = installed
+                .as_ref()
+                .and_then(|i| i.last_synced_at)
+                .map(std::time::SystemTime::from);
+            let started_sys = Some(std::time::SystemTime::from(rec.started_at));
+
+            let clean_manifest = if connected {
+                if let Some(c) = &client {
+                    c.get_manifest(rec.game_id).await.ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let dir_for_scan = rec.install_dir.clone();
+            let manifest_clone = clean_manifest.clone();
+            let inspection = tokio::task::spawn_blocking(move || {
+                inspect_unsynced_saves(
+                    &dir_for_scan,
+                    manifest_clone.as_ref(),
+                    last_synced_sys,
+                    started_sys,
+                )
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+
+            let first_notice = self
+                .notified_interrupted
+                .lock()
+                .unwrap()
+                .insert((rec.profile_id.clone(), rec.game_id));
+
+            if inspection.has_changes {
+                let dto = InterruptedSessionDto {
+                    profile_id: rec.profile_id.clone(),
+                    game_id: rec.game_id,
+                    game_name: rec.game_name.clone(),
+                    install_dir: rec.install_dir.to_string_lossy().to_string(),
+                    runtime: rec.runtime.clone(),
+                    started_at: rec.started_at,
+                    last_heartbeat_at: rec.last_heartbeat_at,
+                    active_secs: rec.active_secs,
+                    has_unsynced_saves: true,
+                    changed_files: inspection.changed_files,
+                    deleted_files: inspection.deleted_files,
+                    changed_bytes: inspection.changed_bytes,
+                    sample_paths: inspection.sample_paths,
+                };
+                if first_notice {
+                    let _ = self.record_activity(
+                        &profile.id,
+                        Some(rec.game_id),
+                        Some(&rec.game_name),
+                        "crash_detected",
+                        "warn",
+                        &format!("Interrupted session detected for {}", rec.game_name),
+                        &format!(
+                            "{} unsynced save file(s) ({}) found after unexpected close",
+                            dto.changed_files + dto.deleted_files,
+                            format_bytes_brief(dto.changed_bytes)
+                        ),
+                    );
+                    self.emit(LauncherEvent::InterruptedSessionDetected {
+                        session: dto.clone(),
+                    });
+                }
+                out.push(dto);
+            } else {
+                // No unsynced save files exist: finalize the interrupted play session and clear
+                // the active_sessions marker automatically.
+                let _ = self.db.record_play_session(
+                    &rec.profile_id,
+                    rec.game_id,
+                    rec.started_at,
+                    rec.last_heartbeat_at,
+                    rec.active_secs,
+                    &rec.runtime,
+                    true,
+                );
+                let _ = self.db.clear_active_session(&rec.profile_id, rec.game_id);
+                if first_notice {
+                    let _ = self.record_activity(
+                        &profile.id,
+                        Some(rec.game_id),
+                        Some(&rec.game_name),
+                        "crash_detected",
+                        "info",
+                        &format!("Recovered session for {}", rec.game_name),
+                        "Launcher closed while game was open · No modified save files detected",
+                    );
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Resolves an interrupted game session detected on startup:
+    /// - When `sync_saves` is `true`, performs differential save sync, records the recovered
+    ///   play session as synced, clears the `active_sessions` marker, and logs the recovery.
+    /// - When `sync_saves` is `false`, records the recovered play session without syncing and
+    ///   clears the `active_sessions` marker.
+    pub async fn resolve_interrupted_session(
+        &self,
+        game_id: i64,
+        sync_saves: bool,
+        force_mass_deletion: bool,
+    ) -> CoreResult<Option<SyncReport>> {
+        let profile = self
+            .active_profile()
+            .await
+            .ok_or(CoreError::NoActiveProfile)?;
+        let rec = self.db.get_active_session(&profile.id, game_id)?;
+        let installed = self
+            .db
+            .get_installed_game(&profile.id, game_id)?
+            .ok_or(CoreError::GameNotInstalled(game_id))?;
+
+        if !sync_saves {
+            if let Some(rec) = &rec {
+                let _ = self.db.record_play_session(
+                    &profile.id,
+                    game_id,
+                    rec.started_at,
+                    rec.last_heartbeat_at,
+                    rec.active_secs,
+                    &rec.runtime,
+                    false,
+                );
+            }
+            self.db.clear_active_session(&profile.id, game_id)?;
+            self.notified_interrupted
+                .lock()
+                .unwrap()
+                .remove(&(profile.id.clone(), game_id));
+            let _ = self.record_activity(
+                &profile.id,
+                Some(game_id),
+                Some(&installed.name),
+                "crash_resolved",
+                "info",
+                &format!("Dismissed save recovery for {}", installed.name),
+                "Local save files kept on disk without uploading",
+            );
+            return Ok(None);
+        }
+
+        let client = self.active_client().await?;
+        let _sync_guard = self.begin_sync_activity();
+        self.emit(LauncherEvent::GameSyncStarted {
+            game_id,
+            name: installed.name.clone(),
+            trigger: "recovery".to_string(),
+        });
+
+        let report =
+            sync_game_saves(&client, game_id, &installed.install_dir, force_mass_deletion).await?;
+        self.db
+            .update_game_synced_at(&profile.id, game_id, Utc::now())?;
+        self.db.clear_pending_sync(&profile.id, game_id)?;
+        if let Some(rec) = &rec {
+            let _ = self.db.record_play_session(
+                &profile.id,
+                game_id,
+                rec.started_at,
+                rec.last_heartbeat_at,
+                rec.active_secs,
+                &rec.runtime,
+                true,
+            );
+        }
+        self.db.clear_active_session(&profile.id, game_id)?;
+        self.notified_interrupted
+            .lock()
+            .unwrap()
+            .remove(&(profile.id.clone(), game_id));
+
+        let detail = format_sync_report_detail(&report);
+        let _ = self.record_activity(
+            &profile.id,
+            Some(game_id),
+            Some(&installed.name),
+            "sync_complete",
+            "accent",
+            &format!("Recovered & synced saves for {}", installed.name),
+            &detail,
+        );
+        self.emit(LauncherEvent::GameSyncCompleted {
+            game_id,
+            name: installed.name.clone(),
+            trigger: "recovery".to_string(),
+            uploaded_files: report.uploaded_files,
+            uploaded_bytes: report.uploaded_bytes,
+            deleted_paths: report.deleted_paths,
+        });
+
+        Ok(Some(report))
+    }
+
+    /// Returns a snapshot of in-flight save syncs, currently running games, and active transfers
+    /// so the window close handler or UI can determine whether it is immediately safe to exit.
+    pub fn shutdown_status(&self) -> ShutdownStatusDto {
+        let active_syncs = self.active_sync_count();
+        let playing_pairs: Vec<(String, i64)> =
+            self.playing_games.lock().unwrap().iter().cloned().collect();
+        let mut playing_games = Vec::with_capacity(playing_pairs.len());
+        for (pid, gid) in playing_pairs {
+            let name = self
+                .db
+                .get_installed_game(&pid, gid)
+                .ok()
+                .flatten()
+                .map(|g| g.name)
+                .or_else(|| {
+                    self.db
+                        .get_active_session(&pid, gid)
+                        .ok()
+                        .flatten()
+                        .map(|s| s.game_name)
+                })
+                .unwrap_or_else(|| format!("Game #{gid}"));
+            playing_games.push(name);
+        }
+        playing_games.sort();
+
+        let active_downloads = self
+            .downloads
+            .read()
+            .unwrap()
+            .values()
+            .filter(|e| {
+                matches!(
+                    e.snapshot.status,
+                    DownloadStatus::Queued | DownloadStatus::Downloading | DownloadStatus::Verifying
+                )
+            })
+            .count();
+
+        let active_uploads = self
+            .uploads
+            .read()
+            .unwrap()
+            .values()
+            .filter(|e| {
+                matches!(
+                    e.snapshot.status,
+                    UploadStatus::Queued | UploadStatus::Uploading | UploadStatus::Indexing
+                )
+            })
+            .count();
+
+        let ready_to_exit = active_syncs == 0
+            && playing_games.is_empty()
+            && active_downloads == 0
+            && active_uploads == 0;
+
+        ShutdownStatusDto {
+            active_syncs,
+            playing_games,
+            active_downloads,
+            active_uploads,
+            ready_to_exit,
+        }
+    }
+
+    /// Emits `LauncherEvent::ShutdownRequested` with the current [`ShutdownStatusDto`] and
+    /// returns it.
+    pub fn request_shutdown_check(&self) -> ShutdownStatusDto {
+        let status = self.shutdown_status();
+        self.emit(LauncherEvent::ShutdownRequested {
+            status: status.clone(),
+        });
+        status
+    }
+
+    /// Executes the safe shutdown sequence:
+    /// 1. If a game is currently running and `force_while_playing` is `false`, returns early
+    ///    with `completed: false` so the caller/UI can ask the user for confirmation.
+    /// 2. Marks the core as `shutting_down` so no new background auto-sync passes start.
+    /// 3. Waits up to `timeout` for any in-flight save syncs (`active_syncs`) to complete.
+    /// 4. Pauses any active downloads or uploads so partial `.part` files aren't written mid-exit.
+    /// 5. Checkpoints and truncates the SQLite WAL (`PRAGMA wal_checkpoint(TRUNCATE)`).
+    pub async fn perform_safe_shutdown(
+        &self,
+        timeout: Duration,
+        force_while_playing: bool,
+    ) -> CoreResult<ShutdownResultDto> {
+        let initial = self.shutdown_status();
+        if !force_while_playing && !initial.playing_games.is_empty() {
+            return Ok(ShutdownResultDto {
+                completed: false,
+                active_syncs_remaining: initial.active_syncs,
+                playing_games: initial.playing_games,
+                wal_checkpointed: false,
+            });
+        }
+
+        self.shutting_down.store(true, Ordering::SeqCst);
+
+        // Wait for any in-flight save sync operations to finish cleanly.
+        let deadline = Instant::now() + timeout;
+        while self.active_sync_count() > 0 && Instant::now() < deadline {
+            let remaining = self.active_sync_count();
+            self.emit(LauncherEvent::ShutdownProgress {
+                stage: "waiting_for_sync".to_string(),
+                active_syncs: remaining,
+                message: format!("Finishing {remaining} active save sync(s) before closing…"),
+            });
+            let wait_for = deadline.saturating_duration_since(Instant::now());
+            let notified = self.sync_idle_notify.notified();
+            if self.active_sync_count() == 0 {
+                break;
+            }
+            let _ = tokio::time::timeout(wait_for.min(Duration::from_millis(250)), notified).await;
+        }
+
+        // Pause active downloads and uploads so disk writes stop cleanly before exit.
+        let dl_ids: Vec<String> = self.downloads.read().unwrap().keys().cloned().collect();
+        for id in dl_ids {
+            let _ = self.pause_download(&id).await;
+        }
+        let up_ids: Vec<String> = self.uploads.read().unwrap().keys().cloned().collect();
+        for id in up_ids {
+            let _ = self.pause_upload(&id).await;
+        }
+
+        // If any games are still running (when force_while_playing == true), touch their
+        // active_sessions heartbeat so the next startup accurately detects them.
+        let live_pairs: Vec<(String, i64)> =
+            self.playing_games.lock().unwrap().iter().cloned().collect();
+        let now = Utc::now();
+        for (pid, gid) in &live_pairs {
+            if let Ok(Some(rec)) = self.db.get_active_session(pid, *gid) {
+                let elapsed = (now - rec.started_at).num_seconds().max(0) as u64;
+                let _ = self
+                    .db
+                    .heartbeat_active_session(pid, *gid, now, rec.active_secs.max(elapsed));
+            }
+        }
+
+        if let Some(profile) = self.active_profile().await {
+            let _ = self.record_activity(
+                &profile.id,
+                None,
+                None,
+                "safe_shutdown",
+                "info",
+                "Safe shutdown completed",
+                "In-flight save syncs flushed and SQLite WAL checkpointed",
+            );
+        }
+
+        let wal_checkpointed = self.db.checkpoint_wal().is_ok();
+        let remaining = self.active_sync_count();
+        self.emit(LauncherEvent::ShutdownProgress {
+            stage: "ready".to_string(),
+            active_syncs: remaining,
+            message: "Safe shutdown complete".to_string(),
+        });
+
+        Ok(ShutdownResultDto {
+            completed: true,
+            active_syncs_remaining: remaining,
+            playing_games: initial.playing_games,
+            wal_checkpointed,
+        })
     }
 
     pub async fn playtime_summary(&self, game_id: i64) -> CoreResult<PlaytimeSummary> {
@@ -1441,6 +3078,23 @@ impl LauncherCore {
     }
 }
 
+fn safe_cache_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn pfp_cache_base(profile_id: &str, user_id: i64) -> String {
+    format!("{}_{}", safe_cache_component(profile_id), user_id)
+}
+
 fn ext_for_mime(content_type: &str) -> &'static str {
     match content_type.to_ascii_lowercase().as_str() {
         "image/jpeg" | "image/jpg" => "jpg",
@@ -1448,5 +3102,61 @@ fn ext_for_mime(content_type: &str) -> &'static str {
         "image/webp" => "webp",
         "image/gif" => "gif",
         _ => "bin",
+    }
+}
+
+fn format_sync_report_detail(report: &SyncReport) -> String {
+    if report.uploaded_files == 0 && report.deleted_paths == 0 {
+        return format!("Saves up to date ({} files verified)", report.skipped_unchanged);
+    }
+    let mut parts = Vec::new();
+    if report.uploaded_files > 0 {
+        parts.push(format!(
+            "{} uploaded ({})",
+            report.uploaded_files,
+            format_bytes_brief(report.uploaded_bytes)
+        ));
+    }
+    if report.deleted_paths > 0 {
+        parts.push(format!("{} deleted", report.deleted_paths));
+    }
+    if report.skipped_unchanged > 0 {
+        parts.push(format!("{} unchanged", report.skipped_unchanged));
+    }
+    parts.join(" · ")
+}
+
+fn format_bytes_brief(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_duration_brief(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{}s", secs.max(1));
+    }
+    let mins = secs / 60;
+    let rem_s = secs % 60;
+    if mins < 60 {
+        if rem_s == 0 {
+            format!("{mins}m")
+        } else {
+            format!("{mins}m {rem_s}s")
+        }
+    } else {
+        let hrs = mins / 60;
+        let rem_m = mins % 60;
+        format!("{hrs}h {rem_m}m")
     }
 }

@@ -8,6 +8,10 @@ license.workspace = true
 name = "opensync-launcher"
 path = "src/main.rs"
 
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
