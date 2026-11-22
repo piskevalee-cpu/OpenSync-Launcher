@@ -17,7 +17,11 @@
         "minWidth": 900,
         "minHeight": 600,
         "backgroundColor": "#090A0D",
-        "resizable": true
+        "resizable": true,
+        "decorations": true,
+        "titleBarStyle": "Transparent",
+        "hiddenTitle": true,
+        "theme": "Dark"
       }
     ],
     "security": {
@@ -32,7 +36,28 @@
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.png",
+      "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "bundleName": "OpenSync Launcher",
+      "bundleVersion": "0.3.0",
+      "signingIdentity": "-",
+      "minimumSystemVersion": "10.15",
+      "dmg": {
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
+      }
+    }
   }
 }

@@ -28,6 +28,8 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, broadcast};
 use uuid::Uuid;
 
+pub use launcher_db::default_data_dir;
+
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("db error: {0}")]
@@ -312,8 +314,9 @@ impl LauncherPaths {
     }
 }
 
-/// Default destination for downloaded games: `<Games>/OpenSync` in the user's home dir.
-/// Checks `Games` then `games`; if neither exists, falls back to creating `Games/OpenSync`.
+/// Default destination for downloaded games: `~/Games/OpenSync` on macOS/Windows and
+/// `<Games>/OpenSync` on Linux (checking `Games` then `games` before creating one).
+/// This never consults `$XDG_DATA_HOME`; it is independent of the data directory.
 pub fn default_games_dir() -> PathBuf {
     let home_env = std::env::var("HOME")
         .ok()
@@ -325,11 +328,18 @@ pub fn default_games_dir() -> PathBuf {
         });
     if let Some(home) = home_env {
         let home = PathBuf::from(home);
-        let games = [home.join("Games"), home.join("games")]
-            .into_iter()
-            .find(|p| p.is_dir())
-            .unwrap_or_else(|| home.join("Games"));
-        return games.join("OpenSync");
+        #[cfg(target_os = "macos")]
+        {
+            return home.join("Games").join("OpenSync");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let games = [home.join("Games"), home.join("games")]
+                .into_iter()
+                .find(|p| p.is_dir())
+                .unwrap_or_else(|| home.join("Games"));
+            return games.join("OpenSync");
+        }
     }
     PathBuf::from("Games").join("OpenSync")
 }

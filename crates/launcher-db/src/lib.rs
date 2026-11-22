@@ -21,6 +21,63 @@ pub enum DbError {
 
 pub type DbResult<T> = Result<T, DbError>;
 
+/// Default directory for launcher state (SQLite database, `secrets.json`, caches, Proton
+/// installs and prefixes).
+///
+/// Resolution order:
+/// 1. `OPENSYNC_LAUNCHER_DATA` override (any platform)
+/// 2. macOS: `~/Library/Application Support/opensync-launcher`
+/// 3. Linux/BSD: `$XDG_DATA_HOME/opensync-launcher` or `~/.local/share/opensync-launcher`
+/// 4. Windows: `%LOCALAPPDATA%/opensync-launcher`, `%APPDATA%/opensync-launcher`, or `USERPROFILE/AppData/Local/...`
+///
+/// macOS never relies on Linux's `$XDG_DATA_HOME` convention.
+pub fn default_data_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var("OPENSYNC_LAUNCHER_DATA")
+        && !custom.trim().is_empty()
+    {
+        return PathBuf::from(custom);
+    }
+
+    let home = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .find(|v| !v.trim().is_empty())
+        .map(PathBuf::from);
+
+    #[cfg(target_os = "macos")]
+    if let Some(home) = home {
+        return home.join("Library/Application Support/opensync-launcher");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        for var in ["LOCALAPPDATA", "APPDATA"] {
+            if let Ok(val) = std::env::var(var)
+                && !val.trim().is_empty()
+            {
+                return PathBuf::from(val).join("opensync-launcher");
+            }
+        }
+        if let Some(home) = home {
+            return home.join("AppData/Local/opensync-launcher");
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+            && !xdg.trim().is_empty()
+        {
+            return PathBuf::from(xdg).join("opensync-launcher");
+        }
+        if let Some(home) = home {
+            return home.join(".local/share/opensync-launcher");
+        }
+    }
+
+    PathBuf::from("./opensync-launcher-data")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Profile {
     pub id: String,
@@ -1127,4 +1184,25 @@ fn parse_dt(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_dir_default_uses_platform_location() {
+        let dir = std::env::var("OPENSYNC_LAUNCHER_DATA").ok();
+        if dir.is_some() {
+            return; // An explicit override is always respected; nothing else to assert.
+        }
+        let resolved = default_data_dir();
+        assert!(resolved.ends_with("opensync-launcher"), "{resolved:?}");
+
+        #[cfg(target_os = "macos")]
+        assert!(
+            resolved.to_string_lossy().contains("Library/Application Support"),
+            "macOS data dir must not use XDG paths: {resolved:?}"
+        );
+    }
 }

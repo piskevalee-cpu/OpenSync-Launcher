@@ -1,4 +1,4 @@
-name: Build OpenSync Launcher (AppImage, Flatpak & Windows .exe)
+name: Build OpenSync Launcher (AppImage, Flatpak, Windows .exe & macOS .app/.dmg)
 
 on:
   push:
@@ -273,21 +273,117 @@ jobs:
           path: dist/OpenSync_Launcher_*_x64.exe*
           if-no-files-found: error
 
+  build-macos:
+    name: macOS (.app / .dmg arm64 + x86_64)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify launcher version parity (and tag match)
+        run: |
+          set -euo pipefail
+          VER=$(tr -d '[:space:]' < VERSION)
+          TAURI_VER=$(python3 -c 'import json; print(json.load(open("crates/launcher-tauri/tauri.conf.json"))["version"])')
+          CARGO_VER=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          test -n "$VER"
+          test "$VER" = "$TAURI_VER" || { echo "tauri.conf.json ($TAURI_VER) != VERSION ($VER)"; exit 1; }
+          test "$VER" = "$CARGO_VER" || { echo "Cargo.toml ($CARGO_VER) != VERSION ($VER)"; exit 1; }
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_VER="${GITHUB_REF#refs/tags/v}"
+            test "$TAG_VER" = "$VER" || { echo "Tag v${TAG_VER} != VERSION ($VER)"; exit 1; }
+          fi
+
+      - name: Install Rust stable toolchain (Apple Silicon + Intel targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version '^2' --locked
+
+      - name: Run Rust workspace tests
+        run: cargo test --workspace --exclude launcher-tauri
+
+      - name: Resolve version
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION=$(tr -d '[:space:]' < VERSION)
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Apple Silicon (aarch64) .app and .dmg
+        working-directory: crates/launcher-tauri
+        run: cargo tauri build --target aarch64-apple-darwin --bundles app,dmg
+
+      - name: Stage Apple Silicon artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          BUNDLE="target/aarch64-apple-darwin/release/bundle"
+          mkdir -p dist
+          cp -R "$BUNDLE/macos/OpenSync Launcher.app" "dist/OpenSync_Launcher_${VERSION}_aarch64.app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/OpenSync_Launcher_${VERSION}_aarch64.app" \
+            "dist/OpenSync_Launcher_${VERSION}_aarch64.app.zip"
+          cp "$BUNDLE"/dmg/*.dmg "dist/OpenSync_Launcher_${VERSION}_aarch64.dmg"
+          (cd dist && shasum -a 256 \
+            "OpenSync_Launcher_${VERSION}_aarch64.app.zip" \
+            "OpenSync_Launcher_${VERSION}_aarch64.dmg" \
+            > "OpenSync_Launcher_${VERSION}_aarch64.sha256")
+          ls -lh dist
+
+      - name: Build Intel (x86_64) .app and .dmg
+        working-directory: crates/launcher-tauri
+        run: cargo tauri build --target x86_64-apple-darwin --bundles app,dmg
+
+      - name: Stage Intel artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          BUNDLE="target/x86_64-apple-darwin/release/bundle"
+          cp -R "$BUNDLE/macos/OpenSync Launcher.app" "dist/OpenSync_Launcher_${VERSION}_x86_64.app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/OpenSync_Launcher_${VERSION}_x86_64.app" \
+            "dist/OpenSync_Launcher_${VERSION}_x86_64.app.zip"
+          cp "$BUNDLE"/dmg/*.dmg "dist/OpenSync_Launcher_${VERSION}_x86_64.dmg"
+          (cd dist && shasum -a 256 \
+            "OpenSync_Launcher_${VERSION}_x86_64.app.zip" \
+            "OpenSync_Launcher_${VERSION}_x86_64.dmg" \
+            > "OpenSync_Launcher_${VERSION}_x86_64.sha256")
+          ls -lh dist
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensync-launcher-macos
+          path: |
+            dist/OpenSync_Launcher_*.dmg
+            dist/OpenSync_Launcher_*.app.zip
+            dist/OpenSync_Launcher_*.sha256
+          if-no-files-found: error
+
   release:
     name: Publish Release Assets
-    needs: [build-linux-appimage, build-linux-flatpak, build-windows-exe]
+    needs: [build-linux-appimage, build-linux-flatpak, build-windows-exe, build-macos]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     runs-on: ubuntu-latest
     steps:
-      - name: Download Linux & Windows artifacts
+      - name: Download Linux, macOS & Windows artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
 
-      - name: Attach .AppImage, .flatpak, and .exe to GitHub Release
+      - name: Attach .AppImage, .flatpak, .exe, .app and .dmg to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |

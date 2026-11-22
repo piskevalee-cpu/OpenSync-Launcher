@@ -42,6 +42,10 @@ pub enum BinaryKind {
     LinuxElf,
     WindowsPe,
     ShellScript,
+    /// A native macOS executable: thin 32/64-bit Mach-O or a universal ("fat") binary.
+    MacOsMachO,
+    /// A macOS `.app` bundle whose launcher lives under `Contents/MacOS`.
+    MacOsAppBundle,
     Unknown,
 }
 
@@ -88,16 +92,69 @@ pub struct LaunchCommandSpec {
     pub runtime_label: String,
 }
 
-/// Inspects the first bytes of a file to classify Linux ELF, Windows PE, or shell scripts.
+/// Returns true when `path` is a macOS application bundle containing a `Contents/MacOS` launcher.
+pub fn is_macos_app_bundle(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("app"))
+        && path.join("Contents/MacOS").is_dir()
+}
+
+/// Locates the native executable inside a macOS `.app` bundle, preferring a binary whose
+/// name matches the bundle name.
+pub fn macos_app_inner_binary(app_path: &Path) -> Option<PathBuf> {
+    let macos_dir = app_path.join("Contents/MacOS");
+    let bundle_name = app_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mut candidates: Vec<PathBuf> = fs::read_dir(&macos_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.is_file()
+                && matches!(
+                    detect_binary_kind(p),
+                    BinaryKind::MacOsMachO | BinaryKind::ShellScript
+                )
+        })
+        .collect();
+    candidates.sort_by_key(|p| {
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let name_match = if !bundle_name.is_empty()
+            && (stem == bundle_name
+                || stem.contains(&bundle_name)
+                || bundle_name.contains(&stem))
+        {
+            0
+        } else {
+            1
+        };
+        (name_match, p.components().count())
+    });
+    candidates.into_iter().next()
+}
+
+/// Inspects the first bytes of a file to classify ELF, PE, shell scripts, and Mach-O binaries.
+/// macOS `.app` bundles are classified by their `Contents/MacOS` directory instead of magic.
 pub fn detect_binary_kind(path: &Path) -> BinaryKind {
+    if is_macos_app_bundle(path) {
+        return BinaryKind::MacOsAppBundle;
+    }
     let Ok(mut f) = File::open(path) else {
         return BinaryKind::Unknown;
     };
-    let mut magic = [0u8; 4];
+    let mut magic = [0u8; 8];
     let Ok(n) = f.read(&mut magic) else {
         return BinaryKind::Unknown;
     };
-    if n >= 4 && magic == [0x7f, b'E', b'L', b'F'] {
+    if n >= 4 && magic[..4] == [0x7f, b'E', b'L', b'F'] {
         return BinaryKind::LinuxElf;
     }
     if n >= 2 && magic[0] == b'M' && magic[1] == b'Z' {
@@ -105,6 +162,23 @@ pub fn detect_binary_kind(path: &Path) -> BinaryKind {
     }
     if n >= 2 && magic[0] == b'#' && magic[1] == b'!' {
         return BinaryKind::ShellScript;
+    }
+    // Mach-O magics (MH_MAGIC/MH_CIGAM, MH_MAGIC_64/MH_CIGAM_64) and the universal
+    // "fat" magics (FAT_MAGIC/FAT_CIGAM and their 64-bit variants) in both byte orders.
+    if n >= 4
+        && matches!(
+            &magic[..4],
+            [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xce]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xbe, 0xba, 0xfe, 0xca]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbf, 0xba, 0xfe, 0xca]
+                | [0xca, 0xfe, 0xba, 0xbf]
+        )
+    {
+        return BinaryKind::MacOsMachO;
     }
     BinaryKind::Unknown
 }
@@ -136,9 +210,6 @@ pub fn discover_executables(install_dir: &Path, game_name: &str) -> Vec<Discover
         .into_iter()
         .filter_map(Result::ok)
     {
-        if !entry.file_type().is_file() {
-            continue;
-        }
         let abs = entry.path().to_path_buf();
         let Ok(rel) = abs.strip_prefix(install_dir) else {
             continue;
@@ -149,8 +220,19 @@ pub fn discover_executables(install_dir: &Path, game_name: &str) -> Vec<Discover
             continue;
         }
 
-        // Skip shared libraries
-        if lower_rel.ends_with(".dll") || lower_rel.ends_with(".so") || lower_rel.contains(".so.") {
+        // Skip shared libraries and macOS bundles' internal support files.
+        if lower_rel.ends_with(".dll")
+            || lower_rel.ends_with(".so")
+            || lower_rel.contains(".so.")
+            || lower_rel.ends_with(".dylib")
+            || lower_rel.ends_with(".framework")
+            || lower_rel.contains(".app/contents/")
+        {
+            continue;
+        }
+
+        let is_bundle = is_macos_app_bundle(&abs);
+        if !is_bundle && !entry.file_type().is_file() {
             continue;
         }
 
@@ -185,15 +267,25 @@ pub fn discover_executables(install_dir: &Path, game_name: &str) -> Vec<Discover
             };
             #[cfg(target_os = "windows")]
             let kind_rank = match c.kind {
+                BinaryKind::MacOsAppBundle | BinaryKind::MacOsMachO => 2,
                 BinaryKind::WindowsPe => 0,
                 BinaryKind::LinuxElf => 1,
-                BinaryKind::ShellScript => 2,
-                BinaryKind::Unknown => 3,
+                BinaryKind::ShellScript => 3,
+                BinaryKind::Unknown => 4,
             };
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "macos")]
+            let kind_rank = match c.kind {
+                BinaryKind::MacOsAppBundle => 0,
+                BinaryKind::MacOsMachO => 1,
+                BinaryKind::ShellScript => 2,
+                BinaryKind::WindowsPe => 3,
+                BinaryKind::LinuxElf => 4,
+                BinaryKind::Unknown => 5,
+            };
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             let kind_rank = match c.kind {
                 BinaryKind::LinuxElf => 0,
-                BinaryKind::WindowsPe => 1,
+                BinaryKind::WindowsPe | BinaryKind::MacOsMachO | BinaryKind::MacOsAppBundle => 1,
                 BinaryKind::ShellScript => 2,
                 BinaryKind::Unknown => 3,
             };
@@ -205,36 +297,86 @@ pub fn discover_executables(install_dir: &Path, game_name: &str) -> Vec<Discover
     candidates
 }
 
-/// Returns standard Linux search roots for installed Proton runtimes.
+fn user_home_dir() -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .find(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// Returns standard search roots for installed Proton runtimes on the current platform.
+/// Linux keeps its Steam/Flatpak locations; macOS uses `~/Library/Application Support/Steam`
+/// (with a compatibility fallback for Linux-style layouts) so scans never depend on
+/// `$XDG_DATA_HOME`.
 pub fn default_proton_search_roots(managed_dir: &Path) -> Vec<(PathBuf, ProtonSource)> {
     let mut roots = vec![(managed_dir.to_path_buf(), ProtonSource::OpenSyncManaged)];
-    if let Ok(home) = std::env::var("HOME") {
-        let h = PathBuf::from(home);
+    let Some(home) = user_home_dir() else {
+        return roots;
+    };
+
+    #[cfg(target_os = "linux")]
+    {
         roots.push((
-            h.join(".local/share/Steam/compatibilitytools.d"),
+            home.join(".local/share/Steam/compatibilitytools.d"),
             ProtonSource::SteamCompatTools,
         ));
         roots.push((
-            h.join(".steam/root/compatibilitytools.d"),
+            home.join(".steam/root/compatibilitytools.d"),
             ProtonSource::SteamCompatTools,
         ));
         roots.push((
-            h.join(".var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"),
+            home.join(".var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"),
             ProtonSource::FlatpakSteam,
         ));
         roots.push((
-            h.join(".local/share/Steam/steamapps/common"),
+            home.join(".local/share/Steam/steamapps/common"),
             ProtonSource::SteamCommon,
         ));
         roots.push((
-            h.join(".steam/steam/steamapps/common"),
+            home.join(".steam/steam/steamapps/common"),
             ProtonSource::SteamCommon,
         ));
         roots.push((
-            h.join(".var/app/com.valvesoftware.Steam/data/Steam/steamapps/common"),
+            home.join(".var/app/com.valvesoftware.Steam/data/Steam/steamapps/common"),
             ProtonSource::FlatpakSteam,
         ));
     }
+
+    #[cfg(target_os = "macos")]
+    {
+        roots.push((
+            home.join("Library/Application Support/Steam/compatibilitytools.d"),
+            ProtonSource::SteamCompatTools,
+        ));
+        roots.push((
+            home.join("Library/Application Support/Steam/steamapps/common"),
+            ProtonSource::SteamCommon,
+        ));
+        // Also pick up Linux-style Steam layouts (e.g. migrated installs).
+        roots.push((
+            home.join(".local/share/Steam/compatibilitytools.d"),
+            ProtonSource::SteamCompatTools,
+        ));
+        roots.push((
+            home.join(".local/share/Steam/steamapps/common"),
+            ProtonSource::SteamCommon,
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(pf) = std::env::var("ProgramFiles(x86)") {
+            let pf = PathBuf::from(pf);
+            roots.push((
+                pf.join("Steam/compatibilitytools.d"),
+                ProtonSource::SteamCompatTools,
+            ));
+            roots.push((pf.join("Steam/steamapps/common"), ProtonSource::SteamCommon));
+        }
+        let _ = &home;
+    }
+
     roots
 }
 
@@ -291,13 +433,216 @@ pub fn detect_proton_in_roots(roots: &[(PathBuf, ProtonSource)]) -> Vec<ProtonIn
     found
 }
 
-/// Builds a launch command for either a native executable or a Windows PE binary via Proton.
+/// Builds a native launch specification, marking the file executable on Unix.
+fn native_command(
+    exe: &DiscoveredExecutable,
+    extra_args: &[String],
+    working_dir: PathBuf,
+) -> LaunchCommandSpec {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(&exe.abs_path) {
+            let mode = meta.permissions().mode();
+            if mode & 0o111 == 0 {
+                let _ = fs::set_permissions(
+                    &exe.abs_path,
+                    fs::Permissions::from_mode(mode | 0o755),
+                );
+            }
+        }
+    }
+    LaunchCommandSpec {
+        program: exe.abs_path.clone(),
+        args: extra_args.to_vec(),
+        env: Vec::new(),
+        working_dir,
+        runtime_label: "native".to_string(),
+    }
+}
+
+/// Launches a macOS `.app` bundle via Launch Services. `open -W` waits until the app quits,
+/// which keeps the runner's session clock and post-exit save sync in sync with the real game.
+#[cfg(target_os = "macos")]
+fn macos_app_command(
+    exe: &DiscoveredExecutable,
+    extra_args: &[String],
+    working_dir: PathBuf,
+) -> ProtonResult<LaunchCommandSpec> {
+    let open = PathBuf::from("/usr/bin/open");
+    if open.is_file() {
+        let mut args = vec!["-W".to_string(), exe.abs_path.to_string_lossy().into_owned()];
+        if !extra_args.is_empty() {
+            args.push("--args".to_string());
+            args.extend(extra_args.iter().cloned());
+        }
+        return Ok(LaunchCommandSpec {
+            program: open,
+            args,
+            env: Vec::new(),
+            working_dir,
+            runtime_label: "macOS".to_string(),
+        });
+    }
+    // Defensive fallback: execute the bundle's inner Mach-O binary directly.
+    match macos_app_inner_binary(&exe.abs_path) {
+        Some(inner) => Ok(LaunchCommandSpec {
+            program: inner.clone(),
+            args: extra_args.to_vec(),
+            env: Vec::new(),
+            working_dir: inner.parent().unwrap_or(&exe.abs_path).to_path_buf(),
+            runtime_label: "native".to_string(),
+        }),
+        None => Err(ProtonError::NotInstalled),
+    }
+}
+
+/// Windows PE launch on macOS: use a configured Wine-compatible runner when available,
+/// otherwise fall back to a clean native execution attempt (no Linux Proton script).
+#[cfg(target_os = "macos")]
+fn macos_pe_command(
+    exe: &DiscoveredExecutable,
+    extra_args: &[String],
+    working_dir: PathBuf,
+) -> ProtonResult<LaunchCommandSpec> {
+    const RUNNER_VARS: &[(&str, &str)] = &[
+        ("OPENSYNC_MACOS_COMPAT_RUNNER", "compat"),
+        ("OPENSYNC_MACOS_WINE", "Wine"),
+        ("OPENSYNC_MACOS_WHISKY", "Whisky"),
+        ("OPENSYNC_MACOS_CROSSOVER", "CrossOver"),
+    ];
+    let mut runner_label = "compat";
+    let runner = RUNNER_VARS
+        .iter()
+        .find_map(|(var, label)| {
+            std::env::var(var)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| {
+                    runner_label = *label;
+                    PathBuf::from(v)
+                })
+        })
+        .or_else(|| {
+            find_on_path("wine").map(|p| {
+                runner_label = "Wine";
+                p
+            })
+        })
+        .or_else(|| {
+            find_on_path("wine64").map(|p| {
+                runner_label = "Wine";
+                p
+            })
+        })
+        .or_else(|| {
+            // macOS GUI apps launched from Finder/Dock do not include Homebrew in PATH.
+            [
+                "/opt/homebrew/bin/wine",
+                "/usr/local/bin/wine",
+                "/opt/homebrew/bin/wine64",
+                "/usr/local/bin/wine64",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+            .map(|p| {
+                runner_label = "Wine";
+                p
+            })
+        });
+
+    let Some(runner) = runner else {
+        return Ok(LaunchCommandSpec {
+            program: exe.abs_path.clone(),
+            args: extra_args.to_vec(),
+            env: Vec::new(),
+            working_dir,
+            runtime_label: "native (Windows PE needs Wine/Whisky/CrossOver on macOS)".to_string(),
+        });
+    };
+
+    let mut args = vec![exe.abs_path.to_string_lossy().into_owned()];
+    args.extend(extra_args.iter().cloned());
+    Ok(LaunchCommandSpec {
+        program: runner,
+        args,
+        env: Vec::new(),
+        working_dir,
+        runtime_label: format!("{runner_label} (macOS)"),
+    })
+}
+
+/// Linux/Windows path: build a Proton (or `umu-run`) launch command for a Windows PE binary.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn build_proton_pe_command(
+    exe: &DiscoveredExecutable,
+    prefix_dir: &Path,
+    proton: &ProtonInstallation,
+    extra_args: &[String],
+    working_dir: PathBuf,
+) -> ProtonResult<LaunchCommandSpec> {
+    fs::create_dir_all(prefix_dir)?;
+
+    // Prefer `umu-run` when available on PATH for clean Steam Linux Runtime sandboxing.
+    let mut env = vec![
+        (
+            "STEAM_COMPAT_DATA_PATH".to_string(),
+            prefix_dir.to_string_lossy().to_string(),
+        ),
+        (
+            "STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(),
+            proton
+                .root_dir
+                .parent()
+                .unwrap_or(&proton.root_dir)
+                .to_string_lossy()
+                .to_string(),
+        ),
+        (
+            "PROTONPATH".to_string(),
+            proton.root_dir.to_string_lossy().to_string(),
+        ),
+        ("GAMEID".to_string(), "opensync-0".to_string()),
+    ];
+
+    if let Some(umu) = find_on_path("umu-run") {
+        let mut args = vec![exe.abs_path.to_string_lossy().to_string()];
+        args.extend(extra_args.iter().cloned());
+        return Ok(LaunchCommandSpec {
+            program: umu,
+            args,
+            env,
+            working_dir,
+            runtime_label: format!("{} (umu)", proton.name),
+        });
+    }
+
+    let mut args = vec!["run".to_string(), exe.abs_path.to_string_lossy().to_string()];
+    args.extend(extra_args.iter().cloned());
+    env.push(("STEAM_COMPAT_APP_ID".to_string(), "0".to_string()));
+    Ok(LaunchCommandSpec {
+        program: proton.proton_script.clone(),
+        args,
+        env,
+        working_dir,
+        runtime_label: proton.name.clone(),
+    })
+}
+
+/// Builds a launch command for a native executable, a macOS app bundle, or (depending on
+/// the host OS) a Windows PE binary via Proton/Wine.
 pub fn build_launch_command(
     exe: &DiscoveredExecutable,
     prefix_dir: &Path,
     proton: Option<&ProtonInstallation>,
     extra_args: &[String],
 ) -> ProtonResult<LaunchCommandSpec> {
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = prefix_dir;
+        let _ = proton;
+    }
     let working_dir = exe
         .abs_path
         .parent()
@@ -305,89 +650,38 @@ pub fn build_launch_command(
         .to_path_buf();
 
     match exe.kind {
-        BinaryKind::LinuxElf | BinaryKind::ShellScript | BinaryKind::Unknown => {
-            #[cfg(unix)]
+        BinaryKind::MacOsAppBundle => {
+            #[cfg(target_os = "macos")]
             {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = fs::metadata(&exe.abs_path) {
-                    let mode = meta.permissions().mode();
-                    if mode & 0o111 == 0 {
-                        let _ = fs::set_permissions(
-                            &exe.abs_path,
-                            fs::Permissions::from_mode(mode | 0o755),
-                        );
-                    }
-                }
+                macos_app_command(exe, extra_args, working_dir)
             }
-            Ok(LaunchCommandSpec {
-                program: exe.abs_path.clone(),
-                args: extra_args.to_vec(),
-                env: Vec::new(),
-                working_dir,
-                runtime_label: "native".to_string(),
-            })
+            #[cfg(not(target_os = "macos"))]
+            {
+                Ok(native_command(exe, extra_args, working_dir))
+            }
         }
+        BinaryKind::MacOsMachO
+        | BinaryKind::LinuxElf
+        | BinaryKind::ShellScript
+        | BinaryKind::Unknown => Ok(native_command(exe, extra_args, working_dir)),
         BinaryKind::WindowsPe => {
             #[cfg(target_os = "windows")]
             if proton.is_none() {
-                return Ok(LaunchCommandSpec {
-                    program: exe.abs_path.clone(),
-                    args: extra_args.to_vec(),
-                    env: Vec::new(),
-                    working_dir,
-                    runtime_label: "native".to_string(),
-                });
+                return Ok(native_command(exe, extra_args, working_dir));
             }
-            let proton = proton.ok_or(ProtonError::NotInstalled)?;
-            fs::create_dir_all(prefix_dir)?;
-
-            // Prefer `umu-run` when available on PATH for clean Steam Linux Runtime sandboxing.
-            let mut env = vec![
-                (
-                    "STEAM_COMPAT_DATA_PATH".to_string(),
-                    prefix_dir.to_string_lossy().to_string(),
-                ),
-                (
-                    "STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(),
-                    proton
-                        .root_dir
-                        .parent()
-                        .unwrap_or(&proton.root_dir)
-                        .to_string_lossy()
-                        .to_string(),
-                ),
-                (
-                    "PROTONPATH".to_string(),
-                    proton.root_dir.to_string_lossy().to_string(),
-                ),
-                ("GAMEID".to_string(), "opensync-0".to_string()),
-            ];
-
-            if let Some(umu) = find_on_path("umu-run") {
-                let mut args = vec![exe.abs_path.to_string_lossy().to_string()];
-                args.extend(extra_args.iter().cloned());
-                return Ok(LaunchCommandSpec {
-                    program: umu,
-                    args,
-                    env,
-                    working_dir,
-                    runtime_label: format!("{} (umu)", proton.name),
-                });
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            {
+                let proton = proton.ok_or(ProtonError::NotInstalled)?;
+                build_proton_pe_command(exe, prefix_dir, proton, extra_args, working_dir)
             }
-
-            let mut args = vec![
-                "run".to_string(),
-                exe.abs_path.to_string_lossy().to_string(),
-            ];
-            args.extend(extra_args.iter().cloned());
-            env.push(("STEAM_COMPAT_APP_ID".to_string(), "0".to_string()));
-            Ok(LaunchCommandSpec {
-                program: proton.proton_script.clone(),
-                args,
-                env,
-                working_dir,
-                runtime_label: proton.name.clone(),
-            })
+            #[cfg(target_os = "macos")]
+            {
+                macos_pe_command(exe, extra_args, working_dir)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            {
+                Ok(native_command(exe, extra_args, working_dir))
+            }
         }
     }
 }
@@ -691,4 +985,63 @@ where
     .map_err(|e| ProtonError::Io(std::io::Error::other(format!("proton installer panicked: {e}"))))??;
 
     Ok(installation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_macho_and_fat_magics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, magic) in [
+            ("thin32_le", [0xce, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]),
+            ("thin32_be", [0xfe, 0xed, 0xfa, 0xce, 0, 0, 0, 0]),
+            ("thin64_le", [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]),
+            ("thin64_be", [0xfe, 0xed, 0xfa, 0xcf, 0, 0, 0, 0]),
+            ("fat32", [0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 0]),
+            ("fat64", [0xbf, 0xba, 0xfe, 0xca, 0, 0, 0, 0]),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, magic).expect("write magic");
+            assert_eq!(detect_binary_kind(&path), BinaryKind::MacOsMachO, "{name}");
+        }
+    }
+
+    #[test]
+    fn discovers_app_bundle_without_duplicate_inner_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = dir.path().join("MyGame.app");
+        let macos = app.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).expect("create bundle");
+        std::fs::write(macos.join("MyGame"), [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0])
+            .expect("write launcher");
+
+        assert!(is_macos_app_bundle(&app));
+        assert_eq!(detect_binary_kind(&app), BinaryKind::MacOsAppBundle);
+        assert_eq!(macos_app_inner_binary(&app), Some(macos.join("MyGame")));
+
+        let found = discover_executables(dir.path(), "MyGame");
+        assert_eq!(found.len(), 1, "unexpected candidates: {found:?}");
+        assert_eq!(found[0].kind, BinaryKind::MacOsAppBundle);
+        assert_eq!(found[0].rel_path, "MyGame.app");
+    }
+
+    #[test]
+    fn native_macho_command_runs_the_binary_directly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("game");
+        std::fs::write(&path, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).expect("write binary");
+        let exe = DiscoveredExecutable {
+            rel_path: "game".into(),
+            abs_path: path.clone(),
+            kind: BinaryKind::MacOsMachO,
+            size: 8,
+        };
+        let spec = build_launch_command(&exe, dir.path(), None, &["--fullscreen".to_string()])
+            .expect("native command");
+        assert_eq!(spec.program, path);
+        assert_eq!(spec.args, ["--fullscreen".to_string()]);
+        assert_eq!(spec.runtime_label, "native");
+    }
 }

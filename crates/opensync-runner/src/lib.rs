@@ -9,7 +9,53 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use tokio::process::Command;
+
+/// On macOS, holds a `caffeinate` assertion for the live game process so the machine does
+/// not sleep mid-session (which would interrupt tracking and post-exit save sync). The child
+/// is bound to the game's PID with `-w`, so it exits on its own when the game closes.
+#[cfg(target_os = "macos")]
+struct SleepExclusionGuard {
+    child: Option<tokio::process::Child>,
+}
+
+#[cfg(target_os = "macos")]
+impl SleepExclusionGuard {
+    fn for_process(pid: Option<u32>) -> Self {
+        let Some(pid) = pid else {
+            return Self { child: None };
+        };
+        let child = Command::new("/usr/bin/caffeinate")
+            .args(["-i", "-d", "-s", "-w", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok();
+        Self { child }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SleepExclusionGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct SleepExclusionGuard;
+
+#[cfg(not(target_os = "macos"))]
+impl SleepExclusionGuard {
+    fn for_process(_pid: Option<u32>) -> Self {
+        Self
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -75,10 +121,12 @@ impl SessionClock {
             .to_std()
             .unwrap_or(Duration::ZERO);
 
-        // If wall time jumped much farther than monotonic time, the machine slept
-        // (on Linux CLOCK_MONOTONIC pauses during suspend while wall clock advances).
-        // Even if monotonic kept ticking (e.g. CLOCK_BOOTTIME / VM pause), cap huge single gaps
-        // beyond suspend_threshold.
+        // If wall time jumped much farther than monotonic time, the machine slept. On Linux
+        // CLOCK_MONOTONIC pauses during suspend, and on macOS `Instant` is backed by
+        // `mach_absolute_time`, which likewise pauses while the Mac sleeps — while wall time
+        // keeps advancing. The gap is therefore excluded from active screen time on both
+        // platforms. Even if monotonic kept ticking (e.g. CLOCK_BOOTTIME / VM pause), cap
+        // huge single gaps beyond suspend_threshold.
         let skew = wall_delta.abs_diff(mono_delta);
         if skew <= self.suspend_threshold && mono_delta <= self.suspend_threshold {
             self.active_duration += mono_delta;
@@ -132,7 +180,9 @@ pub fn resolve_launch_command(
 ) -> RunnerResult<LaunchCommandSpec> {
     let exe = if let Some(rel) = &game.executable_rel_path {
         let abs = game.install_dir.join(rel);
-        if abs.is_file() {
+        // `.app` bundles are directories, so accept files or valid `.app` bundles only
+        // (ignoring empty strings or plain subdirectories so auto-discovery still works).
+        if abs.is_file() || opensync_proton::is_macos_app_bundle(&abs) {
             let kind = opensync_proton::detect_binary_kind(&abs);
             let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
             opensync_proton::DiscoveredExecutable {
@@ -200,6 +250,9 @@ where
     let mut clock = SessionClock::start(started_at);
     let mut child = cmd.spawn()?;
     let pid = child.id();
+    // Prevent macOS idle/system/display sleep for the lifetime of this process. A `.app`
+    // launched via `open -W` is represented by the `open` child, which exits with the app.
+    let _sleep_guard = SleepExclusionGuard::for_process(pid);
 
     let _ = db.upsert_active_session(&ActiveSessionRecord {
         profile_id: game.profile_id.clone(),
