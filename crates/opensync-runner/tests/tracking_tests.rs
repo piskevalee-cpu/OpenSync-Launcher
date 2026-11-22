@@ -161,17 +161,37 @@ fn proton_auto_detection_binary_classification_and_ge_installer() {
     assert_eq!(detected[1].name, "GE-Proton9-20");
     assert_eq!(detected[2].name, "Proton 9.0");
 
-    // 3. Launching Windows PE without Proton returns ProtonError::NotInstalled
+    // 3. Launching Windows PE without a compatibility runtime.
     let prefix = dir.path().join("prefixes/1");
-    let err = build_launch_command(&exes[0], &prefix, None, &[]).unwrap_err();
-    assert!(matches!(err, ProtonError::NotInstalled));
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux/Windows require Proton for a Windows PE binary.
+        let err = build_launch_command(&exes[0], &prefix, None, &[]).unwrap_err();
+        assert!(matches!(err, ProtonError::NotInstalled));
 
-    // With Proton detected, builds isolated STEAM_COMPAT_DATA_PATH launch command
-    let cmd = build_launch_command(&exes[0], &prefix, Some(&detected[0]), &["--windowed".into()])
-        .unwrap();
-    assert!(cmd.env.iter().any(|(k, v)| k == "STEAM_COMPAT_DATA_PATH" && v.contains("prefixes")));
-    assert!(cmd.args.iter().any(|a| a.ends_with("CyberRunner.exe")));
-    assert!(cmd.args.contains(&"--windowed".to_string()));
+        // With Proton detected, builds isolated STEAM_COMPAT_DATA_PATH launch command
+        let cmd =
+            build_launch_command(&exes[0], &prefix, Some(&detected[0]), &["--windowed".into()])
+                .unwrap();
+        assert!(cmd.env.iter().any(|(k, v)| k == "STEAM_COMPAT_DATA_PATH" && v.contains("prefixes")));
+        assert!(cmd.args.iter().any(|a| a.ends_with("CyberRunner.exe")));
+        assert!(cmd.args.contains(&"--windowed".to_string()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS never executes a Linux Proton script. It either uses a configured
+        // Wine/Whisky/CrossOver runner or cleanly falls back to native execution.
+        let cmd = build_launch_command(&exes[0], &prefix, None, &[]).unwrap();
+        assert!(cmd.program.is_absolute());
+        let cmd =
+            build_launch_command(&exes[0], &prefix, Some(&detected[0]), &["--windowed".into()])
+                .unwrap();
+        assert!(
+            cmd.program.ends_with("CyberRunner.exe")
+                || cmd.args.iter().any(|a| a.ends_with("CyberRunner.exe"))
+        );
+        assert!(cmd.args.contains(&"--windowed".to_string()));
+    }
 
     // 4. GE-Proton tarball SHA-512 verification & extraction
     let tarball_path = dir.path().join("GE-Proton9-99.tar.gz");
