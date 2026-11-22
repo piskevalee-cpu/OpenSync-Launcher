@@ -42,6 +42,7 @@
     "macOS": {
       "bundleName": "OpenSync Launcher",
       "bundleVersion": "0.3.0",
+      "signingIdentity": "-",
       "minimumSystemVersion": "10.15",
       "dmg": {
         "windowSize": {

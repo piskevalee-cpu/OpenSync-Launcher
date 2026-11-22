@@ -317,7 +317,7 @@ jobs:
 
       - name: Build Apple Silicon (aarch64) .app and .dmg
         working-directory: crates/launcher-tauri
-        run: cargo tauri build --target aarch64-apple-darwin --bundles app,dmg --no-sign
+        run: cargo tauri build --target aarch64-apple-darwin --bundles app,dmg
 
       - name: Stage Apple Silicon artifacts
         run: |
@@ -338,7 +338,7 @@ jobs:
 
       - name: Build Intel (x86_64) .app and .dmg
         working-directory: crates/launcher-tauri
-        run: cargo tauri build --target x86_64-apple-darwin --bundles app,dmg --no-sign
+        run: cargo tauri build --target x86_64-apple-darwin --bundles app,dmg
 
       - name: Stage Intel artifacts
         run: |
