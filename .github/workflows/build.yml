@@ -20,6 +20,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Verify launcher version parity (and tag match)
+        run: |
+          set -euo pipefail
+          VER=$(tr -d '[:space:]' < VERSION)
+          TAURI_VER=$(python3 -c 'import json; print(json.load(open("crates/launcher-tauri/tauri.conf.json"))["version"])')
+          CARGO_VER=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          test -n "$VER"
+          test "$VER" = "$TAURI_VER" || { echo "tauri.conf.json ($TAURI_VER) != VERSION ($VER)"; exit 1; }
+          test "$VER" = "$CARGO_VER" || { echo "Cargo.toml ($CARGO_VER) != VERSION ($VER)"; exit 1; }
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_VER="${GITHUB_REF#refs/tags/v}"
+            test "$TAG_VER" = "$VER" || { echo "Tag v${TAG_VER} != VERSION ($VER)"; exit 1; }
+          fi
+
       - name: Install Linux GTK & WebKitGTK dependencies
         run: |
           sudo apt-get update
@@ -206,6 +220,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Verify launcher version parity (and tag match)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = (Get-Content "VERSION" -Raw).Trim()
+          $tauriVer = (Get-Content "crates/launcher-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
+          $cargoToml = Get-Content "Cargo.toml" -Raw
+          if ($cargoToml -notmatch '\[workspace\.package\][\s\S]*?version\s*=\s*"([^"]+)"') { throw "Missing workspace version in Cargo.toml" }
+          $cargoVer = $Matches[1]
+          if (-not $ver) { throw "VERSION is empty" }
+          if ($ver -ne $tauriVer) { throw "tauri.conf.json ($tauriVer) != VERSION ($ver)" }
+          if ($ver -ne $cargoVer) { throw "Cargo.toml ($cargoVer) != VERSION ($ver)" }
+          if ($env:GITHUB_REF -like "refs/tags/v*") {
+            $tagVer = $env:GITHUB_REF -replace '^refs/tags/v', ''
+            if ($tagVer -ne $ver) { throw "Tag v$tagVer != VERSION ($ver)" }
+          }
 
       - name: Install Rust stable toolchain (x86_64-pc-windows-msvc)
         uses: dtolnay/rust-toolchain@stable
