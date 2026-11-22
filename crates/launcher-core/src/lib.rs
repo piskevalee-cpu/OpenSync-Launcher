@@ -14,7 +14,7 @@ use opensync_runner::{
 use opensync_sync::{SyncError, SyncReport, inspect_unsynced_saves, sync_game_saves};
 use opensync_transfer::{
     DownloadControl, DownloadOutcome, SpeedSample, TransferError, UploadControl, UploadOutcome,
-    download_and_extract_game, safe_rel_path, upload_folder,
+    download_and_extract_game, manifest_fingerprint, safe_rel_path, upload_folder,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1086,9 +1086,9 @@ impl LauncherCore {
         let verify_clean = fresh || !detail.overlay.has_overlay;
 
         let install_dir = self
-            .games_dir()
-            .join(&profile.id)
-            .join(&detail.game.slug);
+            .db
+            .get_remembered_install_dir(&profile.id, game_id)?
+            .unwrap_or_else(|| self.games_dir().join(&profile.id).join(&detail.game.slug));
 
         let outcome = download_and_extract_game(
             &client,
@@ -1129,9 +1129,9 @@ impl LauncherCore {
         let initial_total = detail.game.total_size;
 
         let install_dir = self
-            .games_dir()
-            .join(&profile.id)
-            .join(&game_slug);
+            .db
+            .get_remembered_install_dir(&profile.id, game_id)?
+            .unwrap_or_else(|| self.games_dir().join(&profile.id).join(&game_slug));
 
         let job_id = Uuid::new_v4().to_string();
         let seq = self.next_job_seq.fetch_add(1, Ordering::Relaxed);
@@ -1623,7 +1623,7 @@ impl LauncherCore {
         folder: Option<&str>,
         cover: Option<(Vec<u8>, String)>,
     ) -> CoreResult<String> {
-        let (_, client) = self.active_profile_and_client().await?;
+        let (profile, client) = self.active_profile_and_client().await?;
         let game = client
             .create_game(name, description, system_requirements)
             .await?;
@@ -1677,6 +1677,7 @@ impl LauncherCore {
             self.spawn_upload_pipeline(
                 job_id.clone(),
                 game.id,
+                profile.id,
                 client,
                 PathBuf::from(folder),
                 None,
@@ -1777,10 +1778,17 @@ impl LauncherCore {
                 .ok_or_else(|| CoreError::UploadNotFound(job_id.to_string()))?;
             (root, game_id)
         };
-        let client = self.active_client().await?;
+        let (profile, client) = self.active_profile_and_client().await?;
         // Chunks are staged under `<job>/files/`; the uploader must walk that directory so
         // relative paths do not pick up a spurious `files/` prefix.
-        self.spawn_upload_pipeline(job_id.to_string(), game_id, client, root.join("files"), Some(root));
+        self.spawn_upload_pipeline(
+            job_id.to_string(),
+            game_id,
+            profile.id,
+            client,
+            root.join("files"),
+            Some(root),
+        );
         Ok(())
     }
 
@@ -1789,11 +1797,13 @@ impl LauncherCore {
         self: &Arc<Self>,
         job_id: String,
         game_id: i64,
+        profile_id: String,
         client: OpenSyncClient,
         root: PathBuf,
         cleanup_root: Option<PathBuf>,
     ) {
         let core = Arc::clone(self);
+        let staged_source = cleanup_root.is_some();
         let Some(control) = self
             .uploads
             .read()
@@ -1885,7 +1895,16 @@ impl LauncherCore {
                         }
                     });
                     if let Err(err) = core
-                        .finish_upload_indexing(&job_id, &client, game_id, &outcome, &control)
+                        .finish_upload_indexing(
+                            &job_id,
+                            &client,
+                            game_id,
+                            &profile_id,
+                            &root,
+                            staged_source,
+                            &outcome,
+                            &control,
+                        )
                         .await
                     {
                         if matches!(err, CoreError::Transfer(TransferError::Cancelled))
@@ -1926,11 +1945,15 @@ impl LauncherCore {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish_upload_indexing(
         &self,
         job_id: &str,
         client: &OpenSyncClient,
         game_id: i64,
+        profile_id: &str,
+        source_root: &Path,
+        staged_source: bool,
         outcome: &UploadOutcome,
         control: &UploadControl,
     ) -> CoreResult<()> {
@@ -1963,6 +1986,55 @@ impl LauncherCore {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+
+        // The game is now indexed on the server. Bring the local files into the launcher's
+        // games directory and register the install so it is immediately playable.
+        let detail = client.get_game(game_id).await?;
+        let target_dir = self.games_dir().join(profile_id).join(&detail.game.slug);
+        if let Err(err) = move_game_into_install_dir(source_root, &target_dir, staged_source) {
+            // A failed move must never delete the original (non-staged) user folder; the
+            // install record still points at the target so the user can retry later.
+            let _ = self.record_activity(
+                profile_id,
+                Some(game_id),
+                Some(&detail.game.name),
+                "sync_error",
+                "danger",
+                "Could not move uploaded game files into the games directory",
+                &err.to_string(),
+            );
+        }
+
+        let manifest = client.get_manifest(game_id).await?;
+        let download_outcome = DownloadOutcome {
+            install_dir: target_dir.clone(),
+            files: Vec::new(),
+            total_bytes: outcome.total_bytes,
+            elapsed: Duration::ZERO,
+            avg_bytes_per_sec: 0.0,
+            manifest_hash: manifest_fingerprint(&manifest),
+        };
+        let installed = self.record_installed_game(
+            profile_id,
+            game_id,
+            &detail.game.name,
+            &detail.game.slug,
+            &target_dir,
+            &download_outcome,
+            false,
+        )?;
+        let _ = self.record_activity(
+            profile_id,
+            Some(game_id),
+            Some(&installed.name),
+            "game_install",
+            "accent",
+            &format!("Installed {}", installed.name),
+            &format!(
+                "Uploaded game files are available in {}",
+                target_dir.display()
+            ),
+        );
 
         let samples = control.snapshot().speed_samples;
         self.update_upload_snapshot(job_id, |snap| {
@@ -2122,8 +2194,10 @@ impl LauncherCore {
         }
     }
 
-    /// Uninstalls a downloaded game for the active profile by removing its install directory
-    /// from disk and deleting its database record.
+    /// Uninstalls a downloaded game for the active profile. Before touching local files the
+    /// install directory is remembered (so a later download can restore the exact same path)
+    /// and, when the server is reachable, a final differential save sync pushes local edits to
+    /// the cloud. Offline or non-network sync errors are logged but never block the uninstall.
     pub async fn uninstall_game(&self, game_id: i64) -> CoreResult<()> {
         let profile = self
             .active_profile()
@@ -2134,6 +2208,82 @@ impl LauncherCore {
             .get_installed_game(&profile.id, game_id)?
             .ok_or(CoreError::GameNotInstalled(game_id))?;
 
+        // Remember the directory first so a redownload can restore it with its cloud saves.
+        self.db
+            .set_remembered_install_dir(&profile.id, game_id, &installed.install_dir)?;
+
+        if installed.install_dir.is_dir()
+            && self.connection_state().await == ConnectionState::Connected
+        {
+            if let Ok(client) = self.active_client().await {
+                let _sync_guard = self.begin_sync_activity();
+                self.emit(LauncherEvent::GameSyncStarted {
+                    game_id,
+                    name: installed.name.clone(),
+                    trigger: "uninstall".to_string(),
+                });
+                match sync_game_saves(&client, game_id, &installed.install_dir, false).await {
+                    Ok(report) => {
+                        let detail = format_sync_report_detail(&report);
+                        let _ = self.record_activity(
+                            &profile.id,
+                            Some(game_id),
+                            Some(&installed.name),
+                            "sync_complete",
+                            "accent",
+                            &format!("Synced saves before uninstalling {}", installed.name),
+                            &detail,
+                        );
+                        self.emit(LauncherEvent::GameSyncCompleted {
+                            game_id,
+                            name: installed.name.clone(),
+                            trigger: "uninstall".to_string(),
+                            uploaded_files: report.uploaded_files,
+                            uploaded_bytes: report.uploaded_bytes,
+                            deleted_paths: report.deleted_paths,
+                        });
+                    }
+                    // The server went away mid-sync (or another network failure occurred):
+                    // proceed with the uninstall, leaving the changes for a later sync.
+                    Err(SyncError::Api(ApiError::Network(_))) => {
+                        let _ = self.record_activity(
+                            &profile.id,
+                            Some(game_id),
+                            Some(&installed.name),
+                            "sync_offline",
+                            "warn",
+                            &format!("Save sync skipped while uninstalling {}", installed.name),
+                            "Server unreachable; local save changes were not uploaded",
+                        );
+                    }
+                    Err(err) => {
+                        // Mass-deletion guard, hash mismatch, etc. — never abort the uninstall.
+                        let _ = self.record_activity(
+                            &profile.id,
+                            Some(game_id),
+                            Some(&installed.name),
+                            "sync_error",
+                            "danger",
+                            &format!("Save sync failed while uninstalling {}", installed.name),
+                            &err.to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let _ = self.record_activity(
+            &profile.id,
+            Some(game_id),
+            Some(&installed.name),
+            "game_uninstall",
+            "info",
+            &format!("Uninstalled {}", installed.name),
+            &format!(
+                "Removed {}; install directory remembered for redownload",
+                installed.install_dir.display()
+            ),
+        );
         if installed.install_dir.exists() {
             let dir = installed.install_dir.clone();
             tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir))
@@ -3081,6 +3231,67 @@ impl LauncherCore {
         let guard = self.active.read().await;
         let active = guard.as_ref().ok_or(CoreError::NoActiveProfile)?;
         Ok((active.profile.clone(), active.client.clone()))
+    }
+}
+
+/// Moves uploaded game files into the launcher's games directory. `std::fs::rename` is used as
+/// the fast path (whole directory when the destination is absent, otherwise per entry); files
+/// that cannot be renamed because they live on another filesystem are copied and the source is
+/// removed only after the copy has been verified. `_staged` sources additionally have their
+/// parent staging root cleaned up by the upload pipeline once this returns.
+fn move_game_into_install_dir(source: &Path, target: &Path, _staged: bool) -> io::Result<()> {
+    move_tree(source, target)
+}
+
+fn move_tree(source: &Path, target: &Path) -> io::Result<()> {
+    if source == target || !source.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if source.is_dir() {
+        // Fast path: renaming a whole directory is a constant-time operation on one FS.
+        if !target.exists() && std::fs::rename(source, target).is_ok() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(target)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let src = entry.path();
+            let dst = target.join(entry.file_name());
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                move_tree(&src, &dst)?;
+            } else if kind.is_file() || kind.is_symlink() {
+                if dst.exists() || dst.is_symlink() {
+                    std::fs::remove_file(&dst)?;
+                }
+                move_file(&src, &dst)?;
+            }
+        }
+        // Verified removal: the source directory is only deleted after every entry moved.
+        std::fs::remove_dir(source)?;
+    } else {
+        move_file(source, target)?;
+    }
+    Ok(())
+}
+
+fn move_file(source: &Path, target: &Path) -> io::Result<()> {
+    match std::fs::rename(source, target) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Cross-filesystem fallback: copy, verify byte count, then remove the source.
+            std::fs::copy(source, target)?;
+            if std::fs::metadata(source)?.len() != std::fs::metadata(target)?.len() {
+                return Err(io::Error::other(format!(
+                    "verified copy failed for {}",
+                    source.display()
+                )));
+            }
+            std::fs::remove_file(source)
+        }
     }
 }
 

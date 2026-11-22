@@ -606,3 +606,144 @@ async fn uninstall_overrides_pending_syncs_events_and_delete_profile_cleanup() {
         Err(CoreError::ProfileNotFound(_))
     ));
 }
+
+#[tokio::test]
+async fn uninstall_syncs_saves_and_redownload_uses_remembered_install_dir() {
+    let dir = tempdir().unwrap();
+    let db = LauncherDb::open_in_memory().unwrap();
+    let core = Arc::new(LauncherCore::new(
+        db,
+        MemorySecretStore::new(),
+        LauncherPaths::under(dir.path()),
+    ));
+
+    let srv = MockOpenSyncServer::start().await;
+    srv.add_user(1, "valerio", "secret123");
+    srv.add_game(
+        7,
+        "Save Game",
+        "save-game",
+        vec![
+            ("game.sh", b"#!/bin/sh\necho game\n".to_vec()),
+            ("saves/slot1.dat", b"original save\n".to_vec()),
+        ],
+    );
+
+    let profile = core
+        .connect_with_password("LAN", &srv.base_url, "valerio", "secret123")
+        .await
+        .unwrap();
+    let (installed, _) = core
+        .download_game(7, true, opensync_transfer::DownloadControl::new(0, 0))
+        .await
+        .unwrap();
+    let original_install_dir = installed.install_dir.clone();
+    assert!(original_install_dir.is_dir());
+    assert_eq!(srv.sync_count(), 0);
+
+    // Edit an existing save and add a brand-new one locally.
+    fs::write(
+        original_install_dir.join("saves/slot1.dat"),
+        b"modified save data\n",
+    )
+    .unwrap();
+    fs::write(
+        original_install_dir.join("saves/slot2.dat"),
+        b"second save\n",
+    )
+    .unwrap();
+
+    // Uninstall while online: local edits must reach the cloud before files are removed.
+    let mut events = core.subscribe_events();
+    core.uninstall_game(7).await.unwrap();
+    assert!(!original_install_dir.exists());
+    assert!(core
+        .db()
+        .get_installed_game(&profile.id, 7)
+        .unwrap()
+        .is_none());
+
+    let overlay = srv.overlay_files(1, 7);
+    assert_eq!(
+        overlay.get("saves/slot1.dat").map(Vec::as_slice),
+        Some(&b"modified save data\n"[..])
+    );
+    assert_eq!(
+        overlay.get("saves/slot2.dat").map(Vec::as_slice),
+        Some(&b"second save\n"[..])
+    );
+    assert_eq!(srv.sync_count(), 1, "uninstall committed one cloud sync");
+
+    let remembered = core
+        .db()
+        .get_remembered_install_dir(&profile.id, 7)
+        .unwrap()
+        .expect("uninstall must remember the install dir");
+    assert_eq!(remembered, original_install_dir);
+
+    let mut saw_uninstall_sync = false;
+    while let Ok(ev) = events.try_recv() {
+        if matches!(
+            ev,
+            LauncherEvent::GameSyncCompleted { ref trigger, .. } if trigger == "uninstall"
+        ) {
+            saw_uninstall_sync = true;
+        }
+    }
+    assert!(saw_uninstall_sync, "expected uninstall SaveSync event");
+
+    let logs = core.list_activity_logs(50).await.unwrap();
+    assert!(
+        logs.iter()
+            .any(|e| e.title.contains("Synced saves before uninstalling")),
+        "uninstall must log the pre-removal save sync"
+    );
+    assert!(
+        logs.iter().any(|e| e.title.contains("Uninstalled")),
+        "uninstall must log an activity entry"
+    );
+
+    // Direct redownload restores the exact same directory with cloud saves intact.
+    let (redownloaded, _) = core
+        .download_game(7, false, opensync_transfer::DownloadControl::new(0, 0))
+        .await
+        .unwrap();
+    assert_eq!(redownloaded.install_dir, original_install_dir);
+    assert_eq!(
+        fs::read(redownloaded.install_dir.join("saves/slot1.dat")).unwrap(),
+        b"modified save data\n"
+    );
+    assert_eq!(
+        fs::read(redownloaded.install_dir.join("saves/slot2.dat")).unwrap(),
+        b"second save\n"
+    );
+
+    // Uninstall once more, then redownload through the managed Download Manager: it must also
+    // extract into the remembered directory rather than rebuilding "<games>/<profile>/<slug>".
+    core.uninstall_game(7).await.unwrap();
+    assert_eq!(
+        core.db()
+            .get_remembered_install_dir(&profile.id, 7)
+            .unwrap(),
+        Some(original_install_dir.clone())
+    );
+
+    let mut events = core.subscribe_events();
+    let job_id = core.start_game_download(7, false).await.unwrap();
+    let completed = wait_for_download_status(&mut events, &job_id, |s| {
+        matches!(s, DownloadStatus::Completed)
+    })
+    .await;
+    assert_eq!(completed.status, DownloadStatus::Completed);
+    let managed = core
+        .db()
+        .get_installed_game(&profile.id, 7)
+        .unwrap()
+        .expect("managed redownload must install the game");
+    assert_eq!(managed.install_dir, original_install_dir);
+    assert_eq!(
+        fs::read(managed.install_dir.join("saves/slot1.dat")).unwrap(),
+        b"modified save data\n"
+    );
+    assert!(managed.install_dir.join("saves/slot2.dat").is_file());
+}

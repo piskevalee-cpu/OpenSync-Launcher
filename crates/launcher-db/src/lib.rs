@@ -271,6 +271,13 @@ impl LauncherDb {
                 PRIMARY KEY (profile_id, game_id)
             );
 
+            CREATE TABLE IF NOT EXISTS remembered_install_dirs (
+                profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+                game_id INTEGER NOT NULL,
+                install_dir TEXT NOT NULL,
+                PRIMARY KEY (profile_id, game_id)
+            );
+
             CREATE TABLE IF NOT EXISTS play_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -450,6 +457,11 @@ impl LauncherDb {
 
     pub fn delete_profile(&self, id: &str) -> DbResult<()> {
         let conn = self.conn.lock().unwrap();
+        // Explicit cleanup keeps the table tidy even when foreign keys are disabled.
+        conn.execute(
+            "DELETE FROM remembered_install_dirs WHERE profile_id = ?1",
+            params![id],
+        )?;
         conn.execute("DELETE FROM profiles WHERE id = ?1", params![id])?;
         conn.execute(
             "DELETE FROM app_state WHERE key = 'active_profile_id' AND value = ?1",
@@ -622,6 +634,55 @@ impl LauncherDb {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM installed_games WHERE profile_id = ?1 AND game_id = ?2",
+            params![profile_id, game_id],
+        )?;
+        Ok(())
+    }
+
+    /// Persists the directory a game was installed into so a later redownload can restore
+    /// the exact same path (and its cloud saves) instead of rebuilding from the game slug.
+    pub fn set_remembered_install_dir(
+        &self,
+        profile_id: &str,
+        game_id: i64,
+        install_dir: &Path,
+    ) -> DbResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO remembered_install_dirs (profile_id, game_id, install_dir)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(profile_id, game_id) DO UPDATE SET install_dir = excluded.install_dir
+            "#,
+            params![
+                profile_id,
+                game_id,
+                install_dir.to_string_lossy().to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_remembered_install_dir(
+        &self,
+        profile_id: &str,
+        game_id: i64,
+    ) -> DbResult<Option<PathBuf>> {
+        let conn = self.conn.lock().unwrap();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT install_dir FROM remembered_install_dirs WHERE profile_id = ?1 AND game_id = ?2",
+                params![profile_id, game_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.map(PathBuf::from))
+    }
+
+    pub fn clear_remembered_install_dir(&self, profile_id: &str, game_id: i64) -> DbResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM remembered_install_dirs WHERE profile_id = ?1 AND game_id = ?2",
             params![profile_id, game_id],
         )?;
         Ok(())

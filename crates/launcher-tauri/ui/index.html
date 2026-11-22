@@ -5,22 +5,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenSync Launcher</title>
   <link rel="icon" type="image/png" href="img/favicon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="css/launcher.css" />
 </head>
 <body>
   <div class="shell" id="app-shell">
     <header class="topbar" id="topbar">
       <a href="#library" class="logo" id="brand-logo" title="OpenSync Library" aria-label="OpenSync Library">
-        <img src="img/opensync-nav-2x.png" srcset="img/opensync-nav-1x.png 1x, img/opensync-nav-2x.png 2x, img/opensync-nav-3x.png 3x" height="34" alt="OpenSync" />
+        <img src="img/opensync-nav-2x.png" srcset="img/opensync-nav-1x.png 1x, img/opensync-nav-2x.png 2x, img/opensync-nav-3x.png 3x" height="30" alt="OpenSync" />
       </a>
 
       <nav class="nav" id="main-nav" aria-label="Primary navigation">
-        <a href="#library" class="nav-link active" data-view="library">library</a>
+        <a href="#library" class="nav-link active" data-view="library">Library</a>
         <a href="#downloads" class="nav-link nav-link-dl" data-view="downloads">
-          <span>downloads</span>
+          <span>Downloads</span>
           <span class="nav-dl-pill" id="nav-dl-pill" hidden></span>
         </a>
-        <a href="#settings" class="nav-link" data-view="settings">settings</a>
+        <a href="#settings" class="nav-link" data-view="settings">Settings</a>
       </nav>
 
       <div class="topbar-user" id="topbar-user">

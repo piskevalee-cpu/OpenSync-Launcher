@@ -297,6 +297,10 @@ const state = {
 const activeWaveforms = new Map(); // job_id -> WaveformCanvas
 const activeUploadWaveforms = new Map(); // job_id -> WaveformCanvas
 
+// Teardown handle for the first-run auth particle field. It is only alive while
+// the auth screen is mounted and is always disposed when leaving it.
+let stopAuthParticleField = null;
+
 // ---------- Scroll performance ----------
 // Mark the body while the user is actively scrolling so paused cards skip the
 // expensive 3D-tilt/backdrop repaints. No layout reads in the hot path.
@@ -925,6 +929,10 @@ function activityIconName(kind) {
       return 'play';
     case 'game_close':
       return 'clock';
+    case 'game_install':
+      return 'hard-drive';
+    case 'game_uninstall':
+      return 'trash-2';
     case 'sync_complete':
       return 'check';
     case 'sync_offline':
@@ -1114,7 +1122,7 @@ function renderStatusStrip() {
         <div class="activity-drawer-header">
           <span class="activity-drawer-title">
             ${isSyncing ? `<span class="spin-icon">${icon('refresh-cw', 14)}</span>` : icon('clock', 14)}
-            <span>Sync &amp; Launch Log</span>
+            <span>Sync and launch log</span>
           </span>
           <div class="activity-drawer-actions">
             ${logCount > 0 ? `<button type="button" class="btn btn-ghost btn-sm" id="btn-clear-activity-log" style="padding:3px 8px;font-size:11.5px;">Clear</button>` : ''}
@@ -1128,7 +1136,7 @@ function renderStatusStrip() {
         <div class="activity-drawer-footer">
           <span class="small faint">${state.playingGameIds.size > 0 ? `${state.playingGameIds.size} game running · auto-sync on exit` : 'Auto-syncs saves on game close'}</span>
           <button type="button" class="btn btn-sm" id="btn-drawer-safe-shutdown" style="padding:4px 10px;font-size:11.5px;">
-            ${icon('shield-check', 13)}<span>Safe Quit</span>
+            ${icon('shield-check', 13)}<span>Safe quit</span>
           </button>
         </div>
       </div>
@@ -1247,6 +1255,7 @@ function destroyUploadWaveforms() {
 
 function navigate(nextView, opts = {}) {
   closeCssSelect();
+  teardownAuthParticles();
   destroyWaveforms();
   if (nextView !== 'upload') destroyUploadWaveforms();
   state.view = nextView;
@@ -1258,6 +1267,11 @@ function navigate(nextView, opts = {}) {
 }
 
 function renderCurrentView(animate = false) {
+  // The orbital field belongs to the auth screen only; drop it the moment any
+  // other view (including the connected library) is rendered.
+  if (state.view !== 'library' || state.activeProfile) {
+    teardownAuthParticles();
+  }
   if (state.view !== 'downloads') {
     destroyWaveforms();
   }
@@ -1295,6 +1309,196 @@ function renderCurrentView(animate = false) {
   gamepadCtrl?.onViewRendered();
 }
 
+// ---------- First-Run Auth: green orbital particle field ----------
+// Adapted from the web UI's AG-DESIGN auth canvas, constrained to a single
+// green hue. Short, round-capped dashes drift on a trig phase and point away
+// from the viewport centre (or the live pointer). The animation pauses while
+// the page is hidden, is skipped entirely under prefers-reduced-motion, and
+// tears down its observers, listeners, rAF loop and canvas when the auth
+// screen is replaced by any other view.
+
+const AUTH_CANVAS_STYLE = 'position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:0;display:block;';
+const AUTH_SCREEN_STYLE = 'position:relative;z-index:1;min-height:calc(100vh - 150px);';
+
+function teardownAuthParticles() {
+  if (!stopAuthParticleField) return;
+  const stop = stopAuthParticleField;
+  stopAuthParticleField = null;
+  stop();
+}
+
+function attachAuthParticleField(canvas, host) {
+  const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)');
+  const ctx = canvas.getContext?.('2d');
+  if (!ctx) return () => canvas.remove();
+
+  // Every stroke is a green shade — no blue or neutral particles.
+  const GREENS = [
+    'rgba(125, 250, 155, 0.85)',
+    'rgba(125, 250, 155, 0.55)',
+    'rgba(74, 222, 128, 0.45)',
+    'rgba(187, 247, 208, 0.32)',
+  ];
+  const pointer = { x: -1, y: -1 };
+  let width = 0;
+  let height = 0;
+  let particles = [];
+  let rafId = 0;
+  let running = false;
+  let cleaned = false;
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // Fixed canvas uses viewport metrics: #view may briefly be transformed by
+    // the view-switch animation, which would otherwise become its containing block.
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = Math.floor(width * dpr);
+    canvas.height = Math.floor(height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const count = Math.max(26, Math.min(90, Math.round((width * height) / 18000)));
+    particles = Array.from({ length: count }, (_, i) => ({
+      x: Math.random() * width,
+      y: Math.random() * height,
+      phase: Math.random() * Math.PI * 2,
+      speed: 0.15 + Math.random() * 0.35,
+      amp: 6 + Math.random() * 14,
+      len: 3 + Math.random() * 5,
+      color: GREENS[i % GREENS.length],
+    }));
+    if (!running) draw(0);
+  }
+
+  function draw(time) {
+    ctx.clearRect(0, 0, width, height);
+    const originX = pointer.x >= 0 ? pointer.x : width / 2;
+    const originY = pointer.y >= 0 ? pointer.y : height / 2;
+    ctx.lineWidth = 1.6;
+    ctx.lineCap = 'round';
+    for (const p of particles) {
+      const angle = Math.atan2(p.y - originY, p.x - originX);
+      let px = p.x + Math.cos(time * 0.0004 * p.speed + p.phase) * p.amp;
+      let py = p.y + Math.sin(time * 0.00035 * p.speed + p.phase) * p.amp;
+      if (pointer.x >= 0) {
+        const rx = px - pointer.x;
+        const ry = py - pointer.y;
+        const dist = Math.hypot(rx, ry);
+        if (dist < 140 && dist > 0) {
+          const push = ((140 - dist) / 140) * 26;
+          px += (rx / dist) * push;
+          py += (ry / dist) * push;
+        }
+      }
+      const dx = Math.cos(angle) * p.len * 0.5;
+      const dy = Math.sin(angle) * p.len * 0.5;
+      ctx.strokeStyle = p.color;
+      ctx.beginPath();
+      ctx.moveTo(px - dx, py - dy);
+      ctx.lineTo(px + dx, py + dy);
+      ctx.stroke();
+    }
+  }
+
+  function tick(time) {
+    draw(time);
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function start() {
+    if (running || cleaned) return;
+    running = true;
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function stop() {
+    running = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = 0;
+  }
+
+  function onVisibility() {
+    if (document.hidden) stop();
+    else if (!reduce?.matches) start();
+  }
+
+  function onMotionChange() {
+    if (reduce?.matches) {
+      stop();
+      draw(0);
+    } else if (!document.hidden) {
+      start();
+    }
+  }
+
+  function onPointerMove(e) {
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+  }
+
+  function onPointerLeave() {
+    pointer.x = -1;
+    pointer.y = -1;
+  }
+
+  // Safety net: if the host is ever detached without an explicit teardown,
+  // clean everything up on the next DOM mutation.
+  const observer = typeof MutationObserver !== 'undefined'
+    ? new MutationObserver(() => {
+        if (!host.isConnected) cleanup();
+      })
+    : null;
+  observer?.observe(document.body, { childList: true, subtree: true });
+
+  function cleanup() {
+    if (cleaned) return;
+    cleaned = true;
+    stop();
+    observer?.disconnect();
+    document.removeEventListener('visibilitychange', onVisibility);
+    document.removeEventListener('pointerleave', onPointerLeave);
+    window.removeEventListener('resize', resize);
+    window.removeEventListener('pointermove', onPointerMove);
+    window.removeEventListener('blur', onPointerLeave);
+    if (reduce?.removeEventListener) reduce.removeEventListener('change', onMotionChange);
+    canvas.remove();
+  }
+
+  window.addEventListener('resize', resize);
+  window.addEventListener('pointermove', onPointerMove, { passive: true });
+  window.addEventListener('blur', onPointerLeave);
+  document.addEventListener('visibilitychange', onVisibility);
+  document.addEventListener('pointerleave', onPointerLeave);
+  if (reduce?.addEventListener) reduce.addEventListener('change', onMotionChange);
+
+  resize();
+  if (reduce?.matches) draw(0);
+  else start();
+
+  return cleanup;
+}
+
+function mountAuthParticleField(screen) {
+  if (!screen) return () => {};
+  const canvas = document.createElement('canvas');
+  canvas.className = 'auth-particles';
+  canvas.setAttribute('aria-hidden', 'true');
+  canvas.style.cssText = AUTH_CANVAS_STYLE;
+  screen.insertBefore(canvas, screen.firstChild);
+  const card = screen.querySelector('.auth-wrap');
+  if (card) {
+    card.style.position = 'relative';
+    card.style.zIndex = '1';
+  }
+  const cleanup = attachAuthParticleField(canvas, screen);
+  return () => {
+    cleanup();
+    if (card) {
+      card.style.removeProperty('position');
+      card.style.removeProperty('z-index');
+    }
+  };
+}
+
 // ---------- View 1: Game Library ----------
 
 function findActiveDownloadForGame(gameId) {
@@ -1315,7 +1519,7 @@ function ensureLibraryShell() {
   root.dataset.profileId = profileId;
   root.innerHTML = `
     <div class="lib-header">
-      <h1 class="page-title">game library</h1>
+      <h1 class="page-title">Game library</h1>
       <div class="lib-header-controls">
         <div class="search-wrap">
           <span class="search-icon">${icon('search', 15)}</span>
@@ -1390,13 +1594,17 @@ function renderLibraryView() {
   if (!state.activeProfile) {
     libViewShell = null;
     cardDomCache.clear();
+    teardownAuthParticles();
     viewEl.innerHTML = `
-      <div class="auth-wrap panel">
-        <img class="auth-logo" src="img/opensync-auth-2x.png" srcset="img/opensync-auth-1x.png 1x, img/opensync-auth-2x.png 2x, img/opensync-auth-3x.png 3x" width="146" alt="OpenSync" />
-        <p class="auth-tagline">LAN game archive and save sync</p>
-        <div id="first-run-connect-host"></div>
+      <div class="auth-screen" id="view-auth" style="${AUTH_SCREEN_STYLE}">
+        <div class="auth-wrap panel">
+          <img class="auth-logo" src="img/opensync-auth-2x.png" srcset="img/opensync-auth-1x.png 1x, img/opensync-auth-2x.png 2x, img/opensync-auth-3x.png 3x" width="146" alt="OpenSync" />
+          <p class="auth-tagline">LAN game archive and save sync</p>
+          <div id="first-run-connect-host"></div>
+        </div>
       </div>
     `;
+    stopAuthParticleField = mountAuthParticleField(document.getElementById('view-auth'));
     mountConnectForm(document.getElementById('first-run-connect-host'), {
       fullWidthSubmit: true,
       onSuccess: async () => {
@@ -1834,7 +2042,7 @@ function renderGameDetailView() {
     </section>
 
     <section class="panel">
-      <h2>Sync &amp; launch activity</h2>
+      <h2>Sync and launch activity</h2>
       ${(() => {
         const gameLogs = state.activityLogs.filter((l) => l.game_id === g.game_id).slice(0, 8);
         if (!gameLogs.length) {
@@ -1864,14 +2072,15 @@ function renderGameDetailView() {
   document.getElementById('btn-detail-uninstall')?.addEventListener('click', () => {
     openConfirmModal({
       title: `Uninstall ${g.name}`,
-      body: 'This removes local game files from your library folder. Your synced saves remain safely stored on the OpenSync server.',
+      body: 'This removes the local game files from your games directory. Any save changes are synced to the cloud first, and reinstalling restores the game and its saves to the same folder.',
       confirmLabel: 'Uninstall game',
       danger: true,
       onConfirm: async () => {
         try {
           await bridge.uninstallGame(g.game_id);
+          cardDomCache.delete(g.game_id);
           await refreshLibrary();
-          showToast(`Uninstalled ${g.name}`, 'accent', 'trash-2');
+          showToast(`Uninstalled ${g.name} · saves synced to cloud`, 'accent', 'trash-2');
           renderCurrentView();
         } catch (err) {
           showToast(String(err?.message || err), 'danger', 'alert-triangle');
@@ -1936,7 +2145,7 @@ function renderDownloadsView() {
 
   viewEl.innerHTML = `
     <div class="page-header-row">
-      <h1 class="page-title">downloads</h1>
+      <h1 class="page-title">Downloads</h1>
       <div class="bw-control">
         <label>Bandwidth limit</label>
         <div id="dl-bw-host"></div>
@@ -2234,10 +2443,18 @@ function defaultUploadForm() {
   };
 }
 
+// Crisp labels that mirror the web upload form: no tracked-out all-caps
+// styling, with the common hardware acronyms kept as written there.
+const REQUIREMENT_LABELS = { os: 'OS', cpu: 'CPU', ram: 'RAM', gpu: 'GPU', storage: 'Storage' };
+
+function requirementLabel(key) {
+  return REQUIREMENT_LABELS[key] || String(key || '').replace(/^./, (c) => c.toUpperCase());
+}
+
 function requirementsString(reqs) {
   return Object.entries(reqs || {})
     .filter(([, v]) => String(v || '').trim())
-    .map(([k, v]) => `${k.toUpperCase()}: ${String(v).trim()}`)
+    .map(([k, v]) => `${requirementLabel(k)}: ${String(v).trim()}`)
     .join('\n');
 }
 
@@ -2262,7 +2479,7 @@ function renderUploadView() {
   viewEl.innerHTML = `
     <div class="upload-page">
       <div class="page-header-row">
-        <h1 class="page-title">upload game</h1>
+        <h1 class="page-title">Upload game</h1>
         <button type="button" class="btn btn-ghost btn-sm" id="up-back">${icon('arrow-left', 14)}<span>Library</span></button>
       </div>
 
@@ -2307,7 +2524,7 @@ function renderUploadView() {
           <div class="req-grid">
             ${['os', 'cpu', 'ram', 'gpu', 'storage'].map((k) => `
               <div class="field" style="margin-bottom:0;">
-                <label for="up-req-${k}">${k.toUpperCase()}</label>
+                <label for="up-req-${k}">${requirementLabel(k)}</label>
                 <input type="text" class="input" id="up-req-${k}" value="${esc(form.requirements[k] || '')}" placeholder="${k === 'ram' ? '8 GB' : k === 'storage' ? '20 GB available' : 'e.g. Linux 64-bit'}" />
               </div>
             `).join('')}
@@ -2779,7 +2996,7 @@ function renderAccountSetting(host) {
 function renderSettingsView() {
   viewEl.innerHTML = `
     <div class="page-header-row">
-      <h1 class="page-title">settings</h1>
+      <h1 class="page-title">Settings</h1>
     </div>
 
     <section class="panel" id="settings-account"></section>
@@ -2943,7 +3160,7 @@ function renderProfilesSection(host) {
                 <div class="dl-title-row">
                   <span class="profile-menu-name">${esc(p.label)}</span>
                   ${isActive ? '<span class="badge badge-accent">Active</span>' : ''}
-                  ${p.role === 'admin' ? '<span class="badge badge-warn">Admin</span>' : ''}
+                  ${p.role === 'admin' ? '<span class="badge badge-admin">Admin</span>' : ''}
                 </div>
                 <div class="small muted">@${esc(p.username)} on ${esc(p.server_url)}</div>
               </div>
@@ -3081,7 +3298,7 @@ function renderProfileView() {
 
   viewEl.innerHTML = `
     <div class="page-header-row">
-      <h1 class="page-title">profile</h1>
+      <h1 class="page-title">Profile</h1>
     </div>
 
     <section class="panel profile-hero">
@@ -3089,7 +3306,7 @@ function renderProfileView() {
       <div class="profile-hero-meta">
         <h2>@${esc(user.username)}</h2>
         <div class="profile-hero-badges">
-          ${user.role === 'admin' ? '<span class="badge badge-warn">admin</span>' : '<span class="badge">user</span>'}
+          ${user.role === 'admin' ? '<span class="badge badge-admin">Admin</span>' : '<span class="badge">User</span>'}
           <span class="small muted">Member since ${esc(fmtDate(user.created_at))}</span>
         </div>
       </div>
@@ -3629,7 +3846,7 @@ function openInterruptedSessionModal(session) {
         <div class="modal-header">
           <h2 id="recovery-modal-title" style="margin:0;display:inline-flex;align-items:center;gap:9px;">
             <span style="color:var(--warn);display:inline-flex;">${icon('alert-triangle', 18)}</span>
-            <span>Interrupted Game Session Detected</span>
+            <span>Interrupted game session detected</span>
           </h2>
           <button type="button" class="btn btn-ghost btn-icon" id="btn-close-recovery-modal" aria-label="Close">${icon('x', 16)}</button>
         </div>
@@ -3726,7 +3943,7 @@ function openSafeShutdownModal(status = {}) {
         <div class="modal-header">
           <h2 id="shutdown-modal-title" style="margin:0;display:inline-flex;align-items:center;gap:9px;">
             <span style="color:var(--accent);display:inline-flex;">${icon('shield-check', 18)}</span>
-            <span>Safe Shutdown</span>
+            <span>Safe shutdown</span>
           </h2>
           <button type="button" class="btn btn-ghost btn-icon" id="btn-close-shutdown-modal" aria-label="Close">${icon('x', 16)}</button>
         </div>
@@ -3849,7 +4066,9 @@ function handleLauncherEvent(evt) {
 
       if (job.stage === 'completed' && prevStage !== 'completed') {
         showToast(`${job.title} is ready`, 'accent', 'check');
+        if (job.kind === 'game' && job.game_id != null) cardDomCache.delete(job.game_id);
         refreshLibrary().then(() => {
+          if (job.kind === 'game' && job.game_id != null) cardDomCache.delete(job.game_id);
           if (state.view === 'downloads') syncDownloadsListDom();
           else renderCurrentView();
         });
@@ -3977,10 +4196,25 @@ function handleLauncherEvent(evt) {
       if (job.stage === 'ready' && prevStage !== 'ready') {
         for (const wf of activeUploadWaveforms.values()) wf.destroy();
         activeUploadWaveforms.clear();
-        showToast(`${job.name} uploaded successfully`, 'accent', 'check');
         state.uploadForm = defaultUploadForm();
+        const uploadedGameId = job.game_id;
+        if (uploadedGameId != null) cardDomCache.delete(uploadedGameId);
+        // The backend moves the uploaded folder into the OpenSync games
+        // directory and reports it installed, so refetch before rendering.
         Promise.all([refreshLibrary(), refreshDownloads()]).then(() => {
-          navigate('game-detail', { gameId: job.game_id });
+          if (uploadedGameId != null) cardDomCache.delete(uploadedGameId);
+          const installedGame = state.library.find(
+            (g) => g.game_id === uploadedGameId && g.installed,
+          );
+          showToast(
+            installedGame
+              ? `${job.name} is installed and ready to play`
+              : `${job.name} uploaded successfully`,
+            'accent',
+            installedGame ? 'play' : 'check',
+          );
+          if (uploadedGameId != null) navigate('game-detail', { gameId: uploadedGameId });
+          else renderCurrentView();
         });
         break;
       }

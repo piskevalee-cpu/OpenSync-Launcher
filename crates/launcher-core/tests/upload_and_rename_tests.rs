@@ -246,12 +246,75 @@ async fn folder_upload_pause_resume_and_cancel() {
 }
 
 #[tokio::test]
+async fn picked_folder_upload_moves_into_games_dir_and_marks_installed() {
+    let dir = tempdir().unwrap();
+    let core = build_core(dir.path());
+    let srv = MockOpenSyncServer::start().await;
+    srv.add_user(1, "alice", "pass1234");
+    let profile = connect(&core, &srv).await;
+
+    // A user folder outside games_dir, with an executable and a save file.
+    let source = dir.path().join("picked_game_folder");
+    write_file(&source, "mygame.sh", b"#!/bin/sh\necho mygame\n");
+    write_file(&source, "saves/slot1.dat", b"initial save\n");
+
+    let job_id = core
+        .start_game_upload(
+            "My Game",
+            "",
+            "",
+            Some(source.to_str().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+    let done = wait_for_status(&core, &job_id, UploadStatus::Ready, Duration::from_secs(30)).await;
+    let game_id = done.game_id.expect("ready upload must have a game id");
+
+    let slug = {
+        let st = srv.state.lock().unwrap();
+        st.games.get(&game_id).unwrap().slug.clone()
+    };
+    let expected_dir = dir.path().join("games").join(&profile.id).join(&slug);
+
+    // The files were moved, not copied: the original picked folder no longer exists.
+    assert!(expected_dir.join("mygame.sh").is_file());
+    assert_eq!(
+        fs::read(expected_dir.join("saves/slot1.dat")).unwrap(),
+        b"initial save\n"
+    );
+    assert!(
+        !source.exists(),
+        "picked source folder must be moved, not left behind"
+    );
+
+    // The game is registered with discovered executable and clean manifest hash.
+    let installed = core
+        .db()
+        .get_installed_game(&profile.id, game_id)
+        .unwrap()
+        .expect("uploaded game must be installed");
+    assert_eq!(installed.install_dir, expected_dir);
+    assert_eq!(installed.executable_rel_path.as_deref(), Some("mygame.sh"));
+    assert!(installed.manifest_hash.is_some(), "clean manifest hash recorded");
+    assert!(installed.total_size > 0);
+    assert!(
+        core.list_downloaded_games()
+            .await
+            .unwrap()
+            .iter()
+            .any(|g| g.game_id == game_id),
+        "installed game must be immediately visible in the library"
+    );
+}
+
+#[tokio::test]
 async fn dropped_upload_stages_chunks_then_finalizes() {
     let dir = tempdir().unwrap();
     let core = build_core(dir.path());
     let srv = MockOpenSyncServer::start().await;
     srv.add_user(1, "alice", "pass1234");
-    connect(&core, &srv).await;
+    let profile = connect(&core, &srv).await;
     srv.set_chunk_delay_ms(0);
 
     let job_id = core
@@ -297,4 +360,16 @@ async fn dropped_upload_stages_chunks_then_finalizes() {
     let files: HashMap<String, Vec<u8>> = srv.game_files(game_id).unwrap();
     assert_eq!(files.get("saves/slot1.dat").unwrap(), &payload);
     assert!(!staging.exists(), "staging directory must be cleaned up");
+
+    // Staged files were moved out of staging into the games dir and installed.
+    let installed = core
+        .db()
+        .get_installed_game(&profile.id, game_id)
+        .unwrap()
+        .expect("dropped upload must be installed");
+    assert_eq!(
+        fs::read(installed.install_dir.join("saves/slot1.dat")).unwrap(),
+        payload
+    );
+    assert!(installed.install_dir.starts_with(dir.path().join("games")));
 }
