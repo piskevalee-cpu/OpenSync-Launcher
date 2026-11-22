@@ -275,8 +275,10 @@ const state = {
   library: [],
   coverCache: new Map(), // game_id -> dataUrl | null
   coverPending: new Set(),
+  heroBlurCache: new Map(), // `${profileId}_${gameId}` -> pre-blurred dataUrl | null
   playingGameIds: new Set(),
   syncingGameIds: new Set(),
+  uninstallingGameIds: new Set(),
   searchQuery: '',
   filterMode: 'all', // 'all' | 'installed'
   sortBy: 'recent', // 'recent' | 'newest' | 'name' | 'size'
@@ -521,6 +523,8 @@ function createCssSelect({ options, value = '', onChange, disabled = false, aria
 
 const viewEl = document.getElementById('view');
 const topbarEl = document.getElementById('topbar');
+const detailHeroBg = document.getElementById('detail-hero-bg');
+const detailHeroImg = document.getElementById('detail-hero-img');
 const profileSwitcherEl = document.getElementById('profile-switcher');
 const statusRightEl = document.getElementById('status-right');
 const modalRoot = document.getElementById('modal-root');
@@ -641,6 +645,113 @@ function showToast(message, tone = 'accent', iconName = 'check') {
 
 // ---------- Cover Lazy Loader ----------
 
+let heroSeq = 0;
+
+function heroCacheKey(profileId, gameId) {
+  return `${profileId || 'none'}_${gameId}`;
+}
+
+function clearDetailHero() {
+  heroSeq += 1;
+  if (!detailHeroBg) return;
+  detailHeroBg.hidden = true;
+  detailHeroBg.classList.remove('has-image');
+  if (detailHeroImg) detailHeroImg.removeAttribute('src');
+}
+
+function makeBlurredHeroDataUrl(srcUrl) {
+  return new Promise((resolve) => {
+    if (!srcUrl || typeof document === 'undefined') {
+      resolve(null);
+      return;
+    }
+    const img = new Image();
+    img.decoding = 'async';
+    img.onload = () => {
+      try {
+        const w = img.naturalWidth || 0;
+        const h = img.naturalHeight || 0;
+        if (!w || !h) {
+          resolve(null);
+          return;
+        }
+        // Multi-step small offscreen downscale produces a smooth edge-free wash
+        // in WebKitGTK with near-zero CPU/GPU work during scroll or switching.
+        const insetW = Math.max(1, Math.round(w * 0.88));
+        const insetH = Math.max(1, Math.round(h * 0.62));
+        const sx = Math.round((w - insetW) * 0.5);
+        const sy = Math.round((h - insetH) * 0.25);
+
+        const c1 = document.createElement('canvas');
+        c1.width = 48;
+        c1.height = 27;
+        const ctx1 = c1.getContext('2d');
+        if (!ctx1) {
+          resolve(null);
+          return;
+        }
+        ctx1.imageSmoothingEnabled = true;
+        ctx1.imageSmoothingQuality = 'high';
+        ctx1.drawImage(img, sx, sy, insetW, insetH, 0, 0, 48, 27);
+
+        const c2 = document.createElement('canvas');
+        c2.width = 96;
+        c2.height = 54;
+        const ctx2 = c2.getContext('2d');
+        if (!ctx2) {
+          resolve(null);
+          return;
+        }
+        ctx2.imageSmoothingEnabled = true;
+        ctx2.imageSmoothingQuality = 'high';
+        if ('filter' in ctx2) {
+          ctx2.filter = 'blur(4px)';
+        }
+        ctx2.drawImage(c1, 0, 0, 96, 54);
+        resolve(c2.toDataURL('image/jpeg', 0.82));
+      } catch {
+        resolve(null);
+      }
+    };
+    img.onerror = () => resolve(null);
+    img.src = srcUrl;
+  });
+}
+
+async function syncDetailHero(game) {
+  if (!detailHeroBg || !detailHeroImg || !game || state.view !== 'game-detail' || state.selectedGameId !== game.game_id) {
+    return;
+  }
+  const seq = ++heroSeq;
+  detailHeroBg.hidden = false;
+
+  const coverUrl = state.coverCache.get(game.game_id);
+  if (!coverUrl) {
+    detailHeroBg.classList.remove('has-image');
+    detailHeroImg.removeAttribute('src');
+    return;
+  }
+
+  const key = heroCacheKey(state.activeProfile?.id, game.game_id);
+  let blurredUrl = state.heroBlurCache.get(key);
+  if (blurredUrl === undefined) {
+    blurredUrl = await makeBlurredHeroDataUrl(coverUrl);
+    state.heroBlurCache.set(key, blurredUrl);
+  }
+  if (seq !== heroSeq || state.view !== 'game-detail' || state.selectedGameId !== game.game_id) {
+    return;
+  }
+  if (blurredUrl) {
+    if (detailHeroImg.getAttribute('src') !== blurredUrl) {
+      detailHeroImg.src = blurredUrl;
+    }
+    detailHeroBg.classList.add('has-image');
+  } else {
+    detailHeroBg.classList.remove('has-image');
+    detailHeroImg.removeAttribute('src');
+  }
+}
+
 async function ensureCover(game) {
   if (!game || !game.has_cover) return;
   if (state.coverCache.has(game.game_id) || state.coverPending.has(game.game_id)) return;
@@ -661,6 +772,9 @@ async function ensureCover(game) {
       const cached = cardDomCache.get(game.game_id);
       if (cached && cached.sig.endsWith('|0')) {
         cached.sig = `${cached.sig.slice(0, -2)}|1`;
+      }
+      if (state.view === 'game-detail' && state.selectedGameId === game.game_id) {
+        syncDetailHero(game);
       }
     }
   } catch {
@@ -881,6 +995,7 @@ function syncFabVisibility() {
   if (topbarEl) {
     topbarEl.style.display = signedIn ? '' : 'none';
   }
+  document.documentElement.classList.toggle('is-auth-screen', !signedIn);
   document.body.classList.toggle('is-auth-screen', !signedIn);
   if (fabUploadEl) {
     fabUploadEl.hidden = !(state.view === 'library' && signedIn);
@@ -1308,11 +1423,9 @@ function clearPendingViewSwitch() {
     activeViewAnim = null;
   }
   if (viewEl) {
+    viewEl.classList.remove('view-switch');
     viewEl.style.removeProperty('opacity');
-    viewEl.style.removeProperty('transform');
-    viewEl.style.removeProperty('will-change');
   }
-  document.body.classList.remove('is-switching');
 }
 
 function navigate(nextView, opts = {}) {
@@ -1321,6 +1434,7 @@ function navigate(nextView, opts = {}) {
   teardownAuthParticles();
   destroyWaveforms();
   if (nextView !== 'upload') destroyUploadWaveforms();
+  if (nextView !== 'game-detail') clearDetailHero();
   state.view = nextView;
   if (opts.gameId != null) {
     state.selectedGameId = opts.gameId;
@@ -1340,6 +1454,7 @@ function renderCurrentView(animate = false) {
   syncFabVisibility();
   // Before signing in, only the sign-in menu may appear.
   if (!state.activeProfile) {
+    clearDetailHero();
     renderLibraryView();
     gamepadCtrl?.onViewRendered();
     return;
@@ -1355,12 +1470,13 @@ function renderCurrentView(animate = false) {
   if (state.view !== 'upload') {
     activeUploadViewApi = null;
   }
+  if (state.view !== 'game-detail') {
+    clearDetailHero();
+  }
 
   const reducedMotion = Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
   const canAnimate = Boolean(animate && !reducedMotion && typeof viewEl.animate === 'function');
   if (canAnimate) {
-    document.body.classList.add('is-switching');
-    viewEl.style.willChange = 'opacity, transform';
     viewEl.style.opacity = '0';
   }
 
@@ -1395,10 +1511,10 @@ function renderCurrentView(animate = false) {
       try {
         activeViewAnim = viewEl.animate(
           [
-            { opacity: 0, transform: 'translate3d(0, 4px, 0)' },
-            { opacity: 1, transform: 'translate3d(0, 0, 0)' },
+            { opacity: 0 },
+            { opacity: 1 },
           ],
-          { duration: 130, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'forwards' },
+          { duration: 120, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'forwards' },
         );
         const finish = () => {
           if (seq !== viewRenderSeq) return;
@@ -1406,7 +1522,7 @@ function renderCurrentView(animate = false) {
         };
         activeViewAnim.onfinish = finish;
         activeViewAnim.oncancel = finish;
-        viewSwitchTimer = window.setTimeout(finish, 200);
+        viewSwitchTimer = window.setTimeout(finish, 180);
       } catch {
         clearPendingViewSwitch();
       }
@@ -1439,75 +1555,90 @@ function attachAuthParticleField(canvas, host) {
   const ctx = canvas.getContext?.('2d');
   if (!ctx) return () => canvas.remove();
 
-  // Every stroke is a green shade — no blue or neutral particles.
-  const GREENS = [
+  // Matches the landing page hero orbital particle field.
+  const PALETTE = [
     'rgba(125, 250, 155, 0.85)',
-    'rgba(125, 250, 155, 0.55)',
+    'rgba(125, 250, 155, 0.56)',
     'rgba(74, 222, 128, 0.45)',
-    'rgba(187, 247, 208, 0.32)',
+    'rgba(187, 247, 208, 0.34)',
   ];
-  const pointer = { x: -1, y: -1 };
+  const pointer = { x: -9999, y: -9999, active: false };
   let width = 0;
   let height = 0;
   let particles = [];
   let rafId = 0;
+  let tickPhase = 0;
   let running = false;
   let cleaned = false;
 
   function resize() {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    // Fixed canvas uses viewport metrics: #view may briefly be transformed by
-    // the view-switch animation, which would otherwise become its containing block.
-    width = window.innerWidth;
-    height = window.innerHeight;
+    width = Math.max(320, window.innerWidth);
+    height = Math.max(240, window.innerHeight);
     canvas.width = Math.floor(width * dpr);
     canvas.height = Math.floor(height * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const count = Math.max(26, Math.min(90, Math.round((width * height) / 18000)));
-    particles = Array.from({ length: count }, (_, i) => ({
-      x: Math.random() * width,
-      y: Math.random() * height,
-      phase: Math.random() * Math.PI * 2,
-      speed: 0.15 + Math.random() * 0.35,
-      amp: 6 + Math.random() * 14,
-      len: 3 + Math.random() * 5,
-      color: GREENS[i % GREENS.length],
-    }));
-    if (!running) draw(0);
+    const count = Math.min(115, Math.round((width * height) / 11000));
+    particles = Array.from({ length: count }, (_, idx) => {
+      const angle = (idx / count) * Math.PI * 2 + (idx % 7) * 0.2;
+      const radiusFactor = 0.18 + ((idx * 37) % 100) / 120;
+      return {
+        x: (width * 0.5) + Math.cos(angle) * width * 0.44 * radiusFactor,
+        y: (height * 0.48) + Math.sin(angle) * height * 0.46 * radiusFactor,
+        vx: (Math.random() - 0.5) * 0.16,
+        vy: (Math.random() - 0.5) * 0.16,
+        len: 3 + (idx % 5) * 1.4,
+        color: PALETTE[idx % PALETTE.length],
+        phase: idx * 0.41,
+      };
+    });
+    if (!running) draw();
   }
 
-  function draw(time) {
+  function draw() {
+    tickPhase += 0.015;
     ctx.clearRect(0, 0, width, height);
-    const originX = pointer.x >= 0 ? pointer.x : width / 2;
-    const originY = pointer.y >= 0 ? pointer.y : height / 2;
+    const cx = width * 0.5;
+    const cy = height * 0.44;
     ctx.lineWidth = 1.6;
     ctx.lineCap = 'round';
     for (const p of particles) {
-      const angle = Math.atan2(p.y - originY, p.x - originX);
-      let px = p.x + Math.cos(time * 0.0004 * p.speed + p.phase) * p.amp;
-      let py = p.y + Math.sin(time * 0.00035 * p.speed + p.phase) * p.amp;
-      if (pointer.x >= 0) {
-        const rx = px - pointer.x;
-        const ry = py - pointer.y;
-        const dist = Math.hypot(rx, ry);
-        if (dist < 140 && dist > 0) {
-          const push = ((140 - dist) / 140) * 26;
-          px += (rx / dist) * push;
-          py += (ry / dist) * push;
+      p.x += p.vx + Math.cos(tickPhase + p.phase) * 0.12;
+      p.y += p.vy + Math.sin(tickPhase + p.phase) * 0.12;
+
+      if (p.x < -20) p.x = width + 20;
+      if (p.x > width + 20) p.x = -20;
+      if (p.y < -20) p.y = height + 20;
+      if (p.y > height + 20) p.y = -20;
+
+      let dx = p.x - cx;
+      let dy = p.y - cy;
+      if (pointer.active) {
+        dx = p.x - pointer.x;
+        dy = p.y - pointer.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < 140 && dist > 1) {
+          const push = (140 - dist) * 0.014;
+          p.x += (dx / dist) * push;
+          p.y += (dy / dist) * push;
         }
       }
-      const dx = Math.cos(angle) * p.len * 0.5;
-      const dy = Math.sin(angle) * p.len * 0.5;
+
+      const angle = Math.atan2(dy, dx);
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(angle);
       ctx.strokeStyle = p.color;
       ctx.beginPath();
-      ctx.moveTo(px - dx, py - dy);
-      ctx.lineTo(px + dx, py + dy);
+      ctx.moveTo(-p.len * 0.5, 0);
+      ctx.lineTo(p.len * 0.5, 0);
       ctx.stroke();
+      ctx.restore();
     }
   }
 
-  function tick(time) {
-    draw(time);
+  function tick() {
+    draw();
     rafId = requestAnimationFrame(tick);
   }
 
@@ -1531,7 +1662,7 @@ function attachAuthParticleField(canvas, host) {
   function onMotionChange() {
     if (reduce?.matches) {
       stop();
-      draw(0);
+      draw();
     } else if (!document.hidden) {
       start();
     }
@@ -1540,11 +1671,11 @@ function attachAuthParticleField(canvas, host) {
   function onPointerMove(e) {
     pointer.x = e.clientX;
     pointer.y = e.clientY;
+    pointer.active = true;
   }
 
   function onPointerLeave() {
-    pointer.x = -1;
-    pointer.y = -1;
+    pointer.active = false;
   }
 
   // Safety net: if the host is ever detached without an explicit teardown,
@@ -1990,6 +2121,7 @@ function renderGameDetailView() {
 
   const isPlaying = state.playingGameIds.has(g.game_id);
   const isSyncing = state.syncingGameIds.has(g.game_id);
+  const isUninstalling = state.uninstallingGameIds.has(g.game_id);
   const dl = findActiveDownloadForGame(g.game_id);
   const dlPct = dl && dl.total_bytes > 0
     ? Math.min(100, Math.round((dl.bytes_downloaded / dl.total_bytes) * 100))
@@ -1997,6 +2129,7 @@ function renderGameDetailView() {
 
   const coverUrl = state.coverCache.get(g.game_id);
   if (!coverUrl && g.has_cover) ensureCover(g);
+  syncDetailHero(g);
 
   const coverInner = coverUrl
     ? `<img src="${coverUrl}" alt="${esc(g.name)}" decoding="async" /><span class="cover-zoom-hint">Expand</span>`
@@ -2012,7 +2145,7 @@ function renderGameDetailView() {
   } else if (dl) {
     primaryBtnHtml = `<button type="button" class="btn btn-primary" id="btn-detail-open-dl">${icon('arrow-down', 16)}<span>${dl.paused ? 'Download paused' : `Downloading ${dlPct}%`}</span></button>`;
   } else if (g.installed) {
-    primaryBtnHtml = `<button type="button" class="btn btn-primary" id="btn-detail-play">${icon('play', 16)}<span>Play</span></button>`;
+    primaryBtnHtml = `<button type="button" class="btn btn-primary" id="btn-detail-play" ${isUninstalling ? 'disabled' : ''}>${icon('play', 16)}<span>Play</span></button>`;
   } else {
     primaryBtnHtml = `<button type="button" class="btn btn-primary" id="btn-detail-install">${icon('arrow-down', 16)}<span>Install (${esc(humanBytes(g.total_size))})</span></button>`;
   }
@@ -2020,15 +2153,15 @@ function renderGameDetailView() {
   const secondaryBtns = [];
   if (g.installed) {
     secondaryBtns.push(`
-      <button type="button" class="btn" id="btn-detail-sync" ${isSyncing || isPlaying ? 'disabled' : ''}>
+      <button type="button" class="btn" id="btn-detail-sync" ${isSyncing || isPlaying || isUninstalling ? 'disabled' : ''}>
         ${icon('refresh-cw', 15, isSyncing ? 'spin' : '')}
         <span>${isSyncing ? 'Syncing saves…' : 'Sync save'}</span>
       </button>
     `);
     secondaryBtns.push(`
-      <button type="button" class="btn btn-danger" id="btn-detail-uninstall" ${isPlaying ? 'disabled' : ''}>
-        ${icon('trash-2', 15)}
-        <span>Uninstall</span>
+      <button type="button" class="btn btn-danger" id="btn-detail-uninstall" ${isPlaying || isUninstalling ? 'disabled' : ''}>
+        ${isUninstalling ? icon('refresh-cw', 15, 'spin') : icon('trash-2', 15)}
+        <span>${isUninstalling ? 'Uninstalling…' : 'Uninstall'}</span>
       </button>
     `);
   } else if (!dl && g.has_overlay) {
@@ -2181,14 +2314,29 @@ function renderGameDetailView() {
       confirmLabel: 'Uninstall game',
       danger: true,
       onConfirm: async () => {
+        if (state.uninstallingGameIds.has(g.game_id)) return;
+        state.uninstallingGameIds.add(g.game_id);
+        if (state.view === 'game-detail' && state.selectedGameId === g.game_id) {
+          const btn = document.getElementById('btn-detail-uninstall');
+          const playBtn = document.getElementById('btn-detail-play');
+          const syncBtn = document.getElementById('btn-detail-sync');
+          if (btn) {
+            btn.disabled = true;
+            btn.innerHTML = `${icon('refresh-cw', 15, 'spin')}<span>Uninstalling…</span>`;
+          }
+          if (playBtn) playBtn.disabled = true;
+          if (syncBtn) syncBtn.disabled = true;
+        }
         try {
           await bridge.uninstallGame(g.game_id);
           cardDomCache.delete(g.game_id);
           await refreshLibrary();
           showToast(`Uninstalled ${g.name} · saves synced to cloud`, 'accent', 'trash-2');
-          renderCurrentView();
         } catch (err) {
           showToast(String(err?.message || err), 'danger', 'alert-triangle');
+        } finally {
+          state.uninstallingGameIds.delete(g.game_id);
+          renderCurrentView();
         }
       },
     });
@@ -3723,63 +3871,111 @@ function formatAuthError(err) {
 function mountConnectForm(container, { onSuccess, onCancel = null, fullWidthSubmit = false }) {
   let mode = 'login'; // 'login' | 'register'
   let showPw = false;
+  let savedUrl = '';
+  let savedLabel = '';
+  let savedUser = '';
+  let savedPass = '';
 
-  const render = () => {
-    const prevUrl = container.querySelector('#cf-url')?.value || '';
-    const prevLabel = container.querySelector('#cf-label')?.value || '';
-    const prevUser = container.querySelector('#cf-user')?.value || '';
+  container.innerHTML = `
+    <div class="auth-tabs" role="tablist">
+      <button type="button" class="active" data-auth-tab="login">Sign in</button>
+      <button type="button" data-auth-tab="register">Create account</button>
+    </div>
+    <div id="auth-body"></div>
+  `;
 
-    container.innerHTML = `
-      <div class="auth-tabs">
-        <button type="button" class="${mode === 'login' ? 'active' : ''}" data-auth-tab="login">Sign in</button>
-        <button type="button" class="${mode === 'register' ? 'active' : ''}" data-auth-tab="register">Create account</button>
-      </div>
-      <form id="connect-profile-form">
+  const loginTab = container.querySelector('[data-auth-tab="login"]');
+  const registerTab = container.querySelector('[data-auth-tab="register"]');
+  const bodyEl = container.querySelector('#auth-body');
+
+  const syncTabs = () => {
+    const isLogin = mode === 'login';
+    loginTab?.classList.toggle('active', isLogin);
+    registerTab?.classList.toggle('active', !isLogin);
+  };
+
+  const renderBody = (isSwitch = false) => {
+    if (isSwitch) {
+      savedUrl = bodyEl.querySelector('#cf-url')?.value || savedUrl;
+      savedLabel = bodyEl.querySelector('#cf-label')?.value || savedLabel;
+      savedUser = bodyEl.querySelector('#cf-user')?.value || savedUser;
+      savedPass = bodyEl.querySelector('#cf-pass')?.value || savedPass;
+    }
+    const prevH = bodyEl.offsetHeight;
+
+    bodyEl.innerHTML = `
+      <form id="connect-profile-form" novalidate>
         <div class="field">
           <label for="cf-url">Server URL</label>
-          <input id="cf-url" class="input" type="text" placeholder="http://127.0.0.1:3000" value="${esc(prevUrl)}" required />
+          <input id="cf-url" class="input" type="text" placeholder="http://127.0.0.1:3000" value="${esc(savedUrl)}" required />
         </div>
         <div class="field">
           <label for="cf-label">Instance label</label>
-          <input id="cf-label" class="input" type="text" placeholder="Home LAN" value="${esc(prevLabel)}" />
+          <input id="cf-label" class="input" type="text" placeholder="Home LAN" value="${esc(savedLabel)}" />
         </div>
         <div class="field">
           <label for="cf-user">Username</label>
-          <input id="cf-user" class="input" type="text" placeholder="your handle" value="${esc(prevUser)}" required />
+          <input id="cf-user" class="input" type="text" placeholder="your handle" value="${esc(savedUser)}" autocomplete="username" required />
         </div>
         <div class="field">
           <label for="cf-pass">Password</label>
           <div class="input-pw-wrap">
-            <input id="cf-pass" class="input" type="${showPw ? 'text' : 'password'}" placeholder="Enter password" required />
+            <input id="cf-pass" class="input" type="${showPw ? 'text' : 'password'}" placeholder="${mode === 'register' ? 'At least 6 characters' : 'Enter password'}" value="${esc(savedPass)}" autocomplete="${mode === 'login' ? 'current-password' : 'new-password'}" required />
             <button type="button" class="pw-toggle" id="cf-pw-toggle" aria-label="${showPw ? 'Hide password' : 'Show password'}" title="${showPw ? 'Hide password' : 'Show password'}">
               ${icon(showPw ? 'eye-off' : 'eye', 16)}
             </button>
           </div>
         </div>
-        <div class="form-error" id="cf-err"></div>
+        <div class="form-error" id="cf-err" role="alert"></div>
         <div class="modal-actions">
           ${onCancel ? '<button type="button" class="btn btn-ghost" id="cf-cancel">Cancel</button>' : ''}
           <button type="submit" class="btn btn-primary${fullWidthSubmit && !onCancel ? ' btn-full' : ''}" id="cf-submit">
             ${mode === 'register' ? 'Create account and connect' : 'Sign in and connect'}
           </button>
         </div>
+        <p class="faint small auth-switch">
+          ${mode === 'login' ? 'No account yet? ' : 'Already have an account? '}
+          <button type="button" class="link-btn" id="cf-mode-switch">${mode === 'login' ? 'Create one' : 'Sign in'}</button>
+        </p>
       </form>
     `;
 
-    container.querySelectorAll('[data-auth-tab]').forEach((t) => {
-      t.addEventListener('click', () => {
-        mode = t.dataset.authTab;
-        render();
-      });
+    const targetH = bodyEl.scrollHeight;
+    if (isSwitch && prevH > 0 && targetH !== prevH) {
+      bodyEl.style.height = `${prevH}px`;
+      void bodyEl.offsetHeight;
+      bodyEl.style.height = `${targetH}px`;
+      bodyEl.addEventListener('transitionend', () => { bodyEl.style.height = ''; }, { once: true });
+    } else {
+      bodyEl.style.height = '';
+    }
+
+    const errEl = bodyEl.querySelector('#cf-err');
+    const showError = (msg) => {
+      if (!errEl) return;
+      errEl.textContent = msg;
+      errEl.classList.remove('shake');
+      void errEl.offsetWidth;
+      if (msg) errEl.classList.add('shake');
+    };
+
+    bodyEl.querySelector('#cf-mode-switch')?.addEventListener('click', () => {
+      const next = mode === 'login' ? 'register' : 'login';
+      if (mode !== next) {
+        mode = next;
+        syncTabs();
+        renderBody(true);
+      }
     });
 
-    container.querySelector('#cf-pw-toggle')?.addEventListener('click', () => {
-      const pwInput = container.querySelector('#cf-pass');
+    bodyEl.querySelector('#cf-pw-toggle')?.addEventListener('click', () => {
+      const pwInput = bodyEl.querySelector('#cf-pass');
       showPw = !showPw;
       if (pwInput) {
         pwInput.type = showPw ? 'text' : 'password';
+        pwInput.focus();
       }
-      const btn = container.querySelector('#cf-pw-toggle');
+      const btn = bodyEl.querySelector('#cf-pw-toggle');
       if (btn) {
         btn.innerHTML = icon(showPw ? 'eye-off' : 'eye', 16);
         btn.setAttribute('aria-label', showPw ? 'Hide password' : 'Show password');
@@ -3787,21 +3983,41 @@ function mountConnectForm(container, { onSuccess, onCancel = null, fullWidthSubm
       }
     });
 
-    container.querySelector('#cf-cancel')?.addEventListener('click', onCancel);
+    if (onCancel) {
+      bodyEl.querySelector('#cf-cancel')?.addEventListener('click', onCancel);
+    }
 
-    container.querySelector('#connect-profile-form')?.addEventListener('submit', async (e) => {
+    bodyEl.querySelector('#connect-profile-form')?.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const errEl = container.querySelector('#cf-err');
-      const submitBtn = container.querySelector('#cf-submit');
-      errEl.textContent = '';
+      const submitBtn = bodyEl.querySelector('#cf-submit');
+      showError('');
 
-      const rawUrl = container.querySelector('#cf-url').value.trim();
+      const rawUrl = bodyEl.querySelector('#cf-url').value.trim();
       const server_url = normalizeServerUrl(rawUrl);
-      const label = container.querySelector('#cf-label').value.trim() || server_url.replace(/^https?:\/\//, '');
-      const username = container.querySelector('#cf-user').value.trim();
-      const password = container.querySelector('#cf-pass').value;
+      const label = bodyEl.querySelector('#cf-label').value.trim() || server_url.replace(/^https?:\/\//, '');
+      const username = bodyEl.querySelector('#cf-user').value.trim();
+      const password = bodyEl.querySelector('#cf-pass').value;
 
+      if (!server_url) {
+        showError('Server URL is required.');
+        bodyEl.querySelector('#cf-url')?.focus();
+        return;
+      }
+      if (!username) {
+        showError('Username is required.');
+        bodyEl.querySelector('#cf-user')?.focus();
+        return;
+      }
+      if (!password) {
+        showError('Password is required.');
+        bodyEl.querySelector('#cf-pass')?.focus();
+        return;
+      }
+
+      const busyText = mode === 'register' ? 'Creating account…' : 'Signing in…';
+      const idleText = mode === 'register' ? 'Create account and connect' : 'Sign in and connect';
       submitBtn.disabled = true;
+      submitBtn.textContent = busyText;
       try {
         await bridge.connectProfile({
           label,
@@ -3813,14 +4029,36 @@ function mountConnectForm(container, { onSuccess, onCancel = null, fullWidthSubm
         showToast(`Connected to ${label}`, 'accent', 'wifi');
         await onSuccess();
       } catch (err) {
-        errEl.textContent = formatAuthError(err);
+        showError(formatAuthError(err));
       } finally {
-        submitBtn.disabled = false;
+        if (submitBtn.isConnected) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = idleText;
+        }
       }
     });
+
+    if (isSwitch) {
+      const uIn = bodyEl.querySelector('#cf-user');
+      const pIn = bodyEl.querySelector('#cf-pass');
+      if (uIn && !uIn.value) uIn.focus();
+      else if (pIn && !pIn.value) pIn.focus();
+      else uIn?.focus();
+    }
   };
 
-  render();
+  [loginTab, registerTab].forEach((tab) => {
+    tab?.addEventListener('click', () => {
+      const next = tab.dataset.authTab;
+      if (!next || next === mode) return;
+      mode = next;
+      syncTabs();
+      renderBody(true);
+    });
+  });
+
+  syncTabs();
+  renderBody(false);
 }
 
 // ---------- Modals & Lightbox ----------
@@ -4311,8 +4549,10 @@ function handleLauncherEvent(evt) {
       const gName = evt.name || (g ? g.name : 'Game');
       showLiveSyncBanner(evt.game_id, gName, evt.trigger || 'post_exit');
       renderStatusStrip();
-      if (state.view === 'library') renderLibraryGrid();
-      else if (state.view === 'game-detail') renderGameDetailView();
+      if (!state.uninstallingGameIds.has(evt.game_id)) {
+        if (state.view === 'library') renderLibraryGrid();
+        else if (state.view === 'game-detail' && state.selectedGameId === evt.game_id) renderGameDetailView();
+      }
       break;
     }
     case 'game_sync_completed':
@@ -4326,8 +4566,10 @@ function handleLauncherEvent(evt) {
         deletedPaths: evt.deleted_paths || 0,
       });
       renderStatusStrip();
-      if (state.view === 'library') renderLibraryGrid();
-      else if (state.view === 'game-detail') renderGameDetailView();
+      if (!state.uninstallingGameIds.has(evt.game_id)) {
+        if (state.view === 'library') renderLibraryGrid();
+        else if (state.view === 'game-detail' && state.selectedGameId === evt.game_id) renderGameDetailView();
+      }
       break;
     }
     case 'game_session_ended':
@@ -4357,7 +4599,11 @@ function handleLauncherEvent(evt) {
           ...state.activityLogs.filter((l) => l.id !== evt.entry.id),
         ].slice(0, 120);
         renderStatusStrip();
-        if (state.view === 'game-detail' && state.selectedGameId === evt.entry.game_id) {
+        if (
+          state.view === 'game-detail'
+          && state.selectedGameId === evt.entry.game_id
+          && !state.uninstallingGameIds.has(evt.entry.game_id)
+        ) {
           renderGameDetailView();
         }
       }
@@ -4451,6 +4697,11 @@ function handleLauncherEvent(evt) {
     }
     case 'background_sync_completed':
     case 'backgroundsynccompleted': {
+      const changed = (evt.synced_games || 0) > 0
+        || (evt.flushed_pending || 0) > 0
+        || state.pendingSyncs.length > 0
+        || state.connectionState?.status !== 'connected';
+      if (!changed) break;
       bridge
         .getBootstrapState()
         .then((boot) => {

@@ -144,7 +144,10 @@ pub async fn get_bootstrap_state(state: State<'_, AppState>) -> Result<Bootstrap
     let active_profile = state.core.active_profile().await;
     let profiles = state.core.list_profiles().map_err(err_str)?;
     let connection_state = ConnectionStateDto::from(state.core.connection_state().await);
-    let proton_installations = state.core.detect_proton();
+    let core_for_proton = Arc::clone(&state.core);
+    let proton_installations = tokio::task::spawn_blocking(move || core_for_proton.detect_proton())
+        .await
+        .map_err(|e| format!("proton scan failed: {e}"))?;
     let pending_syncs = state.core.list_pending_syncs().await.unwrap_or_default();
     let downloads = state.core.list_downloads().await;
     let bandwidth_limit_bps = state.bandwidth_limit_bps.load(Ordering::Relaxed);
@@ -192,23 +195,31 @@ fn expand_home(raw: &str) -> PathBuf {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_games_dir(state: State<'_, AppState>) -> Result<String, String> {
-    Ok(state.core.games_dir().to_string_lossy().to_string())
+pub async fn get_games_dir(state: State<'_, AppState>) -> Result<String, String> {
+    let core = Arc::clone(&state.core);
+    tokio::task::spawn_blocking(move || Ok(core.games_dir().to_string_lossy().to_string()))
+        .await
+        .map_err(|e| format!("get_games_dir task failed: {e}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn set_games_dir(state: State<'_, AppState>, path: String) -> Result<String, String> {
-    let raw = path.trim();
+pub async fn set_games_dir(state: State<'_, AppState>, path: String) -> Result<String, String> {
+    let raw = path.trim().to_string();
     if raw.is_empty() {
         return Err("Games directory cannot be empty".to_string());
     }
-    let target = if raw == "auto" {
-        default_games_dir()
-    } else {
-        expand_home(raw)
-    };
-    let resolved = state.core.set_games_dir(target).map_err(err_str)?;
-    Ok(resolved.to_string_lossy().to_string())
+    let core = Arc::clone(&state.core);
+    tokio::task::spawn_blocking(move || {
+        let target = if raw == "auto" {
+            default_games_dir()
+        } else {
+            expand_home(&raw)
+        };
+        let resolved = core.set_games_dir(target).map_err(err_str)?;
+        Ok(resolved.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| format!("set_games_dir task failed: {e}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -281,8 +292,13 @@ pub async fn get_user_pfp_data_url(
         .await
     {
         Ok(Some((bytes, mime))) => {
-            let encoded = BASE64.encode(&bytes);
-            Ok(Some(format!("data:{mime};base64,{encoded}")))
+            let url = tokio::task::spawn_blocking(move || {
+                let encoded = BASE64.encode(&bytes);
+                format!("data:{mime};base64,{encoded}")
+            })
+            .await
+            .map_err(|e| format!("encode pfp failed: {e}"))?;
+            Ok(Some(url))
         }
         Ok(None) => Ok(None),
         Err(CoreError::Api(ApiError::Http { status: 404, .. })) => Ok(None),
@@ -421,16 +437,21 @@ pub async fn list_library(state: State<'_, AppState>) -> Result<Vec<LibraryGameD
         .await
         .unwrap_or_default();
 
+    let playtime_map = state
+        .core
+        .db()
+        .playtime_summaries_for_profile(&profile.id)
+        .unwrap_or_default();
+
     let mut out = Vec::with_capacity(remote_games.len() + installed_map.len());
     let mut seen_ids = HashSet::new();
 
     for remote in remote_games {
         seen_ids.insert(remote.id);
         let inst = installed_map.remove(&remote.id);
-        let playtime = state
-            .core
-            .db()
-            .playtime_summary(&profile.id, remote.id)
+        let playtime = playtime_map
+            .get(&remote.id)
+            .cloned()
             .unwrap_or(PlaytimeSummary {
                 total_secs: 0,
                 session_count: 0,
@@ -473,10 +494,9 @@ pub async fn list_library(state: State<'_, AppState>) -> Result<Vec<LibraryGameD
         if seen_ids.contains(&gid) {
             continue;
         }
-        let playtime = state
-            .core
-            .db()
-            .playtime_summary(&profile.id, gid)
+        let playtime = playtime_map
+            .get(&gid)
+            .cloned()
             .unwrap_or(PlaytimeSummary {
                 total_secs: 0,
                 session_count: 0,
@@ -524,8 +544,13 @@ pub async fn get_game_cover_data_url(
 ) -> Result<Option<String>, String> {
     match state.core.fetch_cached_cover(game_id).await {
         Ok((bytes, mime)) => {
-            let encoded = BASE64.encode(&bytes);
-            Ok(Some(format!("data:{mime};base64,{encoded}")))
+            let url = tokio::task::spawn_blocking(move || {
+                let encoded = BASE64.encode(&bytes);
+                format!("data:{mime};base64,{encoded}")
+            })
+            .await
+            .map_err(|e| format!("encode cover failed: {e}"))?;
+            Ok(Some(url))
         }
         Err(CoreError::Api(ApiError::Http { status: 404, .. })) => Ok(None),
         Err(CoreError::Api(ApiError::Network(_))) => Ok(None),
@@ -659,7 +684,10 @@ pub async fn set_game_proton(
 pub async fn list_proton_installations(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProtonInstallation>, String> {
-    Ok(state.core.detect_proton())
+    let core = Arc::clone(&state.core);
+    tokio::task::spawn_blocking(move || core.detect_proton())
+        .await
+        .map_err(|e| format!("proton scan failed: {e}"))
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -694,39 +722,48 @@ pub async fn change_username(
 /// Opens a native directory picker using whichever desktop dialog tool is installed.
 /// Returns `None` when the dialog is unavailable or the user cancels.
 #[tauri::command(rename_all = "snake_case")]
-pub fn pick_upload_folder() -> Result<Option<String>, String> {
-    fn try_dialog(program: &str, args: &[&str]) -> Option<String> {
-        let output = std::process::Command::new(program).args(args).output().ok()?;
-        if !output.status.success() {
-            return None;
+pub async fn pick_upload_folder() -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(|| {
+        fn try_dialog(program: &str, args: &[&str]) -> Option<String> {
+            let output = std::process::Command::new(program).args(args).output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
         }
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    }
 
-    #[cfg(target_os = "windows")]
-    let picked = try_dialog(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Choose game folder'; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }",
-        ],
-    );
+        #[cfg(target_os = "windows")]
+        let picked = try_dialog(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Choose game folder'; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }",
+            ],
+        );
 
-    #[cfg(not(target_os = "windows"))]
-    let picked = try_dialog(
-        "zenity",
-        &["--file-selection", "--directory", "--title=Choose game folder"],
-    )
-    .or_else(|| try_dialog("kdialog", &["--getexistingdirectory", "/home"]))
-    .or_else(|| try_dialog("yad", &["--file-selection", "--directory", "--title=Choose game folder"]));
+        #[cfg(not(target_os = "windows"))]
+        let picked = try_dialog(
+            "zenity",
+            &["--file-selection", "--directory", "--title=Choose game folder"],
+        )
+        .or_else(|| try_dialog("kdialog", &["--getexistingdirectory", "/home"]))
+        .or_else(|| {
+            try_dialog(
+                "yad",
+                &["--file-selection", "--directory", "--title=Choose game folder"],
+            )
+        });
 
-    Ok(picked)
+        picked
+    })
+    .await
+    .map_err(|e| format!("folder dialog failed: {e}"))
 }
 
 fn collect_upload_files(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, u64)>) {
@@ -910,7 +947,7 @@ pub async fn start_game_upload(
 
 #[tauri::command(rename_all = "snake_case")]
 #[allow(clippy::too_many_arguments)]
-pub fn upload_game_chunk(
+pub async fn upload_game_chunk(
     state: State<'_, AppState>,
     job_id: String,
     rel_path: String,
@@ -920,17 +957,20 @@ pub fn upload_game_chunk(
     chunk: Option<Vec<u8>>,
     chunk_base64: Option<String>,
 ) -> Result<bool, String> {
-    let bytes = if let Some(b64) = chunk_base64 {
-        BASE64
-            .decode(b64.trim())
-            .map_err(|e| format!("invalid chunk base64: {e}"))?
-    } else {
-        chunk.unwrap_or_default()
-    };
-    state
-        .core
-        .stage_upload_chunk(&job_id, &rel_path, index, total, size, &bytes)
-        .map_err(err_str)
+    let core = Arc::clone(&state.core);
+    tokio::task::spawn_blocking(move || {
+        let bytes = if let Some(b64) = chunk_base64 {
+            BASE64
+                .decode(b64.trim())
+                .map_err(|e| format!("invalid chunk base64: {e}"))?
+        } else {
+            chunk.unwrap_or_default()
+        };
+        core.stage_upload_chunk(&job_id, &rel_path, index, total, size, &bytes)
+            .map_err(err_str)
+    })
+    .await
+    .map_err(|e| format!("upload_game_chunk task failed: {e}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -1012,8 +1052,11 @@ pub async fn resolve_interrupted_session(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn get_shutdown_status(state: State<'_, AppState>) -> Result<ShutdownStatusDto, String> {
-    Ok(state.core.shutdown_status())
+pub async fn get_shutdown_status(state: State<'_, AppState>) -> Result<ShutdownStatusDto, String> {
+    let core = Arc::clone(&state.core);
+    tokio::task::spawn_blocking(move || Ok(core.shutdown_status()))
+        .await
+        .map_err(|e| format!("shutdown status failed: {e}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]

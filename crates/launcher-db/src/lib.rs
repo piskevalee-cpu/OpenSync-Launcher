@@ -780,6 +780,36 @@ impl LauncherDb {
         })
     }
 
+    pub fn playtime_summaries_for_profile(
+        &self,
+        profile_id: &str,
+    ) -> DbResult<HashMap<i64, PlaytimeSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT game_id, COALESCE(SUM(duration_secs), 0), COUNT(*), MAX(ended_at) FROM play_sessions WHERE profile_id = ?1 GROUP BY game_id",
+        )?;
+        let rows = stmt.query_map(params![profile_id], |r| {
+            let gid: i64 = r.get(0)?;
+            let total: i64 = r.get(1)?;
+            let count: i64 = r.get(2)?;
+            let last: Option<String> = r.get(3)?;
+            Ok((
+                gid,
+                PlaytimeSummary {
+                    total_secs: total.max(0) as u64,
+                    session_count: count.max(0) as u64,
+                    last_played_at: last.as_deref().map(parse_dt),
+                },
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (gid, summary) = row?;
+            map.insert(gid, summary);
+        }
+        Ok(map)
+    }
+
     pub fn queue_pending_sync(
         &self,
         profile_id: &str,

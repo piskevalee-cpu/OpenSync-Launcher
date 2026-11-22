@@ -383,6 +383,8 @@ pub struct LauncherCore {
     /// (profile_id, game_id) pairs with a live game session. Background sync and offline
     /// queue flushing must never touch these games' save folders mid-session.
     playing_games: Mutex<HashSet<(String, i64)>>,
+    /// (profile_id, game_id) pairs currently being uninstalled.
+    uninstalling_games: Mutex<HashSet<(String, i64)>>,
     /// Tracks interrupted sessions already logged during this process run.
     notified_interrupted: Mutex<HashSet<(String, i64)>>,
     /// Number of save sync operations currently in flight.
@@ -410,6 +412,7 @@ impl LauncherCore {
             bandwidth_limit: AtomicU64::new(0),
             next_job_seq: AtomicU64::new(1),
             playing_games: Mutex::new(HashSet::new()),
+            uninstalling_games: Mutex::new(HashSet::new()),
             notified_interrupted: Mutex::new(HashSet::new()),
             active_syncs: Arc::new(AtomicUsize::new(0)),
             sync_idle_notify: Arc::new(Notify::new()),
@@ -1991,7 +1994,15 @@ impl LauncherCore {
         // games directory and register the install so it is immediately playable.
         let detail = client.get_game(game_id).await?;
         let target_dir = self.games_dir().join(profile_id).join(&detail.game.slug);
-        if let Err(err) = move_game_into_install_dir(source_root, &target_dir, staged_source) {
+        let src_for_move = source_root.to_path_buf();
+        let dst_for_move = target_dir.clone();
+        let move_res = tokio::task::spawn_blocking(move || {
+            move_game_into_install_dir(&src_for_move, &dst_for_move, staged_source)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("move task panicked: {e}")))
+        .and_then(|inner| inner);
+        if let Err(err) = move_res {
             // A failed move must never delete the original (non-staged) user folder; the
             // install record still points at the target so the user can retry later.
             let _ = self.record_activity(
@@ -2203,6 +2214,26 @@ impl LauncherCore {
             .active_profile()
             .await
             .ok_or(CoreError::NoActiveProfile)?;
+        struct UninstallGuard<'a> {
+            set: &'a Mutex<HashSet<(String, i64)>>,
+            key: (String, i64),
+        }
+        impl Drop for UninstallGuard<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut guard) = self.set.lock() {
+                    guard.remove(&self.key);
+                }
+            }
+        }
+        let uninstall_key = (profile.id.clone(), game_id);
+        {
+            let mut guard = self.uninstalling_games.lock().unwrap();
+            guard.insert(uninstall_key.clone());
+        }
+        let _uninstall_guard = UninstallGuard {
+            set: &self.uninstalling_games,
+            key: uninstall_key,
+        };
         let installed = self
             .db
             .get_installed_game(&profile.id, game_id)?
@@ -2486,7 +2517,13 @@ impl LauncherCore {
             if self.is_shutting_down() {
                 break;
             }
-            if self.is_game_playing(&profile.id, game.game_id) {
+            if self.is_game_playing(&profile.id, game.game_id)
+                || self
+                    .uninstalling_games
+                    .lock()
+                    .map(|g| g.contains(&(profile.id.clone(), game.game_id)))
+                    .unwrap_or(false)
+            {
                 continue;
             }
             let _sync_guard = self.begin_sync_activity();

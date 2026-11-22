@@ -314,6 +314,7 @@ export function createGamepadController(hooks) {
   function renderBar() {
     if (!barEl) return;
     const shouldShow = Boolean(connectedPadName) || inputMode === 'gamepad' || inputMode === 'keyboard';
+    if (!shouldShow && barEl.hidden) return;
     barEl.hidden = !shouldShow;
     document.body.classList.toggle('has-gamepad-bar', shouldShow);
     if (!shouldShow) return;
@@ -428,7 +429,18 @@ export function createGamepadController(hooks) {
       renderBar();
     }
 
+    if (!activePad && !connectedPadName) {
+      rafId = null;
+      return;
+    }
+
     rafId = window.requestAnimationFrame(pollGamepads);
+  }
+
+  function ensurePollLoop() {
+    if (rafId == null) {
+      rafId = window.requestAnimationFrame(pollGamepads);
+    }
   }
 
   // Pointer usage relaxes visual focus ring unless a controller stays connected
@@ -509,6 +521,7 @@ export function createGamepadController(hooks) {
     connectedPadName = e.gamepad?.id || 'Controller';
     setInputMode('gamepad');
     ensureFocus();
+    ensurePollLoop();
     hooks.onGamepadConnected?.(connectedPadName);
   });
 
@@ -518,12 +531,24 @@ export function createGamepadController(hooks) {
     connectedPadName = stillConnected ? (stillConnected.id || 'Controller') : null;
     if (!connectedPadName) {
       setInputMode('pointer');
+      if (rafId != null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
     } else {
       renderBar();
     }
   });
 
-  rafId = window.requestAnimationFrame(pollGamepads);
+  // Start the 60fps gamepad polling loop only when a controller is already connected.
+  try {
+    const initialPads = navigator.getGamepads ? navigator.getGamepads() : [];
+    if ([...initialPads].some((p) => p && p.connected)) {
+      ensurePollLoop();
+    }
+  } catch {
+    // ignore
+  }
 
   return {
     focusElement(el) {
