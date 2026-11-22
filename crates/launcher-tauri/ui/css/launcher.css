@@ -627,7 +627,7 @@ button:hover:not(:disabled),
   background: var(--tonal-hover);
   border-color: var(--border-bright);
   color: var(--fg);
-  transform: translateY(var(--lift));
+  transform: none;
 }
 
 button:disabled,
@@ -652,8 +652,8 @@ button:disabled,
   background: var(--primary-fill-hover);
   border-color: var(--primary-fill-hover);
   color: var(--primary-ink);
-  transform: translateY(var(--lift));
-  box-shadow: 0 8px 24px rgba(244, 246, 250, 0.16);
+  transform: none;
+  box-shadow: 0 8px 24px rgba(244, 246, 250, 0.14);
 }
 
 .btn-playing {
@@ -2365,15 +2365,15 @@ body.has-gamepad-bar .toast-stack {
 }
 
 .css-select.is-open .css-select-trigger {
-  border-color: var(--accent);
-  background: var(--elevated);
+  border-color: var(--border-bright);
+  background: var(--tonal-hover);
   color: var(--fg);
 }
 
 .css-select-trigger:focus-visible {
-  outline: 1px solid var(--accent);
+  outline: 1px solid rgba(255, 255, 255, 0.24);
   outline-offset: 0;
-  border-color: var(--accent);
+  border-color: var(--border-bright);
   box-shadow: none;
 }
 
@@ -2410,8 +2410,8 @@ body.has-gamepad-bar .toast-stack {
 
 .css-select.is-open .css-select-chevron {
   transform: rotate(180deg);
-  color: var(--accent);
-  background: var(--accent-dim);
+  color: var(--fg);
+  background: var(--tonal-hover);
 }
 
 .css-select-menu {
