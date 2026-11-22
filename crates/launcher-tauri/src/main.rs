@@ -45,6 +45,20 @@ fn resolve_data_root() -> PathBuf {
     PathBuf::from("./opensync-launcher-data")
 }
 
+#[derive(Clone, serde::Serialize)]
+struct DragDropPayload {
+    kind: &'static str,
+    paths: Vec<String>,
+    x: f64,
+    y: f64,
+}
+
+fn emit_drag_drop(window: &tauri::Window, payload: DragDropPayload) {
+    if let Err(err) = window.emit("launcher-drag-drop", payload) {
+        tracing::warn!(error = %err, "failed to emit launcher-drag-drop");
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -136,8 +150,8 @@ fn main() {
 
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 let state = window.state::<AppState>();
                 if state
                     .allow_window_close
@@ -156,6 +170,52 @@ fn main() {
                     state.core.request_shutdown_check();
                 }
             }
+            tauri::WindowEvent::DragDrop(ev) => match ev {
+                tauri::DragDropEvent::Enter { paths, position } => emit_drag_drop(
+                    window,
+                    DragDropPayload {
+                        kind: "enter",
+                        paths: paths
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect(),
+                        x: position.x,
+                        y: position.y,
+                    },
+                ),
+                tauri::DragDropEvent::Over { position } => emit_drag_drop(
+                    window,
+                    DragDropPayload {
+                        kind: "over",
+                        paths: Vec::new(),
+                        x: position.x,
+                        y: position.y,
+                    },
+                ),
+                tauri::DragDropEvent::Drop { paths, position } => emit_drag_drop(
+                    window,
+                    DragDropPayload {
+                        kind: "drop",
+                        paths: paths
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect(),
+                        x: position.x,
+                        y: position.y,
+                    },
+                ),
+                tauri::DragDropEvent::Leave => emit_drag_drop(
+                    window,
+                    DragDropPayload {
+                        kind: "leave",
+                        paths: Vec::new(),
+                        x: 0.0,
+                        y: 0.0,
+                    },
+                ),
+                _ => {}
+            },
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
@@ -190,6 +250,8 @@ fn main() {
             commands::change_username,
             commands::pick_upload_folder,
             commands::scan_upload_folder,
+            commands::inspect_dropped_paths,
+            commands::read_local_image,
             commands::start_game_upload,
             commands::upload_game_chunk,
             commands::finalize_dropped_upload,

@@ -1251,6 +1251,27 @@ function createMockRuntime() {
           };
         }
 
+        case 'inspect_dropped_paths': {
+          const paths = Array.isArray(args.paths) ? args.paths : [];
+          return paths.map((raw) => {
+            const p = String(raw || '').trim();
+            const name = p.replace(/\/+$/, '').split(/[\\/]/).pop() || p;
+            const is_image = /\.(jpe?g|png)$/i.test(name);
+            const hasFileExt = /\.[a-z0-9]{1,8}$/i.test(name);
+            return {
+              path: p,
+              name,
+              is_dir: !is_image && !hasFileExt,
+              is_image,
+              size: is_image ? 2048 : 0,
+            };
+          });
+        }
+
+        case 'read_local_image': {
+          throw new Error('Local filesystem image paths require desktop runtime');
+        }
+
         case 'start_game_upload': {
           if (!currentUser) throw new Error('Not connected to an instance');
           const name = String(args.name || '').trim();
@@ -1523,6 +1544,15 @@ export async function listenEvents(handler) {
   return mock.listen(handler);
 }
 
+export async function listenDragDrop(handler) {
+  if (isTauri && window.__TAURI__.event?.listen) {
+    return window.__TAURI__.event.listen('launcher-drag-drop', (e) => {
+      handler(e.payload);
+    });
+  }
+  return () => {};
+}
+
 export const bridge = {
   getBootstrapState: () => invokeCmd('get_bootstrap_state'),
   getGamesDir: () => invokeCmd('get_games_dir'),
@@ -1564,6 +1594,8 @@ export const bridge = {
   changeUsername: (username) => invokeCmd('change_username', { username }),
   pickUploadFolder: () => invokeCmd('pick_upload_folder'),
   scanUploadFolder: (path) => invokeCmd('scan_upload_folder', { path }),
+  inspectDroppedPaths: (paths) => invokeCmd('inspect_dropped_paths', { paths }),
+  readLocalImage: (path) => invokeCmd('read_local_image', { path }),
   startGameUpload: ({ name, description, system_requirements, folder, cover, cover_content_type }) =>
     invokeCmd('start_game_upload', {
       name,
@@ -1573,8 +1605,8 @@ export const bridge = {
       cover,
       cover_content_type,
     }),
-  uploadGameChunk: ({ job_id, rel_path, index, total, size, chunk }) =>
-    invokeCmd('upload_game_chunk', { job_id, rel_path, index, total, size, chunk }),
+  uploadGameChunk: ({ job_id, rel_path, index, total, size, chunk = null, chunk_base64 = null }) =>
+    invokeCmd('upload_game_chunk', { job_id, rel_path, index, total, size, chunk, chunk_base64 }),
   finalizeDroppedUpload: (job_id) => invokeCmd('finalize_dropped_upload', { job_id }),
   pauseUpload: (job_id) => invokeCmd('pause_upload', { job_id }),
   resumeUpload: (job_id) => invokeCmd('resume_upload', { job_id }),

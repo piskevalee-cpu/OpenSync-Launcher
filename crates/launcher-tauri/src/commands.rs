@@ -65,6 +65,23 @@ pub struct FolderScanDto {
     pub top_files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DroppedPathDto {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub is_image: bool,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalImageDto {
+    pub base64: String,
+    pub content_type: String,
+    pub data_url: String,
+    pub name: String,
+}
+
 /// Avatar bytes from the webview: either a base64 string (with or without a data-URL
 /// prefix) or a JSON byte array. Both are accepted so a file input/drop just works.
 #[derive(Debug, Deserialize)]
@@ -741,31 +758,116 @@ fn collect_upload_files(dir: &std::path::Path, root: &std::path::Path, out: &mut
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn scan_upload_folder(path: String) -> Result<FolderScanDto, String> {
-    let raw = path.trim();
+pub async fn scan_upload_folder(path: String) -> Result<FolderScanDto, String> {
+    let raw = path.trim().to_string();
     if raw.is_empty() {
         return Err("Folder path is empty".to_string());
     }
-    let root = expand_home(raw);
-    let mut files: Vec<(String, u64)> = Vec::new();
-    collect_upload_files(&root, &root, &mut files);
-    files.sort_by(|a, b| b.1.cmp(&a.1));
-    let total_bytes = files.iter().map(|(_, size)| *size).sum();
-    let top_files = files
-        .iter()
-        .take(8)
-        .map(|(rel, _)| rel.clone())
-        .collect();
-    let name = root
-        .file_name()
-        .map(|n| n.to_string_lossy().replace('_', " "))
-        .unwrap_or_else(|| "Game".to_string());
-    Ok(FolderScanDto {
-        file_count: files.len(),
-        total_bytes,
-        name,
-        top_files,
+    tokio::task::spawn_blocking(move || {
+        let root = expand_home(&raw);
+        let mut files: Vec<(String, u64)> = Vec::new();
+        collect_upload_files(&root, &root, &mut files);
+        files.sort_by(|a, b| b.1.cmp(&a.1));
+        let total_bytes = files.iter().map(|(_, size)| *size).sum();
+        let top_files = files
+            .iter()
+            .take(8)
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().replace('_', " "))
+            .unwrap_or_else(|| "Game".to_string());
+        Ok(FolderScanDto {
+            file_count: files.len(),
+            total_bytes,
+            name,
+            top_files,
+        })
     })
+    .await
+    .map_err(|e| format!("folder scan task failed: {e}"))?
+}
+
+fn is_supported_image_ext(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png"))
+        .unwrap_or(false)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn inspect_dropped_paths(paths: Vec<String>) -> Result<Vec<DroppedPathDto>, String> {
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::with_capacity(paths.len());
+        for raw in paths {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let p = expand_home(trimmed);
+            let Ok(meta) = std::fs::metadata(&p) else {
+                continue;
+            };
+            let is_dir = meta.is_dir();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.to_string_lossy().into_owned());
+            let is_image = !is_dir && is_supported_image_ext(&p);
+            out.push(DroppedPathDto {
+                path: p.to_string_lossy().into_owned(),
+                name,
+                is_dir,
+                is_image,
+                size: if is_dir { 0 } else { meta.len() },
+            });
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("inspect dropped paths failed: {e}"))?
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn read_local_image(path: String) -> Result<LocalImageDto, String> {
+    const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+    let raw = path.trim().to_string();
+    if raw.is_empty() {
+        return Err("Image path is empty".to_string());
+    }
+    tokio::task::spawn_blocking(move || {
+        let p = expand_home(&raw);
+        let meta = std::fs::metadata(&p).map_err(|e| format!("cannot access image: {e}"))?;
+        if !meta.is_file() {
+            return Err("Dropped item is not an image file".to_string());
+        }
+        if meta.len() == 0 || meta.len() > MAX_IMAGE_BYTES {
+            return Err("Image must be between 1 byte and 8 MB".to_string());
+        }
+        let bytes = std::fs::read(&p).map_err(|e| format!("failed to read image: {e}"))?;
+        let content_type = if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+            "image/png"
+        } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            "image/jpeg"
+        } else {
+            return Err("Only JPG and PNG images are supported".to_string());
+        };
+        let encoded = BASE64.encode(&bytes);
+        let data_url = format!("data:{content_type};base64,{encoded}");
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "image".to_string());
+        Ok(LocalImageDto {
+            base64: encoded,
+            content_type: content_type.to_string(),
+            data_url,
+            name,
+        })
+    })
+    .await
+    .map_err(|e| format!("read local image failed: {e}"))?
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -807,6 +909,7 @@ pub async fn start_game_upload(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+#[allow(clippy::too_many_arguments)]
 pub fn upload_game_chunk(
     state: State<'_, AppState>,
     job_id: String,
@@ -814,11 +917,19 @@ pub fn upload_game_chunk(
     index: usize,
     total: usize,
     size: u64,
-    chunk: Vec<u8>,
+    chunk: Option<Vec<u8>>,
+    chunk_base64: Option<String>,
 ) -> Result<bool, String> {
+    let bytes = if let Some(b64) = chunk_base64 {
+        BASE64
+            .decode(b64.trim())
+            .map_err(|e| format!("invalid chunk base64: {e}"))?
+    } else {
+        chunk.unwrap_or_default()
+    };
     state
         .core
-        .stage_upload_chunk(&job_id, &rel_path, index, total, size, &chunk)
+        .stage_upload_chunk(&job_id, &rel_path, index, total, size, &bytes)
         .map_err(err_str)
 }
 

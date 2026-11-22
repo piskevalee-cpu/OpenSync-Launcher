@@ -1,4 +1,4 @@
-import { bridge, listenEvents } from './bridge.js';
+import { bridge, listenDragDrop, listenEvents } from './bridge.js';
 import { createGamepadController } from './gamepad.js';
 import { icon } from './icons.js';
 import { WaveformCanvas } from './waveform.js';
@@ -296,6 +296,7 @@ const state = {
 
 const activeWaveforms = new Map(); // job_id -> WaveformCanvas
 const activeUploadWaveforms = new Map(); // job_id -> WaveformCanvas
+let activeUploadViewApi = null; // live handlers bound by renderUploadView()
 
 // Teardown handle for the first-run auth particle field. It is only alive while
 // the auth screen is mounted and is always disposed when leaving it.
@@ -1253,6 +1254,26 @@ function destroyUploadWaveforms() {
   activeUploadWaveforms.clear();
 }
 
+function updateUploadStatusPill() {
+  const runningUploads = activeUploads();
+  const pill = document.getElementById('btn-upload-pill');
+  if (!runningUploads.length) {
+    if (pill) renderStatusStrip();
+    return;
+  }
+  if (!pill) {
+    renderStatusStrip();
+    return;
+  }
+  const job = runningUploads[0];
+  const pct = job.total_bytes > 0 ? Math.min(100, Math.round((job.bytes_uploaded / job.total_bytes) * 100)) : 0;
+  pill.classList.toggle('is-paused', job.stage === 'paused');
+  const span = pill.querySelector('span');
+  if (span) {
+    span.textContent = runningUploads.length > 1 ? `${runningUploads.length} uploads` : `Uploading ${pct}%`;
+  }
+}
+
 function navigate(nextView, opts = {}) {
   closeCssSelect();
   teardownAuthParticles();
@@ -1274,6 +1295,9 @@ function renderCurrentView(animate = false) {
   }
   if (state.view !== 'downloads') {
     destroyWaveforms();
+  }
+  if (state.view !== 'upload') {
+    activeUploadViewApi = null;
   }
   viewEl.classList.remove('view-switch');
 
@@ -2436,6 +2460,7 @@ function defaultUploadForm() {
     description: '',
     requirements: { os: '', cpu: '', ram: '', gpu: '', storage: '' },
     folderPath: '',
+    folderScan: null,
     files: [],
     coverDataUrl: '',
     coverBase64: '',
@@ -2487,7 +2512,13 @@ function renderUploadView() {
         <div class="folder-dropzone${form.files.length || form.folderPath ? ' has-files' : ''}" id="up-folder-zone" role="button" tabindex="0">
           <div class="folder-dropzone-icon">${icon('folder', 22)}</div>
           <div class="folder-dropzone-title">${form.folderPath || form.files.length ? 'Game folder selected' : 'Drop a game folder here, or choose one'}</div>
-          <div class="small muted" id="up-folder-summary">${form.folderPath ? esc(form.folderPath) : 'Preserves folder structure with resumable 4 MB chunked uploads'}</div>
+          <div class="small muted" id="up-folder-summary">${
+            form.folderPath
+              ? (form.folderScan
+                ? `${form.folderScan.file_count} files · ${esc(humanBytes(form.folderScan.total_bytes))}`
+                : esc(form.folderPath))
+              : 'Preserves folder structure with resumable 4 MB chunked uploads'
+          }</div>
           <div class="upload-preview-list" id="up-preview-list" ${form.folderPath || form.files.length ? '' : 'hidden'}></div>
         </div>
         <div class="upload-path-row">
@@ -2591,22 +2622,29 @@ function renderUploadView() {
   }
   renderFolderPreview();
 
+  let scanSeq = 0;
   function setFolderPath(path) {
     form.folderPath = String(path || '').trim();
+    form.folderScan = null;
     form.files = [];
     pathInput.value = form.folderPath;
     zone.querySelector('.folder-dropzone-title').textContent = form.folderPath ? 'Game folder selected' : 'Drop a game folder here, or choose one';
+    const seq = ++scanSeq;
     if (form.folderPath) {
       summary.textContent = 'Scanning folder…';
       bridge.scanUploadFolder?.(form.folderPath)
         .then((scan) => {
-          summary.textContent = `${scan.file_count} files · ${esc(humanBytes(scan.total_bytes))}`;
+          if (seq !== scanSeq) return;
+          form.folderScan = scan;
+          if (!summary.isConnected) return;
+          summary.textContent = `${scan.file_count} files · ${humanBytes(scan.total_bytes)}`;
           if (!form.name && scan.name) {
             form.name = scan.name;
             nameInput.value = form.name;
           }
         })
         .catch(() => {
+          if (seq !== scanSeq || !summary.isConnected) return;
           summary.textContent = form.folderPath;
         });
     } else {
@@ -2614,6 +2652,20 @@ function renderUploadView() {
     }
     renderFolderPreview();
   }
+
+  activeUploadViewApi = {
+    setFolderPath,
+    applyNativeCover(img) {
+      if (!img) return;
+      form.coverDataUrl = img.data_url;
+      form.coverBase64 = img.base64;
+      form.coverContentType = img.content_type;
+      if (state.view === 'upload') {
+        renderUploadView();
+        document.getElementById('up-name')?.focus();
+      }
+    },
+  };
 
   document.getElementById('up-folder-browse')?.addEventListener('click', async () => {
     try {
@@ -2626,7 +2678,9 @@ function renderUploadView() {
   document.getElementById('up-folder-browser')?.addEventListener('click', () => folderInput.click());
 
   document.getElementById('up-folder-clear')?.addEventListener('click', () => {
+    scanSeq += 1;
     form.folderPath = '';
+    form.folderScan = null;
     form.files = [];
     pathInput.value = '';
     summary.textContent = 'Preserves folder structure with resumable 4 MB chunked uploads';
@@ -2674,9 +2728,10 @@ function renderUploadView() {
   function applyDroppedFiles(files) {
     form.files = files;
     form.folderPath = '';
+    form.folderScan = null;
     pathInput.value = '';
     zone.querySelector('.folder-dropzone-title').textContent = 'Game folder selected';
-    summary.textContent = `${files.length} files · ${esc(humanBytes(files.reduce((s, f) => s + (f.size || 0), 0)))}`;
+    summary.textContent = `${files.length} files · ${humanBytes(files.reduce((s, f) => s + (f.size || 0), 0))}`;
     if (!form.name) {
       form.name = inferUploadName(files);
       nameInput.value = form.name;
@@ -2709,8 +2764,10 @@ function renderUploadView() {
       form.coverDataUrl = text;
       form.coverBase64 = comma >= 0 ? text.slice(comma + 1) : text;
       form.coverContentType = file.type;
-      renderUploadView();
-      document.getElementById('up-name')?.focus();
+      if (state.view === 'upload') {
+        renderUploadView();
+        document.getElementById('up-name')?.focus();
+      }
     };
     reader.readAsDataURL(file);
   }
@@ -2759,19 +2816,19 @@ function renderUploadView() {
   // Start
   document.getElementById('up-start')?.addEventListener('click', async () => {
     const errEl = document.getElementById('up-error');
-    errEl.textContent = '';
+    if (errEl) errEl.textContent = '';
     const name = String(form.name || '').trim();
     if (!name) {
-      errEl.textContent = 'Game name is required.';
+      if (errEl) errEl.textContent = 'Game name is required.';
       document.getElementById('up-name')?.focus();
       return;
     }
     if (!form.folderPath && !form.files.length) {
-      errEl.textContent = 'Choose a game folder or drop files first.';
+      if (errEl) errEl.textContent = 'Choose a game folder or drop files first.';
       return;
     }
     const btn = document.getElementById('up-start');
-    btn.disabled = true;
+    if (btn) btn.disabled = true;
     try {
       const jobId = await bridge.startGameUpload({
         name,
@@ -2781,16 +2838,46 @@ function renderUploadView() {
         cover: form.coverBase64 || null,
         cover_content_type: form.coverContentType || null,
       });
+      if (!state.uploads.some((j) => j.job_id === jobId)) {
+        upsertUploadInState({
+          job_id: jobId,
+          name,
+          game_id: null,
+          stage: 'queued',
+          error: null,
+          bytes_uploaded: 0,
+          total_bytes: Number(form.folderScan?.total_bytes || 0),
+          files_uploaded: 0,
+          total_files: Number(form.folderScan?.file_count || form.files.length || 0),
+          current_file: null,
+          bytes_per_sec: 0,
+          speed_samples: [],
+          eta_secs: null,
+        });
+      }
+      renderStatusStrip();
+      const progressPanel = document.getElementById('up-progress-panel');
+      const formPanel = document.getElementById('up-form-panel');
+      if (progressPanel) progressPanel.hidden = false;
+      if (formPanel) formPanel.hidden = true;
+      updateUploadPanelForJob(jobId);
+      showToast(`Uploading ${name}`, 'accent', 'arrow-down');
       if (!form.folderPath && form.files.length) {
         await uploadDroppedChunks(jobId, form.files);
       }
-      document.getElementById('up-progress-panel').hidden = false;
-      document.getElementById('up-form-panel').hidden = true;
-      updateUploadPanelForJob(jobId);
-      showToast(`Uploading ${name}`, 'accent', 'arrow-down');
     } catch (err) {
-      errEl.textContent = String(err?.message || err);
-      btn.disabled = false;
+      const msg = String(err?.message || err);
+      const liveErr = document.getElementById('up-error');
+      const liveBtn = document.getElementById('up-start');
+      const liveProgress = document.getElementById('up-progress-panel');
+      const liveForm = document.getElementById('up-form-panel');
+      if (liveForm && liveProgress && !liveProgress.hidden) {
+        liveProgress.hidden = true;
+        liveForm.hidden = false;
+      }
+      if (liveErr) liveErr.textContent = msg;
+      else showToast(msg, 'danger', 'alert-triangle');
+      if (liveBtn) liveBtn.disabled = false;
     }
   });
 
@@ -2837,11 +2924,24 @@ async function collectDroppedFiles(dataTransfer) {
   return out;
 }
 
+function bytesToBase64(bytes) {
+  let binary = '';
+  const sliceSize = 0x4000;
+  for (let offset = 0; offset < bytes.length; offset += sliceSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(offset, offset + sliceSize));
+  }
+  return btoa(binary);
+}
+
 async function uploadDroppedChunks(jobId, files) {
   for (const file of files) {
     const rel = file.webkitRelativePath || file.name;
     const total = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK_SIZE));
     for (let i = 0; i < total; i++) {
+      const curJob = state.uploads.find((j) => j.job_id === jobId);
+      if (curJob && (curJob.stage === 'cancelled' || curJob.stage === 'failed')) {
+        return;
+      }
       const start = i * UPLOAD_CHUNK_SIZE;
       const end = Math.min(file.size, start + UPLOAD_CHUNK_SIZE);
       const chunk = new Uint8Array(await file.slice(start, end).arrayBuffer());
@@ -2851,7 +2951,7 @@ async function uploadDroppedChunks(jobId, files) {
         index: i,
         total,
         size: file.size,
-        chunk: Array.from(chunk),
+        chunk_base64: bytesToBase64(chunk),
       });
     }
   }
@@ -2894,22 +2994,36 @@ function updateUploadPanelForJob(jobId) {
     const canPause = job.stage === 'uploading' || job.stage === 'queued' || job.stage === 'indexing';
     const canResume = job.stage === 'paused';
     const canCancel = ['queued', 'uploading', 'paused', 'indexing'].includes(job.stage);
-    const mode = `${canPause}|${canResume}|${canCancel}|${job.stage}`;
+    const canRetry = job.stage === 'failed';
+    const mode = `${canPause}|${canResume}|${canCancel}|${canRetry}|${job.stage}`;
     if (controls.dataset.mode !== mode) {
       controls.dataset.mode = mode;
       controls.innerHTML = `
         ${canPause ? `<button type="button" class="btn btn-sm" id="up-pause">${icon('pause', 14)}<span>Pause</span></button>` : ''}
         ${canResume ? `<button type="button" class="btn btn-sm btn-primary" id="up-resume">${icon('play', 14)}<span>Resume</span></button>` : ''}
         ${canCancel ? `<button type="button" class="btn btn-sm btn-danger" id="up-cancel">${icon('x', 14)}<span>Cancel</span></button>` : ''}
+        ${canRetry ? `<button type="button" class="btn btn-sm" id="up-reset-failed">${icon('arrow-left', 14)}<span>Back to form</span></button>` : ''}
       `;
       document.getElementById('up-pause')?.addEventListener('click', () => bridge.pauseUpload(job.job_id));
       document.getElementById('up-resume')?.addEventListener('click', () => bridge.resumeUpload(job.job_id));
       document.getElementById('up-cancel')?.addEventListener('click', () => handleCancelUpload(job.job_id));
+      document.getElementById('up-reset-failed')?.addEventListener('click', () => {
+        for (const wf of activeUploadWaveforms.values()) wf.destroy();
+        activeUploadWaveforms.clear();
+        state.uploads = state.uploads.filter((j) => j.job_id !== job.job_id);
+        renderStatusStrip();
+        if (state.view === 'upload') renderUploadView();
+      });
     }
   }
 
   let wf = activeUploadWaveforms.get(job.job_id);
   const canvas = document.getElementById('up-waveform');
+  if (wf && canvas && wf.canvas !== canvas) {
+    wf.destroy();
+    activeUploadWaveforms.delete(job.job_id);
+    wf = null;
+  }
   if (canvas && !wf) {
     wf = new WaveformCanvas(canvas, job.speed_samples || [], job.stage === 'paused');
     activeUploadWaveforms.set(job.job_id, wf);
@@ -2936,9 +3050,13 @@ function upsertUploadInState(job) {
   if (!job || !job.job_id) return null;
   const idx = state.uploads.findIndex((j) => j.job_id === job.job_id);
   const prev = idx !== -1 ? state.uploads[idx].stage : null;
-  if (job.stage === 'cancelled') state.uploads.splice(idx, 1);
-  else if (idx !== -1) state.uploads[idx] = job;
-  else state.uploads.unshift(job);
+  if (job.stage === 'cancelled') {
+    if (idx !== -1) state.uploads.splice(idx, 1);
+  } else if (idx !== -1) {
+    state.uploads[idx] = job;
+  } else {
+    state.uploads.unshift(job);
+  }
   return prev;
 }
 
@@ -4191,7 +4309,11 @@ function handleLauncherEvent(evt) {
       const job = normalizeUploadJob(evt.job);
       if (!job) break;
       const prevStage = upsertUploadInState(job);
-      renderStatusStrip();
+      if (prevStage === job.stage && job.stage !== 'ready' && job.stage !== 'failed' && job.stage !== 'cancelled') {
+        updateUploadStatusPill();
+      } else {
+        renderStatusStrip();
+      }
 
       if (job.stage === 'ready' && prevStage !== 'ready') {
         for (const wf of activeUploadWaveforms.values()) wf.destroy();
@@ -4201,21 +4323,26 @@ function handleLauncherEvent(evt) {
         if (uploadedGameId != null) cardDomCache.delete(uploadedGameId);
         // The backend moves the uploaded folder into the OpenSync games
         // directory and reports it installed, so refetch before rendering.
-        Promise.all([refreshLibrary(), refreshDownloads()]).then(() => {
-          if (uploadedGameId != null) cardDomCache.delete(uploadedGameId);
-          const installedGame = state.library.find(
-            (g) => g.game_id === uploadedGameId && g.installed,
-          );
-          showToast(
-            installedGame
-              ? `${job.name} is installed and ready to play`
-              : `${job.name} uploaded successfully`,
-            'accent',
-            installedGame ? 'play' : 'check',
-          );
-          if (uploadedGameId != null) navigate('game-detail', { gameId: uploadedGameId });
-          else renderCurrentView();
-        });
+        Promise.all([refreshLibrary(), refreshDownloads()])
+          .then(() => {
+            if (uploadedGameId != null) cardDomCache.delete(uploadedGameId);
+            const installedGame = state.library.find(
+              (g) => g.game_id === uploadedGameId && g.installed,
+            );
+            showToast(
+              installedGame
+                ? `${job.name} is installed and ready to play`
+                : `${job.name} uploaded successfully`,
+              'accent',
+              installedGame ? 'play' : 'check',
+            );
+            if (uploadedGameId != null) navigate('game-detail', { gameId: uploadedGameId });
+            else renderCurrentView();
+          })
+          .catch(() => {
+            showToast(`${job.name} uploaded successfully`, 'accent', 'check');
+            renderCurrentView();
+          });
         break;
       }
       if (job.stage === 'failed' && prevStage !== 'failed') {
@@ -4224,7 +4351,7 @@ function handleLauncherEvent(evt) {
       if (job.stage === 'cancelled' && prevStage !== 'cancelled') {
         showToast('Upload cancelled', 'warn', 'x');
       }
-      if (state.view === 'upload' && activeUploads().some((j) => j.job_id === job.job_id)) {
+      if (state.view === 'upload' && (activeUploads().some((j) => j.job_id === job.job_id) || job.stage === 'failed')) {
         updateUploadPanelForJob(job.job_id);
       }
       break;
@@ -4359,6 +4486,202 @@ function initGamepad() {
   });
 }
 
+// ---------- Native OS Drag-and-Drop (Tauri v2 WindowEvent::DragDrop) ----------
+
+function clearNativeDragHighlights() {
+  document.querySelectorAll('#up-folder-zone.drag-over, #up-cover-picker.drag-over, #profile-pfp-panel.drag-over')
+    .forEach((el) => el.classList.remove('drag-over'));
+}
+
+function hitTestNativeDropTarget(x, y) {
+  if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+  const selector = '#up-cover-picker, #up-folder-zone, #profile-pfp-panel';
+  const direct = document.elementFromPoint(x, y)?.closest(selector);
+  if (direct) return direct;
+  const dpr = window.devicePixelRatio || 1;
+  if (dpr !== 1) {
+    return document.elementFromPoint(x / dpr, y / dpr)?.closest(selector) || null;
+  }
+  return null;
+}
+
+async function handleNativeDragDrop(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  const kind = String(payload.kind || '').toLowerCase();
+
+  if (kind === 'leave') {
+    clearNativeDragHighlights();
+    return;
+  }
+
+  if (!state.activeProfile) {
+    clearNativeDragHighlights();
+    return;
+  }
+
+  if (kind === 'enter' || kind === 'over') {
+    clearNativeDragHighlights();
+    const target = hitTestNativeDropTarget(payload.x, payload.y);
+    if (target) {
+      if (target.id === 'up-folder-zone' || target.id === 'up-cover-picker') {
+        const formPanel = document.getElementById('up-form-panel');
+        if (formPanel && !formPanel.hidden) target.classList.add('drag-over');
+      } else {
+        target.classList.add('drag-over');
+      }
+      return;
+    }
+    if (state.view === 'upload') {
+      const formPanel = document.getElementById('up-form-panel');
+      if (formPanel && !formPanel.hidden) {
+        document.getElementById('up-folder-zone')?.classList.add('drag-over');
+      }
+    } else if (state.view === 'profile') {
+      document.getElementById('profile-pfp-panel')?.classList.add('drag-over');
+    }
+    return;
+  }
+
+  if (kind !== 'drop') return;
+  clearNativeDragHighlights();
+
+  const rawPaths = Array.isArray(payload.paths) ? payload.paths : [];
+  if (!rawPaths.length) return;
+
+  const target = hitTestNativeDropTarget(payload.x, payload.y);
+  let items = [];
+  try {
+    items = (await bridge.inspectDroppedPaths(rawPaths)) || [];
+  } catch (err) {
+    showToast(String(err?.message || err), 'danger', 'alert-triangle');
+    return;
+  }
+  if (!items.length) return;
+
+  const dir = items.find((i) => i.is_dir);
+  const img = items.find((i) => i.is_image);
+
+  // Profile view: dropping a JPG/PNG updates avatar directly; dropping a folder opens Upload.
+  if (state.view === 'profile') {
+    if (img) {
+      try {
+        const local = await bridge.readLocalImage(img.path);
+        await bridge.uploadProfilePfp(local.base64, local.content_type);
+        if (state.activeProfile && state.currentUser) {
+          invalidateUserPfp(state.activeProfile.id, state.currentUser.id);
+        }
+        state.profileDangerError = null;
+        await refreshAll();
+        showToast('Profile picture updated', 'accent', 'check');
+      } catch (err) {
+        const pfpErr = document.getElementById('pfp-error');
+        const msg = formatAuthError(err);
+        if (pfpErr) pfpErr.textContent = msg;
+        showToast(msg, 'danger', 'alert-triangle');
+      }
+      return;
+    }
+    if (dir) {
+      navigate('upload');
+      activeUploadViewApi?.setFolderPath(dir.path);
+      return;
+    }
+    showToast('Profile picture must be a JPG or PNG image.', 'warn', 'alert-triangle');
+    return;
+  }
+
+  // Upload view: handle cover drops, folder drops, or both.
+  if (state.view === 'upload') {
+    const formPanel = document.getElementById('up-form-panel');
+    if (formPanel && formPanel.hidden) {
+      showToast('Wait for the current upload to finish or cancel it first.', 'warn', 'alert-triangle');
+      return;
+    }
+    if (target?.id === 'up-cover-picker') {
+      if (img) {
+        try {
+          const local = await bridge.readLocalImage(img.path);
+          activeUploadViewApi?.applyNativeCover(local);
+          showToast(`Cover set from ${local.name}`, 'accent', 'check');
+        } catch (err) {
+          const errEl = document.getElementById('up-error');
+          const msg = String(err?.message || err);
+          if (errEl) errEl.textContent = msg;
+          showToast(msg, 'danger', 'alert-triangle');
+        }
+      } else {
+        showToast('Cover image must be a JPG or PNG image.', 'warn', 'alert-triangle');
+      }
+      return;
+    }
+
+    if (dir) {
+      activeUploadViewApi?.setFolderPath(dir.path);
+      if (img) {
+        try {
+          const local = await bridge.readLocalImage(img.path);
+          activeUploadViewApi?.applyNativeCover(local);
+        } catch {
+          // ignore cover read error if folder succeeded
+        }
+      }
+      return;
+    }
+
+    if (img) {
+      try {
+        const local = await bridge.readLocalImage(img.path);
+        activeUploadViewApi?.applyNativeCover(local);
+        showToast(`Cover set from ${local.name}`, 'accent', 'check');
+      } catch (err) {
+        const errEl = document.getElementById('up-error');
+        const msg = String(err?.message || err);
+        if (errEl) errEl.textContent = msg;
+        showToast(msg, 'danger', 'alert-triangle');
+      }
+      return;
+    }
+
+    showToast('Drop a game folder (not a single file) or a JPG/PNG cover image.', 'warn', 'alert-triangle');
+    return;
+  }
+
+  // Library / Downloads / Settings / Game detail: dropping a game folder or cover image jumps to Upload.
+  if (activeUploads().length > 0) {
+    showToast('An upload is already in progress.', 'warn', 'alert-triangle');
+    navigate('upload');
+    return;
+  }
+  if (dir) {
+    navigate('upload');
+    activeUploadViewApi?.setFolderPath(dir.path);
+    if (img) {
+      try {
+        const local = await bridge.readLocalImage(img.path);
+        activeUploadViewApi?.applyNativeCover(local);
+      } catch {
+        // ignore optional cover
+      }
+    }
+    showToast(`Selected folder: ${dir.name}`, 'accent', 'folder');
+    return;
+  }
+  if (img) {
+    try {
+      const local = await bridge.readLocalImage(img.path);
+      navigate('upload');
+      activeUploadViewApi?.applyNativeCover(local);
+      showToast(`Cover set from ${local.name}`, 'accent', 'check');
+    } catch (err) {
+      showToast(String(err?.message || err), 'danger', 'alert-triangle');
+    }
+    return;
+  }
+  showToast('Drop a game folder to upload, or an image on Profile/Upload.', 'warn', 'alert-triangle');
+}
+
 // ---------- Boot ----------
 
 async function boot() {
@@ -4366,6 +4689,7 @@ async function boot() {
   initGamepad();
   initScrollPerf();
   await listenEvents(handleLauncherEvent);
+  await listenDragDrop(handleNativeDragDrop);
   await refreshAll();
 }
 
