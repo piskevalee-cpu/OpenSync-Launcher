@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.opensync.launcher</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>OpenSync Launcher</name>
+  <summary>Desktop game launcher and differential save sync client for OpenSync</summary>
+  <description>
+    <p>Native desktop game cabinet for self-hosted OpenSync archives with wire-speed streaming extraction, parallel folder uploads, automatic differential save sync on game close, force-quit save recovery, and GE-Proton integration.</p>
+  </description>
+  <launchable type="desktop-id">io.opensync.launcher.desktop</launchable>
+  <url type="homepage">https://github.com/piskevalee-cpu/OpenSync-Launcher</url>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-11-21" />
+  </releases>
+</component>

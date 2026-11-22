@@ -1,0 +1,49 @@
+id: io.opensync.launcher
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+command: opensync-launcher
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=all
+  - --allow=multiarch
+  - --allow=per-app-dev-shm
+  - --filesystem=home
+  - --filesystem=xdg-run/app/com.valvesoftware.Steam:create
+  - --talk-name=org.freedesktop.Notifications
+
+modules:
+  - name: opensync-launcher
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 opensync-launcher /app/bin/opensync-launcher
+      - install -Dm644 io.opensync.launcher.desktop /app/share/applications/io.opensync.launcher.desktop
+      - install -Dm644 io.opensync.launcher.metainfo.xml /app/share/metainfo/io.opensync.launcher.metainfo.xml
+      - install -Dm644 icon-512.png /app/share/icons/hicolor/512x512/apps/io.opensync.launcher.png
+      - install -Dm644 icon-256.png /app/share/icons/hicolor/256x256/apps/io.opensync.launcher.png
+      - install -Dm644 icon-128.png /app/share/icons/hicolor/128x128/apps/io.opensync.launcher.png
+      - install -Dm644 icon-32.png /app/share/icons/hicolor/32x32/apps/io.opensync.launcher.png
+    sources:
+      - type: file
+        path: opensync-launcher
+      - type: file
+        path: io.opensync.launcher.desktop
+      - type: file
+        path: io.opensync.launcher.metainfo.xml
+      - type: file
+        path: ../../crates/launcher-tauri/icons/icon.png
+        dest-filename: icon-512.png
+      - type: file
+        path: ../../crates/launcher-tauri/icons/128x128@2x.png
+        dest-filename: icon-256.png
+      - type: file
+        path: ../../crates/launcher-tauri/icons/128x128.png
+        dest-filename: icon-128.png
+      - type: file
+        path: ../../crates/launcher-tauri/icons/32x32.png
+        dest-filename: icon-32.png

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenSync Launcher
+Comment=Desktop game launcher and differential save sync client for OpenSync
+Exec=opensync-launcher
+Icon=io.opensync.launcher
+Terminal=false
+Categories=Game;
+StartupWMClass=opensync-launcher

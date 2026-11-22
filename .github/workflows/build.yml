@@ -137,6 +137,69 @@ jobs:
           path: dist/OpenSync_Launcher_*_amd64.AppImage*
           if-no-files-found: error
 
+      - name: Stage Linux binary for Flatpak
+        run: |
+          mkdir -p dist/bin
+          cp target/release/opensync-launcher dist/bin/opensync-launcher
+          strip dist/bin/opensync-launcher
+          chmod 755 dist/bin/opensync-launcher
+
+      - name: Upload Linux binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensync-launcher-linux-bin
+          path: dist/bin/opensync-launcher
+          if-no-files-found: error
+
+  build-linux-flatpak:
+    name: Linux (.flatpak amd64)
+    needs: [build-linux-appimage]
+    runs-on: ubuntu-22.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-49
+      options: --privileged
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download stripped Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: opensync-launcher-linux-bin
+          path: packaging/flatpak
+
+      - name: Ensure binary is executable
+        run: chmod 755 packaging/flatpak/opensync-launcher
+
+      - name: Build Flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: OpenSync_Launcher.flatpak
+          manifest-path: packaging/flatpak/io.opensync.launcher.yml
+          branch: stable
+          cache-key: flatpak-builder-x86_64
+
+      - name: Version & checksum Flatpak bundle
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' crates/launcher-tauri/tauri.conf.json | head -n1)
+          fi
+          mkdir -p dist
+          FLATPAK_NAME="OpenSync_Launcher_${VERSION}_amd64.flatpak"
+          mv OpenSync_Launcher.flatpak "dist/${FLATPAK_NAME}"
+          (cd dist && sha256sum "${FLATPAK_NAME}" > "${FLATPAK_NAME}.sha256")
+          ls -lh dist
+
+      - name: Upload Linux Flatpak artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensync-launcher-linux-flatpak
+          path: dist/OpenSync_Launcher_*_amd64.flatpak*
+          if-no-files-found: error
+
   build-windows-exe:
     name: Windows (.exe x64)
     runs-on: windows-latest
@@ -181,7 +244,7 @@ jobs:
 
   release:
     name: Publish Release Assets
-    needs: [build-linux-appimage, build-windows-exe]
+    needs: [build-linux-appimage, build-linux-flatpak, build-windows-exe]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -193,7 +256,9 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Attach .AppImage and .exe to GitHub Release
+      - name: Attach .AppImage, .flatpak, and .exe to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/*
+          files: |
+            release-assets/OpenSync_Launcher_*
+            !release-assets/opensync-launcher
