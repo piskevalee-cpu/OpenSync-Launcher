@@ -524,7 +524,7 @@ function createCssSelect({ options, value = '', onChange, disabled = false, aria
 const viewEl = document.getElementById('view');
 const topbarEl = document.getElementById('topbar');
 const detailHeroBg = document.getElementById('detail-hero-bg');
-const detailHeroImg = document.getElementById('detail-hero-img');
+const detailHeroImgs = detailHeroBg ? [...detailHeroBg.querySelectorAll('.detail-hero-img')] : [];
 const profileSwitcherEl = document.getElementById('profile-switcher');
 const statusRightEl = document.getElementById('status-right');
 const modalRoot = document.getElementById('modal-root');
@@ -646,17 +646,62 @@ function showToast(message, tone = 'accent', iconName = 'check') {
 // ---------- Cover Lazy Loader ----------
 
 let heroSeq = 0;
+let heroActiveLayer = 0;
+let heroHoverGameId = null;
+let heroFadeOutTimer = null;
 
 function heroCacheKey(profileId, gameId) {
   return `${profileId || 'none'}_${gameId}`;
 }
 
+function cancelHeroFadeTimer() {
+  if (heroFadeOutTimer !== null) {
+    window.clearTimeout(heroFadeOutTimer);
+    heroFadeOutTimer = null;
+  }
+}
+
+function prepareHeroBg() {
+  if (!detailHeroBg) return;
+  detailHeroBg.hidden = false;
+}
+
+function fadeOutHero() {
+  cancelHeroFadeTimer();
+  heroHoverGameId = null;
+  heroSeq += 1;
+  if (!detailHeroBg) return;
+  detailHeroBg.classList.remove('is-active');
+  for (const img of detailHeroImgs) {
+    img.classList.remove('is-visible');
+  }
+}
+
+function scheduleClearHero(gameId, delayMs = 95) {
+  cancelHeroFadeTimer();
+  if (delayMs <= 0) {
+    if (gameId == null || heroHoverGameId === gameId) fadeOutHero();
+    return;
+  }
+  heroFadeOutTimer = window.setTimeout(() => {
+    heroFadeOutTimer = null;
+    if (gameId == null || heroHoverGameId === gameId) {
+      fadeOutHero();
+    }
+  }, delayMs);
+}
+
 function clearDetailHero() {
+  cancelHeroFadeTimer();
+  heroHoverGameId = null;
   heroSeq += 1;
   if (!detailHeroBg) return;
   detailHeroBg.hidden = true;
-  detailHeroBg.classList.remove('has-image');
-  if (detailHeroImg) detailHeroImg.removeAttribute('src');
+  detailHeroBg.classList.remove('is-active');
+  for (const img of detailHeroImgs) {
+    img.classList.remove('is-visible');
+    img.removeAttribute('src');
+  }
 }
 
 function makeBlurredHeroDataUrl(srcUrl) {
@@ -718,17 +763,29 @@ function makeBlurredHeroDataUrl(srcUrl) {
   });
 }
 
-async function syncDetailHero(game) {
-  if (!detailHeroBg || !detailHeroImg || !game || state.view !== 'game-detail' || state.selectedGameId !== game.game_id) {
+function isHeroStillValid(gameId, mode) {
+  if (mode === 'detail') {
+    return state.view === 'game-detail' && state.selectedGameId === gameId;
+  }
+  return state.view === 'library' && Boolean(state.activeProfile) && heroHoverGameId === gameId;
+}
+
+async function applyHeroForGame(game, mode) {
+  if (!detailHeroBg || !game || !isHeroStillValid(game.game_id, mode)) {
     return;
   }
+  cancelHeroFadeTimer();
   const seq = ++heroSeq;
   detailHeroBg.hidden = false;
+  if (!detailHeroBg.classList.contains('is-active')) {
+    void detailHeroBg.offsetWidth;
+    detailHeroBg.classList.add('is-active');
+  }
 
   const coverUrl = state.coverCache.get(game.game_id);
   if (!coverUrl) {
-    detailHeroBg.classList.remove('has-image');
-    detailHeroImg.removeAttribute('src');
+    for (const img of detailHeroImgs) img.classList.remove('is-visible');
+    if (game.has_cover) ensureCover(game);
     return;
   }
 
@@ -738,18 +795,44 @@ async function syncDetailHero(game) {
     blurredUrl = await makeBlurredHeroDataUrl(coverUrl);
     state.heroBlurCache.set(key, blurredUrl);
   }
-  if (seq !== heroSeq || state.view !== 'game-detail' || state.selectedGameId !== game.game_id) {
+  if (seq !== heroSeq || !isHeroStillValid(game.game_id, mode)) {
     return;
   }
-  if (blurredUrl) {
-    if (detailHeroImg.getAttribute('src') !== blurredUrl) {
-      detailHeroImg.src = blurredUrl;
-    }
-    detailHeroBg.classList.add('has-image');
-  } else {
-    detailHeroBg.classList.remove('has-image');
-    detailHeroImg.removeAttribute('src');
+  if (!blurredUrl || detailHeroImgs.length === 0) {
+    for (const img of detailHeroImgs) img.classList.remove('is-visible');
+    return;
   }
+
+  const currentImg = detailHeroImgs[heroActiveLayer];
+  if (currentImg && currentImg.getAttribute('src') === blurredUrl && currentImg.classList.contains('is-visible')) {
+    return;
+  }
+
+  const nextLayer = detailHeroImgs.length > 1 ? (heroActiveLayer + 1) % detailHeroImgs.length : 0;
+  const nextImg = detailHeroImgs[nextLayer];
+  heroActiveLayer = nextLayer;
+
+  if (nextImg.getAttribute('src') !== blurredUrl) {
+    nextImg.classList.remove('is-visible');
+    nextImg.src = blurredUrl;
+  }
+  void nextImg.offsetWidth;
+  nextImg.classList.add('is-visible');
+  for (let i = 0; i < detailHeroImgs.length; i += 1) {
+    if (i !== heroActiveLayer) {
+      detailHeroImgs[i].classList.remove('is-visible');
+    }
+  }
+}
+
+function syncDetailHero(game) {
+  return applyHeroForGame(game, 'detail');
+}
+
+function showLibraryHoverHero(game) {
+  if (!game) return;
+  heroHoverGameId = game.game_id;
+  return applyHeroForGame(game, 'hover');
 }
 
 async function ensureCover(game) {
@@ -775,6 +858,8 @@ async function ensureCover(game) {
       }
       if (state.view === 'game-detail' && state.selectedGameId === game.game_id) {
         syncDetailHero(game);
+      } else if (state.view === 'library' && heroHoverGameId === game.game_id) {
+        showLibraryHoverHero(game);
       }
     }
   } catch {
@@ -894,12 +979,13 @@ function buildCardStats(g, isPlaying) {
   return stats;
 }
 
-function attachStatTicker(card, stats, intervalMs = 2000) {
+function attachStatTicker(card, stats, intervalMs = 1500, firstDelayMs = 450) {
   if (!Array.isArray(stats) || stats.length < 2) return;
   const ticker = card.querySelector('.card-stat-ticker');
   if (!ticker) return;
 
   let index = 0;
+  let firstTimer = null;
   let timer = null;
   let hovered = false;
   let focused = false;
@@ -941,22 +1027,36 @@ function attachStatTicker(card, stats, intervalMs = 2000) {
     }, { once: true });
   };
 
+  const stopTimers = () => {
+    if (firstTimer !== null) {
+      window.clearTimeout(firstTimer);
+      firstTimer = null;
+    }
+    if (timer !== null) {
+      window.clearInterval(timer);
+      timer = null;
+    }
+  };
+
+  const stepNext = () => {
+    if (!card.isConnected) {
+      stopTimers();
+      return false;
+    }
+    swapTo((index + 1) % stats.length, 'up');
+    return true;
+  };
+
   const syncTimer = () => {
     if (hovered || focused) {
-      if (timer !== null) return;
-      timer = window.setInterval(() => {
-        if (!card.isConnected) {
-          window.clearInterval(timer);
-          timer = null;
-          return;
-        }
-        swapTo((index + 1) % stats.length, 'up');
-      }, intervalMs);
+      if (firstTimer !== null || timer !== null) return;
+      firstTimer = window.setTimeout(() => {
+        firstTimer = null;
+        if (!stepNext()) return;
+        timer = window.setInterval(stepNext, intervalMs);
+      }, firstDelayMs);
     } else {
-      if (timer !== null) {
-        window.clearInterval(timer);
-        timer = null;
-      }
+      stopTimers();
       if (index !== 0) {
         swapTo(0, 'down');
       }
@@ -1434,7 +1534,11 @@ function navigate(nextView, opts = {}) {
   teardownAuthParticles();
   destroyWaveforms();
   if (nextView !== 'upload') destroyUploadWaveforms();
-  if (nextView !== 'game-detail') clearDetailHero();
+  if (nextView !== 'game-detail' && nextView !== 'library') {
+    clearDetailHero();
+  } else if (nextView === 'library') {
+    fadeOutHero();
+  }
   state.view = nextView;
   if (opts.gameId != null) {
     state.selectedGameId = opts.gameId;
@@ -1470,7 +1574,7 @@ function renderCurrentView(animate = false) {
   if (state.view !== 'upload') {
     activeUploadViewApi = null;
   }
-  if (state.view !== 'game-detail') {
+  if (state.view !== 'game-detail' && state.view !== 'library') {
     clearDetailHero();
   }
 
@@ -1853,6 +1957,7 @@ function renderLibraryView() {
     return;
   }
 
+  prepareHeroBg();
   const shell = ensureLibraryShell();
   if (viewEl.firstElementChild !== shell) {
     viewEl.replaceChildren(shell);
@@ -1911,6 +2016,7 @@ function renderLibraryGrid() {
   }
 
   if (!items.length) {
+    fadeOutHero();
     host.innerHTML = `
       <div class="empty-state">
         <div class="empty-state-icon">${icon('search', 20)}</div>
@@ -2077,12 +2183,27 @@ function renderLibraryGrid() {
       await runCardPrimaryAction(latestGame);
     });
 
+    const activateHero = () => {
+      const latestGame = state.library.find((x) => x.game_id === g.game_id) || g;
+      showLibraryHoverHero(latestGame);
+    };
+    const deactivateHero = () => scheduleClearHero(g.game_id, 95);
+    card.addEventListener('pointerenter', activateHero);
+    card.addEventListener('pointerleave', deactivateHero);
+    card.addEventListener('focusin', activateHero);
+    card.addEventListener('focusout', (e) => {
+      if (!card.contains(e.relatedTarget)) deactivateHero();
+    });
+
     attachSteamTilt(card);
-    attachStatTicker(card, cardStats, 2000);
+    attachStatTicker(card, cardStats, 1500, 450);
     cardDomCache.set(g.game_id, { sig, card });
     nextCards.push(card);
   }
 
+  if (heroHoverGameId != null && !items.some((g) => g.game_id === heroHoverGameId)) {
+    fadeOutHero();
+  }
   const gridSig = sigParts.join('||');
   if (grid.parentElement === host && grid.dataset.gridSig === gridSig) {
     return;
