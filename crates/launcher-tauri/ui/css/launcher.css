@@ -187,9 +187,14 @@ body.is-auth-screen .shell {
   padding: 10px 0;
   margin-bottom: 28px;
   border-bottom: 1px solid var(--hairline);
-  background: rgba(9, 10, 13, 0.72);
-  backdrop-filter: blur(18px) saturate(140%);
-  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  background: var(--canvas);
+  transition: background-color 0.16s var(--ease);
+}
+
+body.is-scrolled .topbar {
+  background: rgba(9, 10, 13, 0.78);
+  backdrop-filter: blur(14px) saturate(135%);
+  -webkit-backdrop-filter: blur(14px) saturate(135%);
 }
 
 .logo {
@@ -260,12 +265,13 @@ body.is-auth-screen .shell {
   border-radius: 2px;
   background: var(--accent);
   transform-origin: center;
-  animation: nav-grow 0.22s var(--ease);
+  will-change: transform;
+  animation: nav-grow 0.18s var(--ease);
 }
 
 @keyframes nav-grow {
-  from { transform: scaleX(0); }
-  to { transform: scaleX(1); }
+  from { transform: scale3d(0, 1, 1); }
+  to { transform: scale3d(1, 1, 1); }
 }
 
 .nav-dl-pill {
@@ -542,15 +548,26 @@ img.pfp-lg {
 
 .workspace {
   outline: none;
+  contain: layout style;
+}
+
+/* Suspend costly WebKitGTK backdrop readbacks during the 130ms section fade so
+   Flatpak / software compositors don't frame-drop while mounting new views. */
+body.is-switching .topbar,
+body.is-switching .card-glass-footer,
+body.is-switching .card-center-btn,
+body.is-switching .card-top-pill {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
 }
 
 .view-switch {
-  animation: view-switch-in 0.13s ease-out;
+  animation: view-switch-in 0.13s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 @keyframes view-switch-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from { opacity: 0; transform: translate3d(0, 4px, 0); }
+  to { opacity: 1; transform: translate3d(0, 0, 0); }
 }
 
 /* ---------- Typography & shared controls ---------- */
@@ -1068,7 +1085,7 @@ textarea.input {
   overflow: hidden;
   cursor: pointer;
   transform-style: preserve-3d;
-  will-change: transform, box-shadow;
+  will-change: transform;
   contain: layout style paint;
   transition:
     transform 0.28s cubic-bezier(0.22, 1, 0.36, 1),

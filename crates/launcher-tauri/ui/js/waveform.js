@@ -182,15 +182,18 @@ export class WaveformCanvas {
     ctx.fillStyle = grad;
     ctx.fill();
 
-    // Glowing spline stroke
+    // Glowing two-pass spline stroke (avoids slow per-frame canvas shadowBlur in WebKitGTK)
     ctx.save();
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    traceSpline();
+    ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${lerp(0.22, 0.12, this.pauseBlend)})`;
+    ctx.lineWidth = 6;
+    ctx.stroke();
+
     traceSpline();
     ctx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
     ctx.lineWidth = 2;
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    ctx.shadowColor = `rgba(${r}, ${g}, ${b}, ${lerp(0.55, 0.3, this.pauseBlend)})`;
-    ctx.shadowBlur = 10;
     ctx.stroke();
     ctx.restore();
 

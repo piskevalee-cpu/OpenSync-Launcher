@@ -306,11 +306,17 @@ let stopAuthParticleField = null;
 // Mark the body while the user is actively scrolling so paused cards skip the
 // expensive 3D-tilt/backdrop repaints. No layout reads in the hot path.
 let scrollIdleTimer = null;
+let wasScrolled = false;
 function initScrollPerf() {
   window.addEventListener(
     'scroll',
     () => {
       document.body.classList.add('is-scrolling');
+      const isScrolled = window.scrollY > 4;
+      if (isScrolled !== wasScrolled) {
+        wasScrolled = isScrolled;
+        document.body.classList.toggle('is-scrolled', isScrolled);
+      }
       if (scrollIdleTimer !== null) clearTimeout(scrollIdleTimer);
       scrollIdleTimer = window.setTimeout(() => {
         document.body.classList.remove('is-scrolling');
@@ -1281,7 +1287,36 @@ function updateUploadStatusPill() {
   }
 }
 
+let activeViewAnim = null;
+let viewSwitchRaf = null;
+let viewSwitchTimer = null;
+let viewRenderSeq = 0;
+
+function clearPendingViewSwitch() {
+  if (viewSwitchRaf !== null) {
+    cancelAnimationFrame(viewSwitchRaf);
+    viewSwitchRaf = null;
+  }
+  if (viewSwitchTimer !== null) {
+    clearTimeout(viewSwitchTimer);
+    viewSwitchTimer = null;
+  }
+  if (activeViewAnim) {
+    activeViewAnim.onfinish = null;
+    activeViewAnim.oncancel = null;
+    try { activeViewAnim.cancel(); } catch { /* ignore */ }
+    activeViewAnim = null;
+  }
+  if (viewEl) {
+    viewEl.style.removeProperty('opacity');
+    viewEl.style.removeProperty('transform');
+    viewEl.style.removeProperty('will-change');
+  }
+  document.body.classList.remove('is-switching');
+}
+
 function navigate(nextView, opts = {}) {
+  clearPendingViewSwitch();
   closeCssSelect();
   teardownAuthParticles();
   destroyWaveforms();
@@ -1290,11 +1325,18 @@ function navigate(nextView, opts = {}) {
   if (opts.gameId != null) {
     state.selectedGameId = opts.gameId;
   }
+  if (window.scrollY > 0) {
+    window.scrollTo(0, 0);
+  }
+  wasScrolled = false;
+  document.body.classList.remove('is-scrolled');
   updateNavState();
   renderCurrentView(true);
 }
 
 function renderCurrentView(animate = false) {
+  const seq = ++viewRenderSeq;
+  clearPendingViewSwitch();
   syncFabVisibility();
   // Before signing in, only the sign-in menu may appear.
   if (!state.activeProfile) {
@@ -1313,7 +1355,14 @@ function renderCurrentView(animate = false) {
   if (state.view !== 'upload') {
     activeUploadViewApi = null;
   }
-  viewEl.classList.remove('view-switch');
+
+  const reducedMotion = Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
+  const canAnimate = Boolean(animate && !reducedMotion && typeof viewEl.animate === 'function');
+  if (canAnimate) {
+    document.body.classList.add('is-switching');
+    viewEl.style.willChange = 'opacity, transform';
+    viewEl.style.opacity = '0';
+  }
 
   switch (state.view) {
     case 'library':
@@ -1339,9 +1388,29 @@ function renderCurrentView(animate = false) {
   }
 
   syncFabVisibility();
-  if (animate) {
-    void viewEl.offsetWidth;
-    viewEl.classList.add('view-switch');
+  if (canAnimate) {
+    viewSwitchRaf = requestAnimationFrame(() => {
+      viewSwitchRaf = null;
+      if (seq !== viewRenderSeq) return;
+      try {
+        activeViewAnim = viewEl.animate(
+          [
+            { opacity: 0, transform: 'translate3d(0, 4px, 0)' },
+            { opacity: 1, transform: 'translate3d(0, 0, 0)' },
+          ],
+          { duration: 130, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'forwards' },
+        );
+        const finish = () => {
+          if (seq !== viewRenderSeq) return;
+          clearPendingViewSwitch();
+        };
+        activeViewAnim.onfinish = finish;
+        activeViewAnim.oncancel = finish;
+        viewSwitchTimer = window.setTimeout(finish, 200);
+      } catch {
+        clearPendingViewSwitch();
+      }
+    });
   }
 
   gamepadCtrl?.onViewRendered();
