@@ -129,11 +129,26 @@ Download the `.dmg` for your Mac from [GitHub Releases](https://github.com/piske
 
 Open the disk image and drag **OpenSync Launcher.app** into `/Applications`. A `.app.zip` is also published for each architecture if you prefer to unzip manually.
 
-The CI builds are ad-hoc signed. If Gatekeeper refuses to open the app, right-click it and choose **Open**, or clear the quarantine attribute:
+> **Note about macOS security:** the release `.dmg` files are **ad-hoc signed but not notarized**. Gatekeeper may warn that the app "can't be opened because Apple cannot check it for malicious software" or that it is "damaged". This is expected for a binary distributed outside the App Store and not notarized with Apple.
 
-```sh
-xattr -d com.apple.quarantine "/Applications/OpenSync Launcher.app"
-```
+If macOS refuses to launch the app, use one of these options:
+
+1. **Right-click → Open.** In Finder, right-click (or Control-click) **OpenSync Launcher.app** and choose **Open**, then **Open** again in the dialog. Do this once and macOS will remember it.
+2. **Remove the download quarantine attribute.** Clear it from the downloaded DMG before mounting, and/or from the installed app:
+
+   ```sh
+   # Optional: clear quarantine on the downloaded .dmg (choose your architecture)
+   xattr -d com.apple.quarantine ~/Downloads/OpenSync_Launcher_<version>_aarch64.dmg
+   # xattr -d com.apple.quarantine ~/Downloads/OpenSync_Launcher_<version>_x86_64.dmg
+
+   # After dragging the app to /Applications:
+   xattr -d com.apple.quarantine "/Applications/OpenSync Launcher.app"
+   ```
+
+   If `xattr` prints `No such xattr: com.apple.quarantine`, the file is already clear and you can skip this step.
+3. **Open Anyway.** If it is still blocked, go to **System Settings → Privacy & Security**, find the OpenSync Launcher warning under "Security", and click **Open Anyway**.
+
+You only need to do this once per downloaded build. Notarization is planned for a future release.
 
 ### Build from Source
 
