@@ -747,3 +747,73 @@ async fn uninstall_syncs_saves_and_redownload_uses_remembered_install_dir() {
     );
     assert!(managed.install_dir.join("saves/slot2.dat").is_file());
 }
+
+#[tokio::test]
+async fn cover_content_type_cannot_escape_data_url() {
+    let dir = tempdir().unwrap();
+    let db = LauncherDb::open_in_memory().unwrap();
+    let core = LauncherCore::new(db, MemorySecretStore::new(), LauncherPaths::under(dir.path()));
+
+    let srv = MockOpenSyncServer::start().await;
+    srv.add_user(1, "valerio", "secret123");
+    srv.add_game(
+        10,
+        "Fogwoods",
+        "fogwoods",
+        vec![("fogwoods.sh", b"#!/bin/sh\n".to_vec())],
+    );
+    let png_bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+    // An on-path attacker rewriting the plaintext HTTP response tries to break out
+    // of the frontend's `src="..."` attribute via the Content-Type header.
+    srv.set_cover(10, png_bytes.clone(), "image/png\" onerror=\"alert(1)");
+
+    core.connect_with_password("LAN", &srv.base_url, "valerio", "secret123")
+        .await
+        .unwrap();
+
+    let (bytes, ct) = core.fetch_cached_cover(10).await.unwrap();
+    assert_eq!(bytes, png_bytes);
+    assert_eq!(
+        ct, "image/png",
+        "the MIME type must be one of the two safe literals, never a raw header"
+    );
+    assert!(!ct.contains('"') && !ct.contains("onerror"));
+}
+
+#[tokio::test]
+async fn hostile_slug_cannot_escape_games_directory() {
+    let dir = tempdir().unwrap();
+    let db = LauncherDb::open_in_memory().unwrap();
+    let core = LauncherCore::new(db, MemorySecretStore::new(), LauncherPaths::under(dir.path()));
+
+    let srv = MockOpenSyncServer::start().await;
+    srv.add_user(1, "valerio", "secret123");
+    let escape_dir = dir.path().join("escaped");
+    srv.add_game(
+        20,
+        "Absolute Slug",
+        escape_dir.to_str().unwrap(),
+        vec![("game.sh", b"#!/bin/sh\n".to_vec())],
+    );
+    srv.add_game(
+        21,
+        "Traversal Slug",
+        "../escaped",
+        vec![("game.sh", b"#!/bin/sh\n".to_vec())],
+    );
+
+    core.connect_with_password("LAN", &srv.base_url, "valerio", "secret123")
+        .await
+        .unwrap();
+
+    for game_id in [20, 21] {
+        let result = core
+            .download_game(game_id, true, opensync_transfer::DownloadControl::new(0, 0))
+            .await;
+        assert!(result.is_err(), "game {game_id} has an unsafe slug and must be rejected");
+    }
+    assert!(
+        !escape_dir.exists(),
+        "no files may be written outside the games directory"
+    );
+}

@@ -6,7 +6,7 @@ use launcher_core::{
     ReconnectPolicy, ShutdownResultDto, ShutdownStatusDto, UploadJobSnapshot, default_games_dir,
 };
 use launcher_db::{ActivityLogEntry, InstalledGame, PendingSync, PlaytimeSummary, Profile};
-use opensync_api::{ApiError, Game, User};
+use opensync_api::{ApiError, Game, User, safe_image_mime};
 use opensync_proton::{
     BinaryKind, DiscoveredExecutable, GeProtonRelease, ProtonInstallation, detect_binary_kind,
     discover_executables,
@@ -291,14 +291,17 @@ pub async fn get_user_pfp_data_url(
         .fetch_cached_user_pfp(pfp_path.as_deref(), user_id)
         .await
     {
-        Ok(Some((bytes, mime))) => {
+        Ok(Some((bytes, _mime))) => {
             let url = tokio::task::spawn_blocking(move || {
+                let Some(mime) = safe_image_mime(&bytes) else {
+                    return None;
+                };
                 let encoded = BASE64.encode(&bytes);
-                format!("data:{mime};base64,{encoded}")
+                Some(format!("data:{mime};base64,{encoded}"))
             })
             .await
             .map_err(|e| format!("encode pfp failed: {e}"))?;
-            Ok(Some(url))
+            Ok(url)
         }
         Ok(None) => Ok(None),
         Err(CoreError::Api(ApiError::Http { status: 404, .. })) => Ok(None),
@@ -543,14 +546,20 @@ pub async fn get_game_cover_data_url(
     game_id: i64,
 ) -> Result<Option<String>, String> {
     match state.core.fetch_cached_cover(game_id).await {
-        Ok((bytes, mime)) => {
+        Ok((bytes, _mime)) => {
             let url = tokio::task::spawn_blocking(move || {
+                // The MIME type is re-derived from the image bytes. Even if a cached
+                // or server-supplied content type were hostile, only the two safe
+                // literals below can ever reach the frontend's HTML.
+                let Some(mime) = safe_image_mime(&bytes) else {
+                    return None;
+                };
                 let encoded = BASE64.encode(&bytes);
-                format!("data:{mime};base64,{encoded}")
+                Some(format!("data:{mime};base64,{encoded}"))
             })
             .await
             .map_err(|e| format!("encode cover failed: {e}"))?;
-            Ok(Some(url))
+            Ok(url)
         }
         Err(CoreError::Api(ApiError::Http { status: 404, .. })) => Ok(None),
         Err(CoreError::Api(ApiError::Network(_))) => Ok(None),
@@ -883,13 +892,8 @@ pub async fn read_local_image(path: String) -> Result<LocalImageDto, String> {
             return Err("Image must be between 1 byte and 8 MB".to_string());
         }
         let bytes = std::fs::read(&p).map_err(|e| format!("failed to read image: {e}"))?;
-        let content_type = if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
-            "image/png"
-        } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-            "image/jpeg"
-        } else {
-            return Err("Only JPG and PNG images are supported".to_string());
-        };
+        let content_type = safe_image_mime(&bytes)
+            .ok_or_else(|| "Only JPG and PNG images are supported".to_string())?;
         let encoded = BASE64.encode(&bytes);
         let data_url = format!("data:{content_type};base64,{encoded}");
         let name = p

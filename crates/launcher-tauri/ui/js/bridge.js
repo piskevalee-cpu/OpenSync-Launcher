@@ -1,10 +1,13 @@
 // Unified Tauri v2 + interactive browser preview bridge for OpenSync Launcher.
 
+// With `withGlobalTauri: false` we deliberately do not expose the full
+// `window.__TAURI__` API to page scripts. Tauri still injects the low-level
+// `__TAURI_INTERNALS__` bridge, which is all this module needs. Keeping the
+// narrowed surface means injected markup cannot reach every IPC command.
+const tauriInternals = typeof window !== 'undefined' ? window.__TAURI_INTERNALS__ : null;
 const isTauri = Boolean(
-  typeof window !== 'undefined'
-  && window.__TAURI__
-  && window.__TAURI__.core
-  && typeof window.__TAURI__.core.invoke === 'function',
+  tauriInternals
+  && typeof tauriInternals.invoke === 'function',
 );
 
 export function isDesktopRuntime() {
@@ -1530,25 +1533,38 @@ const mock = isTauri ? null : createMockRuntime();
 
 async function invokeCmd(cmd, args = {}) {
   if (isTauri) {
-    return window.__TAURI__.core.invoke(cmd, args);
+    return tauriInternals.invoke(cmd, args);
   }
   return mock.invoke(cmd, args);
 }
 
+// Minimal equivalent of `@tauri-apps/api/event`'s listen(), built on the
+// low-level internals that Tauri always injects (no global API object needed).
+async function tauriListen(event, handler) {
+  const internals = tauriInternals;
+  const callbackId = internals.transformCallback((e) => handler(e.payload));
+  const eventId = await internals.invoke('plugin:event|listen', {
+    event,
+    target: { kind: 'Any' },
+    handler: callbackId,
+  });
+  return async () => {
+    internals.unregisterCallback(callbackId);
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__?.unregisterListener?.(event, eventId);
+    await internals.invoke('plugin:event|unlisten', { event, eventId }).catch(() => {});
+  };
+}
+
 export async function listenEvents(handler) {
-  if (isTauri && window.__TAURI__.event?.listen) {
-    return window.__TAURI__.event.listen('launcher-event', (e) => {
-      handler(e.payload);
-    });
+  if (isTauri) {
+    return tauriListen('launcher-event', handler);
   }
   return mock.listen(handler);
 }
 
 export async function listenDragDrop(handler) {
-  if (isTauri && window.__TAURI__.event?.listen) {
-    return window.__TAURI__.event.listen('launcher-drag-drop', (e) => {
-      handler(e.payload);
-    });
+  if (isTauri) {
+    return tauriListen('launcher-drag-drop', handler);
   }
   return () => {};
 }

@@ -28,6 +28,23 @@ pub enum ApiError {
     MissingCookie,
     #[error("invalid profile picture: {0}")]
     InvalidPfp(String),
+    #[error("invalid cover image: {0}")]
+    InvalidCover(String),
+}
+
+/// Returns the only two MIME types that are ever embedded in a `data:` URL and
+/// injected into the frontend. The type is derived from the image's magic bytes,
+/// never from a server-supplied `Content-Type` header, so a hostile server (or an
+/// on-path attacker rewriting headers over plain HTTP) cannot smuggle quotes or
+/// markup into an HTML `src="..."` attribute.
+pub fn safe_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else {
+        None
+    }
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -535,14 +552,13 @@ impl OpenSyncClient {
             .send()
             .await?;
         let res = check_status(res).await?;
-        let content_type = res
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "application/octet-stream".to_string());
         let bytes = res.bytes().await?.to_vec();
+        // Never trust the server's Content-Type. It is attacker-controlled on plain
+        // HTTP connections and is interpolated into a `data:` URL by the frontend.
+        // Derive one of exactly two safe literals from the bytes themselves.
+        let content_type = safe_image_mime(&bytes)
+            .ok_or_else(|| ApiError::InvalidCover("cover is not a PNG or JPEG image".to_string()))?
+            .to_string();
         Ok((bytes, content_type))
     }
 
@@ -919,6 +935,24 @@ async fn extract_error_message(status: StatusCode, res: Response) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_image_mime_only_returns_two_literals() {
+        assert_eq!(
+            safe_image_mime(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2]),
+            Some("image/png")
+        );
+        assert_eq!(safe_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 1]), Some("image/jpeg"));
+
+        // Bytes that once arrived with a hostile Content-Type must never yield a
+        // MIME type containing quotes or markup.
+        let hostile = b"<svg onload=alert(1)>";
+        assert_eq!(safe_image_mime(hostile), None);
+        assert_eq!(safe_image_mime(b""), None);
+        let mime = safe_image_mime(hostile).unwrap_or("application/octet-stream");
+        assert!(mime == "image/png" || mime == "image/jpeg" || mime == "application/octet-stream");
+        assert!(!mime.contains('"') && !mime.contains('<'));
+    }
 
     #[test]
     fn normalizes_hash_routes_and_bare_hosts() {
