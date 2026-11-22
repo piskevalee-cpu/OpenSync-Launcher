@@ -305,6 +305,9 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version '^2' --locked
 
+      - name: Run Rust workspace tests
+        run: cargo test --workspace --exclude launcher-tauri
+
       - name: Resolve version
         id: meta
         run: |

@@ -534,6 +534,22 @@ fn macos_pe_command(
                 runner_label = "Wine";
                 p
             })
+        })
+        .or_else(|| {
+            // macOS GUI apps launched from Finder/Dock do not include Homebrew in PATH.
+            [
+                "/opt/homebrew/bin/wine",
+                "/usr/local/bin/wine",
+                "/opt/homebrew/bin/wine64",
+                "/usr/local/bin/wine64",
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+            .map(|p| {
+                runner_label = "Wine";
+                p
+            })
         });
 
     let Some(runner) = runner else {

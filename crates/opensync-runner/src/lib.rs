@@ -180,8 +180,9 @@ pub fn resolve_launch_command(
 ) -> RunnerResult<LaunchCommandSpec> {
     let exe = if let Some(rel) = &game.executable_rel_path {
         let abs = game.install_dir.join(rel);
-        // `.app` bundles are directories, so use `exists()` rather than `is_file()`.
-        if abs.exists() {
+        // `.app` bundles are directories, so accept files or valid `.app` bundles only
+        // (ignoring empty strings or plain subdirectories so auto-discovery still works).
+        if abs.is_file() || opensync_proton::is_macos_app_bundle(&abs) {
             let kind = opensync_proton::detect_binary_kind(&abs);
             let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
             opensync_proton::DiscoveredExecutable {

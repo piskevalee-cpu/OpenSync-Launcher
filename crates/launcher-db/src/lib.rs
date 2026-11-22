@@ -28,7 +28,7 @@ pub type DbResult<T> = Result<T, DbError>;
 /// 1. `OPENSYNC_LAUNCHER_DATA` override (any platform)
 /// 2. macOS: `~/Library/Application Support/opensync-launcher`
 /// 3. Linux/BSD: `$XDG_DATA_HOME/opensync-launcher` or `~/.local/share/opensync-launcher`
-/// 4. Windows: `%APPDATA%/opensync-launcher` (or `USERPROFILE/AppData/Roaming/...`)
+/// 4. Windows: `%LOCALAPPDATA%/opensync-launcher`, `%APPDATA%/opensync-launcher`, or `USERPROFILE/AppData/Local/...`
 ///
 /// macOS never relies on Linux's `$XDG_DATA_HOME` convention.
 pub fn default_data_dir() -> PathBuf {
@@ -49,7 +49,21 @@ pub fn default_data_dir() -> PathBuf {
         return home.join("Library/Application Support/opensync-launcher");
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        for var in ["LOCALAPPDATA", "APPDATA"] {
+            if let Ok(val) = std::env::var(var)
+                && !val.trim().is_empty()
+            {
+                return PathBuf::from(val).join("opensync-launcher");
+            }
+        }
+        if let Some(home) = home {
+            return home.join("AppData/Local/opensync-launcher");
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
             && !xdg.trim().is_empty()
@@ -57,19 +71,7 @@ pub fn default_data_dir() -> PathBuf {
             return PathBuf::from(xdg).join("opensync-launcher");
         }
         if let Some(home) = home {
-            #[cfg(target_os = "windows")]
-            {
-                return home.join("AppData/Roaming/opensync-launcher");
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                return home.join(".local/share/opensync-launcher");
-            }
-        }
-        if let Ok(app_data) = std::env::var("APPDATA")
-            && !app_data.trim().is_empty()
-        {
-            return PathBuf::from(app_data).join("opensync-launcher");
+            return home.join(".local/share/opensync-launcher");
         }
     }
 
