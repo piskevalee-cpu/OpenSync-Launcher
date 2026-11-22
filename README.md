@@ -109,11 +109,10 @@ chmod +x OpenSync_Launcher_0.1.0_amd64.AppImage
 
 #### Linux Flatpak (amd64)
 
-[Download `OpenSync_Launcher_0.1.0_amd64.flatpak`](https://github.com/piskevalee-cpu/OpenSync-Launcher/releases/download/v0.1.0/OpenSync_Launcher_0.1.0_amd64.flatpak), then install and run:
+Fetch from [v0.1.0 Releases](https://github.com/piskevalee-cpu/OpenSync-Launcher/releases/download/v0.1.0/OpenSync_Launcher_0.1.0_amd64.flatpak) and install in one command:
 
 ```sh
-flatpak install --user OpenSync_Launcher_0.1.0_amd64.flatpak
-flatpak run io.opensync.launcher
+curl -fSL https://github.com/piskevalee-cpu/OpenSync-Launcher/releases/download/v0.1.0/OpenSync_Launcher_0.1.0_amd64.flatpak -o /tmp/opensync.flatpak && flatpak install --user -y /tmp/opensync.flatpak && flatpak run io.opensync.launcher
 ```
 
 #### Windows (x64)
