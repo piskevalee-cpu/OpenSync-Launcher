@@ -92,42 +92,57 @@ Key features:
 <!-- GETTING STARTED -->
 ## Getting Started
 
-### Prerequisites
-
-* **Rust** (stable toolchain via `rustup`)
-* **Linux desktop development libraries** required by Tauri v2 (WebKitGTK & GTK3)
-* A running **[OpenSync](https://github.com/piskevalee-cpu/OpenSync)** server on your LAN or localhost
-
-Install the system packages for your distro:
-
-* **openSUSE Tumbleweed**
-  ```sh
-  sudo zypper in webkitgtk3-devel gtk3-devel libsoup-devel librsvg-devel
-  ```
-* **Ubuntu / Debian**
-  ```sh
-  sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev patchelf
-  ```
+You only need a running **[OpenSync](https://github.com/piskevalee-cpu/OpenSync)** server on your LAN or `localhost`.
 
 ### Installation
 
-1. Clone the repo
-   ```sh
-   git clone https://github.com/piskevalee-cpu/OpenSync-Launcher.git
-   cd OpenSync-Launcher
-   ```
-2. Run the workspace tests
-   ```sh
-   cargo test --workspace --exclude launcher-tauri
-   ```
-3. Launch the desktop app in development mode
-   ```sh
-   cargo run -p launcher-tauri
-   ```
-4. Build an optimized release binary / bundle
-   ```sh
-   cargo build --release -p launcher-tauri
-   ```
+Download prebuilt binaries for **`v0.1.0`** from [GitHub Releases](https://github.com/piskevalee-cpu/OpenSync-Launcher/releases/tag/v0.1.0):
+
+#### Linux AppImage (amd64)
+
+[Download `OpenSync_Launcher_0.1.0_amd64.AppImage`](https://github.com/piskevalee-cpu/OpenSync-Launcher/releases/download/v0.1.0/OpenSync_Launcher_0.1.0_amd64.AppImage), make it executable, and run:
+
+```sh
+chmod +x OpenSync_Launcher_0.1.0_amd64.AppImage
+./OpenSync_Launcher_0.1.0_amd64.AppImage
+```
+
+#### Linux Flatpak (amd64)
+
+[Download `OpenSync_Launcher_0.1.0_amd64.flatpak`](https://github.com/piskevalee-cpu/OpenSync-Launcher/releases/download/v0.1.0/OpenSync_Launcher_0.1.0_amd64.flatpak), then install and run:
+
+```sh
+flatpak install --user OpenSync_Launcher_0.1.0_amd64.flatpak
+flatpak run io.opensync.launcher
+```
+
+#### Windows (x64)
+
+[Download `OpenSync_Launcher_0.1.0_x64.exe`](https://github.com/piskevalee-cpu/OpenSync-Launcher/releases/download/v0.1.0/OpenSync_Launcher_0.1.0_x64.exe) and run directly.
+
+### Build from Source
+
+#### Prerequisites
+
+* **Rust** (stable toolchain via `rustup`)
+* On Windows: Visual Studio C++ Build Tools (MSVC) + WebView2 runtime
+* On Linux: WebKitGTK 4.1 & GTK3 development packages:
+  * **openSUSE Tumbleweed**: `sudo zypper in webkitgtk3-devel gtk3-devel libsoup-devel librsvg-devel`
+  * **Ubuntu / Debian**: `sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev librsvg2-dev patchelf`
+
+#### Compile & Run
+
+```sh
+git clone https://github.com/piskevalee-cpu/OpenSync-Launcher.git
+cd OpenSync-Launcher
+cargo build --release -p launcher-tauri
+```
+
+Run in development mode with `cargo run -p launcher-tauri`, or run the workspace test suite with:
+
+```sh
+cargo test --workspace --exclude launcher-tauri
+```
 
 ### Configuration
 
@@ -172,12 +187,13 @@ Install the system packages for your distro:
 - [x] Automatic Proton discovery, per-game prefix isolation & one-click GE-Proton installer
 - [x] Profile picture recognition, avatar upload/removal & account customization
 - [x] W3C Gamepad + keyboard spatial navigation with live button hints
+- [x] Automated Linux AppImage, Linux Flatpak, and Windows `.exe` CI releases
 
 **Next up**
 
 - [ ] Native desktop notifications for completed downloads and background save conflicts
 - [ ] Pre-launch remote save conflict prompt (keep local vs. pull newer server overlay)
-- [ ] AppImage / Flatpak / `.rpm` / `.deb` release CI artifacts
+- [ ] Native `.rpm` / `.deb` release packages
 
 See the [open issues](https://github.com/piskevalee-cpu/OpenSync-Launcher/issues) for a full list of proposed features (and known issues).
 
