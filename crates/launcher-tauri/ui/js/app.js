@@ -514,6 +514,7 @@ function createCssSelect({ options, value = '', onChange, disabled = false, aria
 // ---------- DOM References ----------
 
 const viewEl = document.getElementById('view');
+const topbarEl = document.getElementById('topbar');
 const profileSwitcherEl = document.getElementById('profile-switcher');
 const statusRightEl = document.getElementById('status-right');
 const modalRoot = document.getElementById('modal-root');
@@ -870,8 +871,14 @@ function attachStatTicker(card, stats, intervalMs = 2000) {
 // ---------- Topbar Navigation & Status ----------
 
 function syncFabVisibility() {
-  if (!fabUploadEl) return;
-  fabUploadEl.hidden = !(state.view === 'library' && Boolean(state.activeProfile));
+  const signedIn = Boolean(state.activeProfile);
+  if (topbarEl) {
+    topbarEl.style.display = signedIn ? '' : 'none';
+  }
+  document.body.classList.toggle('is-auth-screen', !signedIn);
+  if (fabUploadEl) {
+    fabUploadEl.hidden = !(state.view === 'library' && signedIn);
+  }
 }
 
 function initTopbarNav() {
@@ -1288,6 +1295,13 @@ function navigate(nextView, opts = {}) {
 }
 
 function renderCurrentView(animate = false) {
+  syncFabVisibility();
+  // Before signing in, only the sign-in menu may appear.
+  if (!state.activeProfile) {
+    renderLibraryView();
+    gamepadCtrl?.onViewRendered();
+    return;
+  }
   // The orbital field belongs to the auth screen only; drop it the moment any
   // other view (including the connected library) is rendered.
   if (state.view !== 'library' || state.activeProfile) {
@@ -1342,7 +1356,7 @@ function renderCurrentView(animate = false) {
 // screen is replaced by any other view.
 
 const AUTH_CANVAS_STYLE = 'position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:0;display:block;';
-const AUTH_SCREEN_STYLE = 'position:relative;z-index:1;min-height:calc(100vh - 150px);';
+const AUTH_SCREEN_STYLE = 'position:relative;z-index:1;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px 0;';
 
 function teardownAuthParticles() {
   if (!stopAuthParticleField) return;
@@ -1781,8 +1795,6 @@ function renderLibraryGrid() {
       topPillHtml = `<span class="card-top-pill playing"><span class="status-dot connected"></span>Playing</span>`;
     } else if (isSyncing) {
       topPillHtml = `<span class="card-top-pill syncing">${icon('refresh-cw', 12, 'spin')}Syncing saves</span>`;
-    } else if (dl) {
-      topPillHtml = `<span class="card-top-pill downloading">${dl.paused ? 'Paused' : `${dlPct}%`}</span>`;
     }
 
     let primaryAction = 'download';
@@ -1798,7 +1810,7 @@ function renderLibraryGrid() {
       primaryAction = 'downloads';
       centerBtnHtml = `
         <button type="button" class="card-center-btn" data-card-action="downloads" aria-label="View download for ${esc(g.name)}" title="Open Download Manager" tabindex="-1">
-          <span class="card-dl-pct">${dlPct}%</span>
+          <span class="card-dl-pct">${dl.paused ? 'Paused' : `${dlPct}%`}</span>
         </button>
       `;
     } else if (g.installed) {

@@ -171,6 +171,11 @@ a:hover {
   padding: 0 24px 60px;
 }
 
+body.is-auth-screen .shell {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
 .topbar {
   position: sticky;
   top: 0;
@@ -869,8 +874,9 @@ textarea.input {
 /* ---------- First-run auth card ---------- */
 
 .auth-wrap {
+  width: 100%;
   max-width: 440px;
-  margin: 34px auto 0;
+  margin: 0 auto;
   padding: 28px 26px 24px;
   text-align: center;
   background: var(--panel);

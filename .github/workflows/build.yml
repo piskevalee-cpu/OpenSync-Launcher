@@ -1,4 +1,4 @@
-name: Build OpenSync Launcher (AppImage & Windows .exe)
+name: Build OpenSync Launcher (AppImage, Flatpak & Windows .exe)
 
 on:
   push:
