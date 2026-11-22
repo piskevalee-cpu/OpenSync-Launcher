@@ -3,7 +3,7 @@
 mod commands;
 
 use commands::AppState;
-use launcher_core::{LauncherCore, LauncherPaths, default_games_dir};
+use launcher_core::{LauncherCore, LauncherPaths, default_data_dir, default_games_dir};
 use launcher_db::{FileSecretStore, LauncherDb};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,38 +11,11 @@ use std::time::Duration;
 use tauri::{Emitter, Manager};
 use tokio::sync::broadcast::error::RecvError;
 
+/// Resolves the launcher data root. On macOS this is
+/// `~/Library/Application Support/opensync-launcher`; other platforms keep their XDG or
+/// Windows locations. The logic lives in `launcher-db` so it is shared and testable.
 fn resolve_data_root() -> PathBuf {
-    if let Ok(custom) = std::env::var("OPENSYNC_LAUNCHER_DATA")
-        && !custom.trim().is_empty()
-    {
-        return PathBuf::from(custom);
-    }
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
-        && !xdg.trim().is_empty()
-    {
-        return PathBuf::from(xdg).join("opensync-launcher");
-    }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.trim().is_empty()
-    {
-        return PathBuf::from(home).join(".local/share/opensync-launcher");
-    }
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA")
-        && !local_app_data.trim().is_empty()
-    {
-        return PathBuf::from(local_app_data).join("opensync-launcher");
-    }
-    if let Ok(app_data) = std::env::var("APPDATA")
-        && !app_data.trim().is_empty()
-    {
-        return PathBuf::from(app_data).join("opensync-launcher");
-    }
-    if let Ok(user_profile) = std::env::var("USERPROFILE")
-        && !user_profile.trim().is_empty()
-    {
-        return PathBuf::from(user_profile).join("AppData/Local/opensync-launcher");
-    }
-    PathBuf::from("./opensync-launcher-data")
+    default_data_dir()
 }
 
 #[derive(Clone, serde::Serialize)]
