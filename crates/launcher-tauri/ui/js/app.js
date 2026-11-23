@@ -131,7 +131,7 @@ function pfpSlotHtml(profileId, userId, pfpPath, className, label) {
   }
   const cached = state.pfpCache.get(key);
   if (cached) {
-    return `<img class="${safeClass}" src="${cached}" alt="" decoding="async" />`;
+    return `<img class="${safeClass}" src="${esc(cached)}" alt="" decoding="async" />`;
   }
   return `<span class="${safeClass} pfp-pending" data-pfp-key="${esc(key)}" data-pfp-class="${safeClass}" aria-hidden="true">${monogramHtml}</span>`;
 }
@@ -4248,7 +4248,7 @@ function openLightbox(src, alt) {
   lightboxRoot.innerHTML = `
     <div class="modal-backdrop" id="lightbox-bg">
       <div class="lightbox-frame">
-        <img src="${src}" alt="${esc(alt)}" />
+        <img src="${esc(src)}" alt="${esc(alt)}" />
         <button type="button" class="btn btn-icon lightbox-close" id="lightbox-close-btn" aria-label="Close lightbox">${icon('x', 16)}</button>
       </div>
     </div>

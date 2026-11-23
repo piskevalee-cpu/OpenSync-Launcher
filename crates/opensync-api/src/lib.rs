@@ -428,16 +428,11 @@ impl OpenSyncClient {
                 message,
             });
         }
-        let content_type = res
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase())
-            .filter(|s| s == "image/jpeg" || s == "image/png");
-        let Some(content_type) = content_type else {
+        let bytes = res.bytes().await?.to_vec();
+        let Some(content_type) = safe_image_mime(&bytes) else {
             return Ok(None);
         };
-        Ok(Some((res.bytes().await?.to_vec(), content_type)))
+        Ok(Some((bytes, content_type.to_string())))
     }
 
     /// Uploads raw JPG/PNG bytes to the active account's profile picture.

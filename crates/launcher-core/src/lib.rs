@@ -816,12 +816,13 @@ impl LauncherCore {
         let mime_path = dir.join(format!("{base}.mime"));
 
         if let Ok(ct_raw) = std::fs::read_to_string(&mime_path) {
-            let ct = ct_raw.trim().to_string();
+            let ct = ct_raw.trim().to_ascii_lowercase();
             let data_path = dir.join(format!("{base}.{}", ext_for_mime(&ct)));
             if let Ok(bytes) = std::fs::read(&data_path)
                 && !bytes.is_empty()
+                && let Some(safe) = safe_image_mime(&bytes)
             {
-                return Ok(Some((bytes, ct)));
+                return Ok(Some((bytes, safe.to_string())));
             }
         }
 
@@ -3404,26 +3405,90 @@ fn install_dir_for_slug(games_dir: &Path, profile_id: &str, slug: &str) -> CoreR
     if candidate == canonical_base || !candidate.starts_with(&canonical_base) {
         return Err(CoreError::UnsafeInstallDir(candidate));
     }
+    if candidate
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(CoreError::UnsafeInstallDir(candidate));
+    }
     Ok(candidate)
 }
 
-/// Verifies that an install directory restored from SQLite is still contained in
-/// the profile's games directory before it is written to or deleted. Existing
-/// directories are canonicalized so a symlink cannot redirect the operation
-/// outside of the games tree.
+/// Canonicalizes `path` by resolving its deepest existing ancestor with `canonicalize`
+/// (rejecting any symlink component along the way) and appending only plain `Normal`
+/// non-existent tail components so `..`, broken symlinks, and Windows `\\?\` / macOS
+/// `/private/var` prefix mismatches are all handled uniformly.
+fn resolve_without_traversal_or_symlink(path: &Path) -> CoreResult<PathBuf> {
+    let mut cur = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+
+    loop {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(CoreError::UnsafeInstallDir(path.to_path_buf()));
+                }
+                let mut resolved = std::fs::canonicalize(&cur)?;
+                for seg in tail.into_iter().rev() {
+                    resolved.push(seg);
+                }
+                return Ok(resolved);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cur.file_name() else {
+                    return Err(CoreError::UnsafeInstallDir(path.to_path_buf()));
+                };
+                if name == "." || name == ".." {
+                    return Err(CoreError::UnsafeInstallDir(path.to_path_buf()));
+                }
+                tail.push(name.to_os_string());
+                let Some(parent) = cur.parent() else {
+                    return Err(CoreError::UnsafeInstallDir(path.to_path_buf()));
+                };
+                cur = parent.to_path_buf();
+            }
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+    }
+}
+
+/// Verifies that an install directory restored from SQLite is safe to write to or delete:
+/// either it resolves inside the active `games_dir/<profile_id>` tree, or (when the user
+/// changed `games_dir` in Settings after installing) its canonicalized parent is `<profile_id>`
+/// and its leaf folder name is a valid game slug, with no symlinks or `..` traversal.
 fn assert_install_dir_contained(games_dir: &Path, profile_id: &str, dir: &Path) -> CoreResult<()> {
-    let base = games_dir.join(profile_id);
-    std::fs::create_dir_all(&base)?;
-    let canonical_base = std::fs::canonicalize(&base)?;
-    let resolved = if dir.exists() {
-        std::fs::canonicalize(dir)?
-    } else {
-        dir.to_path_buf()
-    };
-    if resolved == canonical_base || !resolved.starts_with(&canonical_base) {
+    if dir
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(CoreError::UnsafeInstallDir(dir.to_path_buf()));
     }
-    Ok(())
+
+    let resolved = resolve_without_traversal_or_symlink(dir)?;
+    let base = games_dir.join(profile_id);
+    if base.exists() {
+        let canonical_base = std::fs::canonicalize(&base)?;
+        if resolved != canonical_base && resolved.starts_with(&canonical_base) {
+            return Ok(());
+        }
+    }
+
+    // Allow legacy/remembered installs from a prior `games_dir` only if they still
+    // strictly follow `.../<profile_id>/<valid_slug>`.
+    let parent_ok = resolved
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some(profile_id);
+    let leaf_ok = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|s| validate_game_slug(s).is_ok());
+    if parent_ok && leaf_ok {
+        return Ok(());
+    }
+
+    Err(CoreError::UnsafeInstallDir(dir.to_path_buf()))
 }
 
 fn pfp_cache_base(profile_id: &str, user_id: i64) -> String {
@@ -3561,5 +3626,19 @@ mod path_safety_tests {
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         #[cfg(unix)]
         assert!(assert_install_dir_contained(&games_dir, "profile-1", &link).is_err());
+
+        // Non-existent traversal tail under the profile dir must be rejected.
+        let non_existent_escape = profile_dir.join("foo/../../escaped-new");
+        assert!(assert_install_dir_contained(&games_dir, "profile-1", &non_existent_escape).is_err());
+
+        // Valid non-existent remembered dir (after uninstall/delete) is accepted.
+        let nonexistent_valid = profile_dir.join("celeste");
+        assert_install_dir_contained(&games_dir, "profile-1", &nonexistent_valid).unwrap();
+
+        // Changing games_dir in Settings still allows managing existing `<prev>/<profile_id>/<slug>` installs.
+        let other_games_dir = dir.path().join("other-games");
+        let legacy_install = other_games_dir.join("profile-1").join("fogwoods");
+        std::fs::create_dir_all(&legacy_install).unwrap();
+        assert_install_dir_contained(&games_dir, "profile-1", &legacy_install).unwrap();
     }
 }
