@@ -3,7 +3,7 @@ use launcher_db::{
     ActiveSessionRecord, ActivityLogEntry, DbError, InstalledGame, LauncherDb, PendingSync,
     PlaytimeSummary, Profile, SecretStore,
 };
-use opensync_api::{ApiError, Game, OpenSyncClient, User};
+use opensync_api::{ApiError, Game, OpenSyncClient, User, safe_image_mime};
 use opensync_proton::{
     GeProtonRelease, ProtonError, ProtonInstallation, default_proton_search_roots,
     detect_proton_in_roots, discover_executables, download_and_install_ge_proton_with_control,
@@ -54,6 +54,10 @@ pub enum CoreError {
     UploadNotFound(String),
     #[error("game {0} is not installed for the active profile")]
     GameNotInstalled(i64),
+    #[error("unsafe game slug rejected: {0}")]
+    UnsafeGameSlug(String),
+    #[error("install directory escapes the games directory: {0}")]
+    UnsafeInstallDir(PathBuf),
     #[error("reconnect failed after {attempts} attempts: {last_error}")]
     ReconnectExhausted { attempts: u32, last_error: String },
 }
@@ -812,12 +816,13 @@ impl LauncherCore {
         let mime_path = dir.join(format!("{base}.mime"));
 
         if let Ok(ct_raw) = std::fs::read_to_string(&mime_path) {
-            let ct = ct_raw.trim().to_string();
+            let ct = ct_raw.trim().to_ascii_lowercase();
             let data_path = dir.join(format!("{base}.{}", ext_for_mime(&ct)));
             if let Ok(bytes) = std::fs::read(&data_path)
                 && !bytes.is_empty()
+                && let Some(safe) = safe_image_mime(&bytes)
             {
-                return Ok(Some((bytes, ct)));
+                return Ok(Some((bytes, safe.to_string())));
             }
         }
 
@@ -1058,12 +1063,16 @@ impl LauncherCore {
         if mime_path.is_file()
             && let Ok(ct_raw) = std::fs::read_to_string(&mime_path)
         {
-            let ct = ct_raw.trim().to_string();
+            let ct = ct_raw.trim().to_ascii_lowercase();
             let data_path = covers_dir.join(format!("{base}.{}", ext_for_mime(&ct)));
             if let Ok(bytes) = std::fs::read(&data_path)
                 && !bytes.is_empty()
             {
-                return Ok((bytes, ct));
+                // A cached .mime file is untrusted data (it may predate this fix or have
+                // been tampered with). Re-derive the literal from the bytes on every read.
+                if let Some(safe) = safe_image_mime(&bytes) {
+                    return Ok((bytes, safe.to_string()));
+                }
             }
         }
 
@@ -1098,10 +1107,14 @@ impl LauncherCore {
         let detail = client.get_game(game_id).await?;
         let verify_clean = fresh || !detail.overlay.has_overlay;
 
-        let install_dir = self
-            .db
-            .get_remembered_install_dir(&profile.id, game_id)?
-            .unwrap_or_else(|| self.games_dir().join(&profile.id).join(&detail.game.slug));
+        let games_dir = self.games_dir();
+        let install_dir = match self.db.get_remembered_install_dir(&profile.id, game_id)? {
+            Some(dir) => {
+                assert_install_dir_contained(&games_dir, &profile.id, &dir)?;
+                dir
+            }
+            None => install_dir_for_slug(&games_dir, &profile.id, &detail.game.slug)?,
+        };
 
         let outcome = download_and_extract_game(
             &client,
@@ -1141,10 +1154,14 @@ impl LauncherCore {
         let game_slug = detail.game.slug.clone();
         let initial_total = detail.game.total_size;
 
-        let install_dir = self
-            .db
-            .get_remembered_install_dir(&profile.id, game_id)?
-            .unwrap_or_else(|| self.games_dir().join(&profile.id).join(&game_slug));
+        let games_dir = self.games_dir();
+        let install_dir = match self.db.get_remembered_install_dir(&profile.id, game_id)? {
+            Some(dir) => {
+                assert_install_dir_contained(&games_dir, &profile.id, &dir)?;
+                dir
+            }
+            None => install_dir_for_slug(&games_dir, &profile.id, &game_slug)?,
+        };
 
         let job_id = Uuid::new_v4().to_string();
         let seq = self.next_job_seq.fetch_add(1, Ordering::Relaxed);
@@ -2003,7 +2020,7 @@ impl LauncherCore {
         // The game is now indexed on the server. Bring the local files into the launcher's
         // games directory and register the install so it is immediately playable.
         let detail = client.get_game(game_id).await?;
-        let target_dir = self.games_dir().join(profile_id).join(&detail.game.slug);
+        let target_dir = install_dir_for_slug(&self.games_dir(), profile_id, &detail.game.slug)?;
         let src_for_move = source_root.to_path_buf();
         let dst_for_move = target_dir.clone();
         let move_res = tokio::task::spawn_blocking(move || {
@@ -2326,6 +2343,9 @@ impl LauncherCore {
             ),
         );
         if installed.install_dir.exists() {
+            // The stored path may have come from an older, vulnerable version. Refuse
+            // to delete anything outside the profile's games directory.
+            assert_install_dir_contained(&self.games_dir(), &profile.id, &installed.install_dir)?;
             let dir = installed.install_dir.clone();
             tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir))
                 .await
@@ -3355,6 +3375,122 @@ fn safe_cache_component(value: &str) -> String {
         .collect()
 }
 
+/// A game slug is supplied by a remote (possibly hostile) server and is used as a
+/// single directory name. Accept only one plain ASCII segment — never an absolute
+/// path, a parent reference, a separator, or an embedded NUL.
+fn validate_game_slug(slug: &str) -> CoreResult<()> {
+    let valid = !slug.is_empty()
+        && slug.len() <= 128
+        && slug != "."
+        && slug != ".."
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(CoreError::UnsafeGameSlug(slug.to_string()))
+    }
+}
+
+/// Computes the install directory for a freshly installed game. The slug is
+/// validated first and the result is checked against the canonicalized profile
+/// games directory, so a malicious slug can never escape into an arbitrary path.
+fn install_dir_for_slug(games_dir: &Path, profile_id: &str, slug: &str) -> CoreResult<PathBuf> {
+    validate_game_slug(slug)?;
+    let base = games_dir.join(profile_id);
+    std::fs::create_dir_all(&base)?;
+    let canonical_base = std::fs::canonicalize(&base)?;
+    let candidate = canonical_base.join(slug);
+    if candidate == canonical_base || !candidate.starts_with(&canonical_base) {
+        return Err(CoreError::UnsafeInstallDir(candidate));
+    }
+    if candidate
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(CoreError::UnsafeInstallDir(candidate));
+    }
+    Ok(candidate)
+}
+
+/// Canonicalizes `path` by resolving its deepest existing ancestor with `canonicalize`
+/// (rejecting any symlink component along the way) and appending only plain `Normal`
+/// non-existent tail components so `..`, broken symlinks, and Windows `\\?\` / macOS
+/// `/private/var` prefix mismatches are all handled uniformly.
+fn resolve_without_traversal_or_symlink(path: &Path) -> CoreResult<PathBuf> {
+    let mut cur = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+
+    loop {
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(CoreError::UnsafeInstallDir(path.to_path_buf()));
+                }
+                let mut resolved = std::fs::canonicalize(&cur)?;
+                for seg in tail.into_iter().rev() {
+                    resolved.push(seg);
+                }
+                return Ok(resolved);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cur.file_name() else {
+                    return Err(CoreError::UnsafeInstallDir(path.to_path_buf()));
+                };
+                if name == "." || name == ".." {
+                    return Err(CoreError::UnsafeInstallDir(path.to_path_buf()));
+                }
+                tail.push(name.to_os_string());
+                let Some(parent) = cur.parent() else {
+                    return Err(CoreError::UnsafeInstallDir(path.to_path_buf()));
+                };
+                cur = parent.to_path_buf();
+            }
+            Err(e) => return Err(CoreError::Io(e)),
+        }
+    }
+}
+
+/// Verifies that an install directory restored from SQLite is safe to write to or delete:
+/// either it resolves inside the active `games_dir/<profile_id>` tree, or (when the user
+/// changed `games_dir` in Settings after installing) its canonicalized parent is `<profile_id>`
+/// and its leaf folder name is a valid game slug, with no symlinks or `..` traversal.
+fn assert_install_dir_contained(games_dir: &Path, profile_id: &str, dir: &Path) -> CoreResult<()> {
+    if dir
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(CoreError::UnsafeInstallDir(dir.to_path_buf()));
+    }
+
+    let resolved = resolve_without_traversal_or_symlink(dir)?;
+    let base = games_dir.join(profile_id);
+    if base.exists() {
+        let canonical_base = std::fs::canonicalize(&base)?;
+        if resolved != canonical_base && resolved.starts_with(&canonical_base) {
+            return Ok(());
+        }
+    }
+
+    // Allow legacy/remembered installs from a prior `games_dir` only if they still
+    // strictly follow `.../<profile_id>/<valid_slug>`.
+    let parent_ok = resolved
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        == Some(profile_id);
+    let leaf_ok = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|s| validate_game_slug(s).is_ok());
+    if parent_ok && leaf_ok {
+        return Ok(());
+    }
+
+    Err(CoreError::UnsafeInstallDir(dir.to_path_buf()))
+}
+
 fn pfp_cache_base(profile_id: &str, user_id: i64) -> String {
     format!("{}_{}", safe_cache_component(profile_id), user_id)
 }
@@ -3422,5 +3558,87 @@ fn format_duration_brief(secs: u64) -> String {
         let hrs = mins / 60;
         let rem_m = mins % 60;
         format!("{hrs}h {rem_m}m")
+    }
+}
+
+#[cfg(test)]
+mod path_safety_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn game_slug_allowlist_rejects_traversal_and_absolute_paths() {
+        for slug in ["fogwoods", "cyber-runner-2077", "game_2"] {
+            validate_game_slug(slug).unwrap();
+        }
+        for slug in [
+            "",
+            ".",
+            "..",
+            "/etc/passwd",
+            "../escaped",
+            "a/b",
+            "a\\b",
+            "game\0.exe",
+            "Uppercase",
+            "caf\u{e9}",
+        ] {
+            assert!(
+                validate_game_slug(slug).is_err(),
+                "slug {slug:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn install_dir_for_slug_stays_under_games_directory() {
+        let dir = tempdir().unwrap();
+        let games_dir = dir.path().join("games");
+        let install = install_dir_for_slug(&games_dir, "profile-1", "fogwoods").unwrap();
+        assert!(install.starts_with(games_dir.join("profile-1")));
+        assert_eq!(install.file_name().unwrap(), "fogwoods");
+
+        let escape = dir.path().join("escaped");
+        assert!(install_dir_for_slug(&games_dir, "profile-1", escape.to_str().unwrap()).is_err());
+        assert!(install_dir_for_slug(&games_dir, "profile-1", "../escaped").is_err());
+        assert!(!escape.exists());
+    }
+
+    #[test]
+    fn install_dir_containment_rejects_paths_outside_games_directory() {
+        let dir = tempdir().unwrap();
+        let games_dir = dir.path().join("games");
+        let profile_dir = games_dir.join("profile-1");
+        let safe = profile_dir.join("fogwoods");
+        std::fs::create_dir_all(&safe).unwrap();
+        assert_install_dir_contained(&games_dir, "profile-1", &safe).unwrap();
+
+        // The profile root itself is never a valid install directory.
+        assert!(assert_install_dir_contained(&games_dir, "profile-1", &profile_dir).is_err());
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(assert_install_dir_contained(&games_dir, "profile-1", &outside).is_err());
+
+        // A symlink inside the games tree pointing elsewhere must be rejected too.
+        let link = profile_dir.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        #[cfg(unix)]
+        assert!(assert_install_dir_contained(&games_dir, "profile-1", &link).is_err());
+
+        // Non-existent traversal tail under the profile dir must be rejected.
+        let non_existent_escape = profile_dir.join("foo/../../escaped-new");
+        assert!(assert_install_dir_contained(&games_dir, "profile-1", &non_existent_escape).is_err());
+
+        // Valid non-existent remembered dir (after uninstall/delete) is accepted.
+        let nonexistent_valid = profile_dir.join("celeste");
+        assert_install_dir_contained(&games_dir, "profile-1", &nonexistent_valid).unwrap();
+
+        // Changing games_dir in Settings still allows managing existing `<prev>/<profile_id>/<slug>` installs.
+        let other_games_dir = dir.path().join("other-games");
+        let legacy_install = other_games_dir.join("profile-1").join("fogwoods");
+        std::fs::create_dir_all(&legacy_install).unwrap();
+        assert_install_dir_contained(&games_dir, "profile-1", &legacy_install).unwrap();
     }
 }

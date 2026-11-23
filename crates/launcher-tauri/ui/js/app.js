@@ -131,7 +131,7 @@ function pfpSlotHtml(profileId, userId, pfpPath, className, label) {
   }
   const cached = state.pfpCache.get(key);
   if (cached) {
-    return `<img class="${safeClass}" src="${cached}" alt="" decoding="async" />`;
+    return `<img class="${safeClass}" src="${esc(cached)}" alt="" decoding="async" />`;
   }
   return `<span class="${safeClass} pfp-pending" data-pfp-key="${esc(key)}" data-pfp-class="${safeClass}" aria-hidden="true">${monogramHtml}</span>`;
 }
@@ -2086,7 +2086,7 @@ function renderLibraryGrid() {
 
     let coverHtml;
     if (coverUrl) {
-      coverHtml = `<img class="card-cover-img" src="${coverUrl}" alt="${esc(g.name)}" loading="lazy" decoding="async" />`;
+      coverHtml = `<img class="card-cover-img" src="${esc(coverUrl)}" alt="${esc(g.name)}" loading="lazy" decoding="async" />`;
     } else {
       coverHtml = `
         <div class="card-cover-placeholder" data-cover-game="${g.game_id}" data-cover-class="card-cover-img" aria-hidden="true">
@@ -2253,7 +2253,7 @@ function renderGameDetailView() {
   syncDetailHero(g);
 
   const coverInner = coverUrl
-    ? `<img src="${coverUrl}" alt="${esc(g.name)}" decoding="async" /><span class="cover-zoom-hint">Expand</span>`
+    ? `<img src="${esc(coverUrl)}" alt="${esc(g.name)}" decoding="async" /><span class="cover-zoom-hint">Expand</span>`
     : `<div class="card-cover-placeholder" data-cover-game="${g.game_id}" data-cover-class=""><span class="card-cover-monogram">${esc(monogram(g.name))}</span></div>`;
 
   const isWindows = g.binary_kind === 'WindowsPe';
@@ -2887,7 +2887,7 @@ function renderUploadView() {
           <div class="field">
             <label>Cover image (optional)</label>
             <div class="cover-picker" id="up-cover-picker" role="button" tabindex="0">
-              ${form.coverDataUrl ? `<img class="cover-preview" src="${form.coverDataUrl}" alt="Cover preview" decoding="async" />` : ''}
+              ${form.coverDataUrl ? `<img class="cover-preview" src="${esc(form.coverDataUrl)}" alt="Cover preview" decoding="async" />` : ''}
               <span class="muted small" id="up-cover-label">${form.coverDataUrl ? 'Click to replace or drop a JPG/PNG' : 'Click to choose or drop a JPG/PNG'}</span>
               ${form.coverDataUrl ? `<button type="button" class="btn btn-sm btn-ghost" id="up-cover-remove">Remove</button>` : ''}
               <input type="file" id="up-cover-input" accept="image/jpeg,image/png" hidden />
@@ -4248,7 +4248,7 @@ function openLightbox(src, alt) {
   lightboxRoot.innerHTML = `
     <div class="modal-backdrop" id="lightbox-bg">
       <div class="lightbox-frame">
-        <img src="${src}" alt="${esc(alt)}" />
+        <img src="${esc(src)}" alt="${esc(alt)}" />
         <button type="button" class="btn btn-icon lightbox-close" id="lightbox-close-btn" aria-label="Close lightbox">${icon('x', 16)}</button>
       </div>
     </div>
