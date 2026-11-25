@@ -686,6 +686,46 @@ pub fn build_launch_command(
     }
 }
 
+/// Re-roots a launch command on the host when the launcher itself runs inside a Flatpak.
+///
+/// Flatpak runtimes are minimal: since GNOME 49 the GNOME runtime no longer ships an
+/// i386 compatibility extension, so a 32-bit Windows game launched through Proton/Wine
+/// dies immediately with `/lib/ld-linux.so.2: could not open`. `flatpak-spawn --host`
+/// executes the very same command in the host session, where Proton has a complete
+/// 32-bit runtime (this is also why the same games work in Lutris).
+///
+/// The app must hold the `org.freedesktop.Flatpak` D-Bus talk permission for this to
+/// work; without it the spawn fails with a clear error instead of silently dying.
+pub fn wrap_launch_for_flatpak_host(spec: LaunchCommandSpec) -> LaunchCommandSpec {
+    if std::env::var_os("FLATPAK_ID").is_none() {
+        return spec;
+    }
+    let Some(spawn) = find_on_path("flatpak-spawn").or_else(|| {
+        let fallback = PathBuf::from("/usr/bin/flatpak-spawn");
+        fallback.is_file().then_some(fallback)
+    }) else {
+        return spec;
+    };
+
+    let mut args = vec![
+        "--host".to_string(),
+        format!("--directory={}", spec.working_dir.display()),
+    ];
+    for (key, value) in &spec.env {
+        args.push(format!("--env={key}={value}"));
+    }
+    args.push(spec.program.to_string_lossy().into_owned());
+    args.extend(spec.args.iter().cloned());
+
+    LaunchCommandSpec {
+        program: spawn,
+        args,
+        env: spec.env,
+        working_dir: spec.working_dir,
+        runtime_label: format!("{} (Flatpak host)", spec.runtime_label),
+    }
+}
+
 fn find_on_path(bin: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -1025,6 +1065,42 @@ mod tests {
         assert_eq!(found.len(), 1, "unexpected candidates: {found:?}");
         assert_eq!(found[0].kind, BinaryKind::MacOsAppBundle);
         assert_eq!(found[0].rel_path, "MyGame.app");
+    }
+
+    #[test]
+    fn flatpak_launch_is_rerooted_on_the_host() {
+        // Simulate running inside a Flatpak (edition 2024 makes env mutation unsafe).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spawn = dir.path().join("flatpak-spawn");
+        fs::write(&spawn, b"#!/bin/sh\n").expect("write fake flatpak-spawn");
+        let old_path = std::env::var_os("PATH");
+        let new_path = format!("{}:{}", dir.path().display(), old_path.clone().unwrap_or_default().to_string_lossy());
+        unsafe {
+            std::env::set_var("FLATPAK_ID", "io.opensync.launcher");
+            std::env::set_var("PATH", &new_path);
+        }
+        let spec = LaunchCommandSpec {
+            program: PathBuf::from("/usr/bin/proton"),
+            args: vec!["run".into(), "/home/aki/games/HMA.exe".into()],
+            env: vec![("GAMEID".into(), "opensync-0".into())],
+            working_dir: PathBuf::from("/home/aki/games"),
+            runtime_label: "GE-Proton".into(),
+        };
+        let wrapped = wrap_launch_for_flatpak_host(spec);
+        unsafe {
+            std::env::remove_var("FLATPAK_ID");
+            match old_path {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_eq!(wrapped.program, spawn);
+        assert_eq!(wrapped.args[0], "--host");
+        assert_eq!(wrapped.args[1], "--directory=/home/aki/games");
+        assert!(wrapped.args.iter().any(|a| a == "--env=GAMEID=opensync-0"));
+        assert!(wrapped.args.iter().any(|a| a == "/usr/bin/proton"));
+        assert!(wrapped.runtime_label.contains("Flatpak host"));
     }
 
     #[test]
