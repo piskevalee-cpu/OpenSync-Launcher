@@ -275,7 +275,10 @@ async fn picked_folder_upload_moves_into_games_dir_and_marks_installed() {
         let st = srv.state.lock().unwrap();
         st.games.get(&game_id).unwrap().slug.clone()
     };
-    let expected_dir = dir.path().join("games").join(&profile.id).join(&slug);
+    // Install dirs are canonicalized by the core; canonicalize the expected base too
+    // so macOS /var (a symlink to /private/var) does not break the comparison below.
+    let games_dir = fs::canonicalize(dir.path().join("games")).unwrap();
+    let expected_dir = games_dir.join(&profile.id).join(&slug);
 
     // The files were moved, not copied: the original picked folder no longer exists.
     assert!(expected_dir.join("mygame.sh").is_file());
@@ -371,5 +374,6 @@ async fn dropped_upload_stages_chunks_then_finalizes() {
         fs::read(installed.install_dir.join("saves/slot1.dat")).unwrap(),
         payload
     );
-    assert!(installed.install_dir.starts_with(dir.path().join("games")));
+    let games_dir = fs::canonicalize(dir.path().join("games")).unwrap();
+    assert!(installed.install_dir.starts_with(games_dir));
 }
