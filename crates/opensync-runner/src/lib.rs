@@ -3,6 +3,7 @@ use launcher_db::{ActiveSessionRecord, DbError, InstalledGame, LauncherDb, PlayS
 use opensync_api::OpenSyncClient;
 use opensync_proton::{
     LaunchCommandSpec, ProtonError, ProtonInstallation, build_launch_command, discover_executables,
+    wrap_launch_for_flatpak_host,
 };
 use opensync_sync::{SyncReport, sync_game_saves};
 use std::path::{Path, PathBuf};
@@ -67,6 +68,11 @@ pub enum RunnerError {
     Io(#[from] std::io::Error),
     #[error("no launchable executable found in {0}")]
     NoExecutableFound(PathBuf),
+    #[error("game failed to start: process exited after {elapsed:?} with status {code:?}")]
+    GameFailedToStart {
+        code: Option<i32>,
+        elapsed: Duration,
+    },
 }
 
 pub type RunnerResult<T> = Result<T, RunnerError>;
@@ -235,7 +241,12 @@ pub async fn launch_and_track_with_hook<F>(
 where
     F: FnOnce(u64, Option<i32>),
 {
-    let spec = resolve_launch_command(game, proton, &options.prefixes_root, &options.extra_args)?;
+    let spec = wrap_launch_for_flatpak_host(resolve_launch_command(
+        game,
+        proton,
+        &options.prefixes_root,
+        &options.extra_args,
+    )?);
 
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args)
@@ -286,6 +297,18 @@ where
     };
 
     let ended_at = Utc::now();
+    let elapsed = mono_start.elapsed();
+    // A game that dies almost immediately never really started (e.g. Proton failing with
+    // `/lib/ld-linux.so.2: could not open` inside a Flatpak without 32-bit libs). Treat it
+    // as a launch failure rather than recording a fake play session + successful save sync.
+    if !status.success() && elapsed < Duration::from_secs(5) {
+        let _ = db.clear_active_session(&game.profile_id, game.game_id);
+        on_process_exit(0, status.code());
+        return Err(RunnerError::GameFailedToStart {
+            code: status.code(),
+            elapsed,
+        });
+    }
     // Ensure very short sessions that still ran (> 0ms) record at least their rounded active seconds.
     let active_secs = clock.active_secs();
     on_process_exit(active_secs, status.code());

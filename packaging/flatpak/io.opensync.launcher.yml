@@ -16,6 +16,38 @@ finish-args:
   - --filesystem=home
   - --filesystem=xdg-run/app/com.valvesoftware.Steam:create
   - --talk-name=org.freedesktop.Notifications
+  # Needed by the Flatpak host-launch fallback (flatpak-spawn --host): Proton/Wine
+  # needs a complete runtime (notably 32-bit libs) that the GNOME 49 sandbox lacks.
+  - --talk-name=org.freedesktop.Flatpak
+  # GNOME 49 no longer provides its own i386 compat extension, so expose the
+  # freedesktop one explicitly and let the loader find the installed 32-bit libs.
+  - --env=LD_LIBRARY_PATH=/app/lib/i386-linux-gnu
+
+# Do not use `inherit-extensions` here: it copies extension points from the parent
+# runtime's metadata, and org.gnome.Platform 49 no longer declares the i386/GL32
+# points (flatpak-builder then fails with "Can't find inherited extension point
+# org.freedesktop.Platform.Compat.i386"). Defining the points with `add-extensions`
+# below is the supported way to attach the freedesktop compat extensions to an app.
+add-extensions:
+  org.freedesktop.Platform.Compat.i386:
+    directory: lib/i386-linux-gnu
+    version: '25.08'
+  org.freedesktop.Platform.Compat.i386.Debug:
+    directory: lib/debug/lib/i386-linux-gnu
+    version: '25.08'
+    no-autodownload: true
+  org.freedesktop.Platform.GL32:
+    directory: lib/i386-linux-gnu/GL
+    version: '1.4'
+    versions: '25.08;1.4'
+    subdirectories: true
+    no-autodownload: true
+    autodelete: false
+    add-ld-path: lib
+
+cleanup-commands:
+  - mkdir -p /app/lib/i386-linux-gnu
+  - ln -sfn /app/lib/i386-linux-gnu /app/lib32
 
 modules:
   - name: opensync-launcher
