@@ -237,8 +237,8 @@ function normalizeDownloadJob(raw) {
     subtitle: kindType === 'ge_proton'
       ? 'GE-Proton compatibility runtime (SHA-512 verified)'
       : fresh
-        ? 'Fresh install (clean manifest)'
-        : 'Synced archive (STORE wire-speed)',
+        ? 'Clean install (pristine archive, no saves)'
+        : 'With saves (includes cloud save overlay)',
     stage,
     paused: stage === 'paused',
     bytes_downloaded: bytesDownloaded,
@@ -835,37 +835,63 @@ function showLibraryHoverHero(game) {
   return applyHeroForGame(game, 'hover');
 }
 
+const MAX_CONCURRENT_COVERS = 6;
+const inFlightCovers = new Set();
+const coverQueue = [];
+let activeCoverCount = 0;
+
+function drainCoverQueue() {
+  while (activeCoverCount < MAX_CONCURRENT_COVERS && coverQueue.length > 0) {
+    const next = coverQueue.shift();
+    if (next) next();
+  }
+}
+
 async function ensureCover(game) {
   if (!game || !game.has_cover) return;
-  if (state.coverCache.has(game.game_id) || state.coverPending.has(game.game_id)) return;
+  if (state.coverCache.has(game.game_id) || state.coverPending.has(game.game_id) || inFlightCovers.has(game.game_id)) return;
   state.coverPending.add(game.game_id);
-  try {
-    const dataUrl = await bridge.getGameCoverDataUrl(game.game_id);
-    state.coverCache.set(game.game_id, dataUrl || null);
-    if (dataUrl) {
-      document.querySelectorAll(`[data-cover-game="${game.game_id}"]`).forEach((slot) => {
-        const img = document.createElement('img');
-        img.className = slot.dataset.coverClass || 'card-cover-img';
-        img.src = dataUrl;
-        img.alt = game.name;
-        img.decoding = 'async';
-        slot.replaceWith(img);
-        img.dataset.coverLoaded = String(game.game_id);
-      });
-      const cached = cardDomCache.get(game.game_id);
-      if (cached && cached.sig.endsWith('|0')) {
-        cached.sig = `${cached.sig.slice(0, -2)}|1`;
+  inFlightCovers.add(game.game_id);
+
+  const run = async () => {
+    activeCoverCount += 1;
+    try {
+      const dataUrl = await bridge.getGameCoverDataUrl(game.game_id);
+      state.coverCache.set(game.game_id, dataUrl || null);
+      if (dataUrl) {
+        document.querySelectorAll(`[data-cover-game="${game.game_id}"]`).forEach((slot) => {
+          const img = document.createElement('img');
+          img.className = slot.dataset.coverClass || 'card-cover-img';
+          img.src = dataUrl;
+          img.alt = game.name;
+          img.decoding = 'async';
+          slot.replaceWith(img);
+          img.dataset.coverLoaded = String(game.game_id);
+        });
+        const cached = cardDomCache.get(game.game_id);
+        if (cached && cached.sig.endsWith('|0')) {
+          cached.sig = `${cached.sig.slice(0, -2)}|1`;
+        }
+        if (state.view === 'game-detail' && state.selectedGameId === game.game_id) {
+          syncDetailHero(game);
+        } else if (state.view === 'library' && heroHoverGameId === game.game_id) {
+          showLibraryHoverHero(game);
+        }
       }
-      if (state.view === 'game-detail' && state.selectedGameId === game.game_id) {
-        syncDetailHero(game);
-      } else if (state.view === 'library' && heroHoverGameId === game.game_id) {
-        showLibraryHoverHero(game);
-      }
+    } catch {
+      state.coverCache.set(game.game_id, null);
+    } finally {
+      activeCoverCount -= 1;
+      state.coverPending.delete(game.game_id);
+      inFlightCovers.delete(game.game_id);
+      drainCoverQueue();
     }
-  } catch {
-    state.coverCache.set(game.game_id, null);
-  } finally {
-    state.coverPending.delete(game.game_id);
+  };
+
+  if (activeCoverCount < MAX_CONCURRENT_COVERS) {
+    void run();
+  } else {
+    coverQueue.push(() => { void run(); });
   }
 }
 
@@ -2225,6 +2251,8 @@ async function runCardPrimaryAction(g) {
     navigate('downloads');
   } else if (g.installed) {
     await handleLaunchGame(g);
+  } else if (g.has_overlay) {
+    openDownloadChoiceModal(g);
   } else {
     await handleStartDownload(g, false);
   }
@@ -2267,6 +2295,8 @@ function renderGameDetailView() {
     primaryBtnHtml = `<button type="button" class="btn btn-primary" id="btn-detail-open-dl">${icon('arrow-down', 16)}<span>${dl.paused ? 'Download paused' : `Downloading ${dlPct}%`}</span></button>`;
   } else if (g.installed) {
     primaryBtnHtml = `<button type="button" class="btn btn-primary" id="btn-detail-play" ${isUninstalling ? 'disabled' : ''}>${icon('play', 16)}<span>Play</span></button>`;
+  } else if (g.has_overlay) {
+    primaryBtnHtml = `<button type="button" class="btn btn-primary" id="btn-detail-install" title="Download the game with your synced cloud save overlay">${icon('arrow-down', 16)}<span>Download with saves</span></button>`;
   } else {
     primaryBtnHtml = `<button type="button" class="btn btn-primary" id="btn-detail-install">${icon('arrow-down', 16)}<span>Install (${esc(humanBytes(g.total_size))})</span></button>`;
   }
@@ -2287,9 +2317,9 @@ function renderGameDetailView() {
     `);
   } else if (!dl && g.has_overlay) {
     secondaryBtns.push(`
-      <button type="button" class="btn" id="btn-detail-fresh">
+      <button type="button" class="btn" id="btn-detail-fresh" title="Download a pristine archive without your account saves">
         ${icon('hard-drive', 15)}
-        <span>Fresh install</span>
+        <span>Download clean</span>
       </button>
     `);
   }
@@ -4216,6 +4246,39 @@ function openConnectModal() {
   gamepadCtrl?.onViewRendered();
 }
 
+function openDownloadChoiceModal(game) {
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" id="dl-choice-modal-bg">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-label="Download ${esc(game.name)}">
+        <div class="modal-header">
+          <h2>Download ${esc(game.name)}</h2>
+          <button type="button" class="btn btn-ghost btn-icon" id="dl-choice-close-x" aria-label="Close">${icon('x', 16)}</button>
+        </div>
+        <p class="muted" style="margin:0;">You have synced cloud saves for this game. Choose whether to include your save overlay or download a clean archive.</p>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost" id="dl-choice-cancel">Cancel</button>
+          <button type="button" class="btn" id="dl-choice-clean" title="Pristine archive without your account saves">Download clean</button>
+          <button type="button" class="btn btn-primary" id="dl-choice-saves" title="Includes your synced cloud save overlay">Download with your saves</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.getElementById('dl-choice-close-x')?.addEventListener('click', closeModal);
+  document.getElementById('dl-choice-cancel')?.addEventListener('click', closeModal);
+  document.getElementById('dl-choice-modal-bg')?.addEventListener('click', (e) => {
+    if (e.target.id === 'dl-choice-modal-bg') closeModal();
+  });
+  document.getElementById('dl-choice-clean')?.addEventListener('click', async () => {
+    closeModal();
+    await handleStartDownload(game, true);
+  });
+  document.getElementById('dl-choice-saves')?.addEventListener('click', async () => {
+    closeModal();
+    await handleStartDownload(game, false);
+  });
+  gamepadCtrl?.onViewRendered();
+}
+
 function openConfirmModal({ title, body, confirmLabel = 'Confirm', danger = false, onConfirm }) {
   modalRoot.innerHTML = `
     <div class="modal-backdrop" id="confirm-modal-bg">
@@ -4564,7 +4627,6 @@ async function refreshAll() {
   const boot = await bridge.getBootstrapState();
   state.activeProfile = boot.active_profile || null;
   state.profiles = boot.profiles || [];
-  await refreshCurrentUser();
   state.connectionState = normalizeConnectionState(boot.connection_state);
   state.protonInstallations = boot.proton_installations || [];
   state.pendingSyncs = boot.pending_syncs || [];
@@ -4577,12 +4639,13 @@ async function refreshAll() {
   if (Array.isArray(boot.interrupted_sessions)) {
     state.interruptedSessions = boot.interrupted_sessions;
   }
-  await refreshLibrary();
-  try {
-    const rawUploads = await bridge.listUploads?.();
-    state.uploads = (rawUploads || []).map(normalizeUploadJob).filter(Boolean);
-  } catch {
-    // ignore transient error
+  const [, , rawUploads] = await Promise.all([
+    refreshCurrentUser(),
+    refreshLibrary(),
+    Promise.resolve(bridge.listUploads?.()).catch(() => null),
+  ]);
+  if (rawUploads) {
+    state.uploads = rawUploads.map(normalizeUploadJob).filter(Boolean);
   }
   updateNavState();
   renderStatusStrip();

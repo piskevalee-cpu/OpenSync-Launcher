@@ -16,15 +16,27 @@ use opensync_sync::SyncReport;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 use tauri::State;
+
+const IMAGE_CACHE_MAX_ENTRIES: usize = 500;
+
+type ExeCacheEntry = (
+    Option<SystemTime>,
+    Option<String>,
+    Vec<ExecutableOptionDto>,
+    Option<BinaryKind>,
+);
 
 pub struct AppState {
     pub core: Arc<LauncherCore>,
     pub bandwidth_limit_bps: AtomicU64,
     pub allow_window_close: AtomicBool,
+    pub exe_cache: Arc<Mutex<HashMap<PathBuf, ExeCacheEntry>>>,
+    pub cover_cache: Mutex<HashMap<i64, String>>,
+    pub pfp_cache: Mutex<HashMap<(i64, Option<String>), String>>,
 }
 
 impl AppState {
@@ -33,6 +45,30 @@ impl AppState {
             core,
             bandwidth_limit_bps: AtomicU64::new(0),
             allow_window_close: AtomicBool::new(false),
+            exe_cache: Arc::new(Mutex::new(HashMap::new())),
+            cover_cache: Mutex::new(HashMap::new()),
+            pfp_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn clear_media_caches(&self) {
+        self.cover_cache.lock().unwrap().clear();
+        self.pfp_cache.lock().unwrap().clear();
+    }
+
+    async fn installed_dir_for_game(&self, game_id: i64) -> Option<PathBuf> {
+        let profile = self.core.active_profile().await?;
+        self.core
+            .db()
+            .get_installed_game(&profile.id, game_id)
+            .ok()
+            .flatten()
+            .map(|inst| inst.install_dir)
+    }
+
+    fn invalidate_exe_cache_dir(&self, dir: Option<PathBuf>) {
+        if let Some(install_dir) = dir {
+            self.exe_cache.lock().unwrap().remove(&install_dir);
         }
     }
 }
@@ -139,25 +175,55 @@ fn err_str(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+fn insert_bounded_cache<K: Eq + std::hash::Hash + Clone>(
+    cache: &Mutex<HashMap<K, String>>,
+    key: K,
+    value: String,
+) {
+    let mut guard = cache.lock().unwrap();
+    if guard.len() >= IMAGE_CACHE_MAX_ENTRIES
+        && !guard.contains_key(&key)
+        && let Some(evict_key) = guard.keys().next().cloned()
+    {
+        guard.remove(&evict_key);
+    }
+    guard.insert(key, value);
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn get_bootstrap_state(state: State<'_, AppState>) -> Result<BootstrapStateDto, String> {
-    let active_profile = state.core.active_profile().await;
-    let profiles = state.core.list_profiles().map_err(err_str)?;
-    let connection_state = ConnectionStateDto::from(state.core.connection_state().await);
+    let core_for_profiles = Arc::clone(&state.core);
     let core_for_proton = Arc::clone(&state.core);
-    let proton_installations = tokio::task::spawn_blocking(move || core_for_proton.detect_proton())
-        .await
-        .map_err(|e| format!("proton scan failed: {e}"))?;
-    let pending_syncs = state.core.list_pending_syncs().await.unwrap_or_default();
-    let downloads = state.core.list_downloads().await;
+    let (
+        active_profile,
+        profiles_res,
+        connection_state,
+        proton_res,
+        pending_syncs_res,
+        downloads,
+        interrupted_sessions_res,
+        activity_logs_res,
+    ) = tokio::join!(
+        state.core.active_profile(),
+        tokio::task::spawn_blocking(move || core_for_profiles.list_profiles()),
+        state.core.connection_state(),
+        tokio::task::spawn_blocking(move || core_for_proton.detect_proton()),
+        state.core.list_pending_syncs(),
+        state.core.list_downloads(),
+        state.core.detect_interrupted_sessions(),
+        state.core.list_activity_logs(80),
+    );
+
+    let profiles = profiles_res
+        .map_err(|e| format!("profile list failed: {e}"))?
+        .map_err(err_str)?;
+    let connection_state = ConnectionStateDto::from(connection_state);
+    let proton_installations = proton_res.map_err(|e| format!("proton scan failed: {e}"))?;
+    let pending_syncs = pending_syncs_res.unwrap_or_default();
     let bandwidth_limit_bps = state.bandwidth_limit_bps.load(Ordering::Relaxed);
     let games_dir = state.core.games_dir().to_string_lossy().to_string();
-    let interrupted_sessions = state
-        .core
-        .detect_interrupted_sessions()
-        .await
-        .unwrap_or_default();
-    let activity_logs = state.core.list_activity_logs(80).await.unwrap_or_default();
+    let interrupted_sessions = interrupted_sessions_res.unwrap_or_default();
+    let activity_logs = activity_logs_res.unwrap_or_default();
 
     Ok(BootstrapStateDto {
         active_profile,
@@ -231,19 +297,21 @@ pub async fn connect_profile(
     password: String,
     register: bool,
 ) -> Result<Profile, String> {
-    if register {
+    let profile = if register {
         state
             .core
             .register_and_connect(&label, &server_url, &username, &password)
             .await
-            .map_err(err_str)
+            .map_err(err_str)?
     } else {
         state
             .core
             .connect_with_password(&label, &server_url, &username, &password)
             .await
-            .map_err(err_str)
-    }
+            .map_err(err_str)?
+    };
+    state.clear_media_caches();
+    Ok(profile)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -251,11 +319,13 @@ pub async fn switch_profile(
     state: State<'_, AppState>,
     profile_id: String,
 ) -> Result<Profile, String> {
-    state
+    let profile = state
         .core
         .switch_profile(&profile_id)
         .await
-        .map_err(err_str)
+        .map_err(err_str)?;
+    state.clear_media_caches();
+    Ok(profile)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -268,6 +338,7 @@ pub async fn delete_profile(
         .delete_profile(&profile_id)
         .await
         .map_err(err_str)?;
+    state.clear_media_caches();
     Ok(true)
 }
 
@@ -286,6 +357,11 @@ pub async fn get_user_pfp_data_url(
     pfp_path: Option<String>,
     user_id: i64,
 ) -> Result<Option<String>, String> {
+    let cache_key = (user_id, pfp_path.clone());
+    if let Some(cached) = state.pfp_cache.lock().unwrap().get(&cache_key).cloned() {
+        return Ok(Some(cached));
+    }
+
     match state
         .core
         .fetch_cached_user_pfp(pfp_path.as_deref(), user_id)
@@ -301,6 +377,9 @@ pub async fn get_user_pfp_data_url(
             })
             .await
             .map_err(|e| format!("encode pfp failed: {e}"))?;
+            if let Some(ref data_url) = url {
+                insert_bounded_cache(&state.pfp_cache, cache_key, data_url.clone());
+            }
             Ok(url)
         }
         Ok(None) => Ok(None),
@@ -329,20 +408,40 @@ pub async fn upload_profile_pfp(
                 .map_err(|e| format!("invalid base64 image: {e}"))?
         }
     };
-    state
+    let pfp_path = state
         .core
         .upload_active_profile_pfp(bytes, &content_type)
         .await
-        .map_err(err_str)
+        .map_err(err_str)?;
+    if let Some(profile) = state.core.active_profile().await {
+        state
+            .pfp_cache
+            .lock()
+            .unwrap()
+            .retain(|(uid, _), _| *uid != profile.user_id);
+    } else {
+        state.pfp_cache.lock().unwrap().clear();
+    }
+    Ok(pfp_path)
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn remove_profile_pfp(state: State<'_, AppState>) -> Result<String, String> {
-    state
+    let pfp_path = state
         .core
         .remove_active_profile_pfp()
         .await
-        .map_err(err_str)
+        .map_err(err_str)?;
+    if let Some(profile) = state.core.active_profile().await {
+        state
+            .pfp_cache
+            .lock()
+            .unwrap()
+            .retain(|(uid, _), _| *uid != profile.user_id);
+    } else {
+        state.pfp_cache.lock().unwrap().clear();
+    }
+    Ok(pfp_path)
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -352,6 +451,7 @@ pub async fn delete_server_account(state: State<'_, AppState>) -> Result<bool, S
         .delete_active_account()
         .await
         .map_err(err_str)?;
+    state.clear_media_caches();
     Ok(true)
 }
 
@@ -376,23 +476,55 @@ pub async fn reconnect_now(state: State<'_, AppState>) -> Result<ReconnectOutcom
     })
 }
 
+fn scan_one_game_executables(
+    dir: &std::path::Path,
+    name: &str,
+    exe_override: Option<&str>,
+) -> (Vec<ExecutableOptionDto>, Option<BinaryKind>) {
+    let discovered = if dir.is_dir() {
+        discover_executables(dir, name)
+    } else {
+        Vec::new()
+    };
+    let selected_kind = exe_override
+        .and_then(|rel| {
+            let abs = dir.join(rel);
+            if abs.is_file() {
+                Some(detect_binary_kind(&abs))
+            } else {
+                None
+            }
+        })
+        .or_else(|| discovered.first().map(|e| e.kind));
+    let opts = discovered.into_iter().map(ExecutableOptionDto::from).collect();
+    (opts, selected_kind)
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn list_library(state: State<'_, AppState>) -> Result<Vec<LibraryGameDto>, String> {
     let Some(profile) = state.core.active_profile().await else {
         return Ok(Vec::new());
     };
 
-    let remote_games: Vec<Game> = state.core.fetch_remote_games().await.unwrap_or_default();
-    let installed_games: Vec<InstalledGame> =
-        state.core.list_downloaded_games().await.unwrap_or_default();
-    let pending_set: HashSet<i64> = state
-        .core
-        .list_pending_syncs()
-        .await
+    let core_for_playtime = Arc::clone(&state.core);
+    let profile_id = profile.id.clone();
+    let (remote_res, installed_res, pending_res, playtime_res) = tokio::join!(
+        state.core.fetch_remote_games(),
+        state.core.list_downloaded_games(),
+        state.core.list_pending_syncs(),
+        tokio::task::spawn_blocking(move || {
+            core_for_playtime.db().playtime_summaries_for_profile(&profile_id)
+        }),
+    );
+
+    let remote_games: Vec<Game> = remote_res.unwrap_or_default();
+    let installed_games: Vec<InstalledGame> = installed_res.unwrap_or_default();
+    let pending_set: HashSet<i64> = pending_res
         .unwrap_or_default()
         .into_iter()
         .map(|p| p.game_id)
         .collect();
+    let playtime_map = playtime_res.ok().and_then(|r| r.ok()).unwrap_or_default();
 
     let mut installed_map: HashMap<i64, InstalledGame> = installed_games
         .into_iter()
@@ -400,7 +532,7 @@ pub async fn list_library(state: State<'_, AppState>) -> Result<Vec<LibraryGameD
         .collect();
 
     // Scan installed directories on a blocking thread so the async runtime stays responsive.
-    let scan_targets: Vec<(i64, std::path::PathBuf, String, Option<String>)> = installed_map
+    let scan_targets: Vec<(i64, PathBuf, String, Option<String>)> = installed_map
         .values()
         .map(|inst| {
             (
@@ -412,39 +544,118 @@ pub async fn list_library(state: State<'_, AppState>) -> Result<Vec<LibraryGameD
         })
         .collect();
 
+    let exe_cache = Arc::clone(&state.exe_cache);
     let discovered_map: HashMap<i64, (Vec<ExecutableOptionDto>, Option<BinaryKind>)> =
-        tokio::task::spawn_blocking(move || {
-            let mut out = HashMap::new();
-            for (gid, dir, name, exe_override) in scan_targets {
-                let discovered = if dir.is_dir() {
-                    discover_executables(&dir, &name)
-                } else {
-                    Vec::new()
-                };
-                let selected_kind = exe_override
-                    .as_deref()
-                    .and_then(|rel| {
-                        let abs = dir.join(rel);
-                        if abs.is_file() {
-                            Some(detect_binary_kind(&abs))
-                        } else {
-                            None
-                        }
-                    })
-                    .or_else(|| discovered.first().map(|e| e.kind));
-                let opts = discovered.into_iter().map(ExecutableOptionDto::from).collect();
-                out.insert(gid, (opts, selected_kind));
-            }
-            out
-        })
-        .await
-        .unwrap_or_default();
+        if scan_targets.is_empty() {
+            HashMap::new()
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let mut out = HashMap::with_capacity(scan_targets.len());
+                let mut misses: Vec<(i64, PathBuf, String, Option<String>, Option<SystemTime>)> =
+                    Vec::new();
 
-    let playtime_map = state
-        .core
-        .db()
-        .playtime_summaries_for_profile(&profile.id)
-        .unwrap_or_default();
+                {
+                    let cache = exe_cache.lock().unwrap();
+                    for (gid, dir, name, exe_override) in scan_targets {
+                        let mtime = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+                        if mtime.is_some()
+                            && let Some((cached_mtime, cached_exe, cached_opts, cached_kind)) =
+                                cache.get(&dir)
+                            && *cached_mtime == mtime
+                            && *cached_exe == exe_override
+                        {
+                            out.insert(gid, (cached_opts.clone(), *cached_kind));
+                            continue;
+                        }
+                        misses.push((gid, dir, name, exe_override, mtime));
+                    }
+                }
+
+                if !misses.is_empty() {
+                    let scanned: Vec<(
+                        i64,
+                        PathBuf,
+                        Option<SystemTime>,
+                        Option<String>,
+                        Vec<ExecutableOptionDto>,
+                        Option<BinaryKind>,
+                    )> = if misses.len() == 1 {
+                        misses
+                            .into_iter()
+                            .map(|(gid, dir, name, exe_override, mtime)| {
+                                let (opts, kind) = scan_one_game_executables(
+                                    &dir,
+                                    &name,
+                                    exe_override.as_deref(),
+                                );
+                                (gid, dir, mtime, exe_override, opts, kind)
+                            })
+                            .collect()
+                    } else {
+                        let workers = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(4)
+                            .clamp(2, 8)
+                            .min(misses.len());
+                        let next_idx = AtomicUsize::new(0);
+                        let misses_ref = &misses;
+                        let next_ref = &next_idx;
+                        std::thread::scope(|s| {
+                            let handles: Vec<_> = (0..workers)
+                                .map(|_| {
+                                    s.spawn(move || {
+                                        let mut local = Vec::new();
+                                        loop {
+                                            let i = next_ref.fetch_add(1, Ordering::Relaxed);
+                                            if i >= misses_ref.len() {
+                                                break;
+                                            }
+                                            let (gid, dir, name, exe_override, mtime) =
+                                                &misses_ref[i];
+                                            let (opts, kind) = scan_one_game_executables(
+                                                dir,
+                                                name,
+                                                exe_override.as_deref(),
+                                            );
+                                            local.push((
+                                                *gid,
+                                                dir.clone(),
+                                                *mtime,
+                                                exe_override.clone(),
+                                                opts,
+                                                kind,
+                                            ));
+                                        }
+                                        local
+                                    })
+                                })
+                                .collect();
+                            let mut all = Vec::with_capacity(misses_ref.len());
+                            for h in handles {
+                                if let Ok(part) = h.join() {
+                                    all.extend(part);
+                                }
+                            }
+                            all
+                        })
+                    };
+
+                    let mut cache = exe_cache.lock().unwrap();
+                    for (gid, dir, mtime, exe_override, opts, kind) in scanned {
+                        if mtime.is_some() {
+                            cache.insert(dir, (mtime, exe_override, opts.clone(), kind));
+                        } else {
+                            cache.remove(&dir);
+                        }
+                        out.insert(gid, (opts, kind));
+                    }
+                }
+
+                out
+            })
+            .await
+            .unwrap_or_default()
+        };
 
     let mut out = Vec::with_capacity(remote_games.len() + installed_map.len());
     let mut seen_ids = HashSet::new();
@@ -545,6 +756,10 @@ pub async fn get_game_cover_data_url(
     state: State<'_, AppState>,
     game_id: i64,
 ) -> Result<Option<String>, String> {
+    if let Some(cached) = state.cover_cache.lock().unwrap().get(&game_id).cloned() {
+        return Ok(Some(cached));
+    }
+
     match state.core.fetch_cached_cover(game_id).await {
         Ok((bytes, _mime)) => {
             let url = tokio::task::spawn_blocking(move || {
@@ -559,6 +774,9 @@ pub async fn get_game_cover_data_url(
             })
             .await
             .map_err(|e| format!("encode cover failed: {e}"))?;
+            if let Some(ref data_url) = url {
+                insert_bounded_cache(&state.cover_cache, game_id, data_url.clone());
+            }
             Ok(url)
         }
         Err(CoreError::Api(ApiError::Http { status: 404, .. })) => Ok(None),
@@ -657,7 +875,9 @@ pub async fn sync_game_now(
 
 #[tauri::command(rename_all = "snake_case")]
 pub async fn uninstall_game(state: State<'_, AppState>, game_id: i64) -> Result<bool, String> {
+    let install_dir = state.installed_dir_for_game(game_id).await;
     state.core.uninstall_game(game_id).await.map_err(err_str)?;
+    state.invalidate_exe_cache_dir(install_dir);
     Ok(true)
 }
 
@@ -672,6 +892,8 @@ pub async fn set_game_executable(
         .set_game_executable(game_id, rel_path)
         .await
         .map_err(err_str)?;
+    let install_dir = state.installed_dir_for_game(game_id).await;
+    state.invalidate_exe_cache_dir(install_dir);
     Ok(true)
 }
 
@@ -694,7 +916,7 @@ pub async fn list_proton_installations(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProtonInstallation>, String> {
     let core = Arc::clone(&state.core);
-    tokio::task::spawn_blocking(move || core.detect_proton())
+    tokio::task::spawn_blocking(move || core.rescan_proton())
         .await
         .map_err(|e| format!("proton scan failed: {e}"))
 }

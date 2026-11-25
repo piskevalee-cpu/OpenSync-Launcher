@@ -227,3 +227,80 @@ async fn runner_auto_syncs_saves_every_time_game_closes_and_flushes_offline_queu
     let pt = core.playtime_summary(7).await.unwrap();
     assert_eq!(pt.session_count, 2);
 }
+
+#[tokio::test]
+async fn differential_download_supports_with_saves_and_clean_modes() {
+    let dir = tempdir().unwrap();
+    let db = LauncherDb::open_in_memory().unwrap();
+    let secrets = MemorySecretStore::new();
+    let core = LauncherCore::new(db, secrets, LauncherPaths::under(dir.path()));
+
+    let srv = MockOpenSyncServer::start().await;
+    srv.add_user(1, "valerio", "secret123");
+    srv.add_game(
+        9,
+        "CloudSavesRPG",
+        "cloud-saves-rpg",
+        vec![
+            ("game.bin", b"clean game binary".to_vec()),
+            ("saves/slot1.sav", b"clean initial save".to_vec()),
+            ("obsolete.tmp", b"remove in overlay".to_vec()),
+        ],
+    );
+
+    // Populate user's cloud overlay (modified save, new save, and a deletion).
+    {
+        let mut st = srv.state.lock().unwrap();
+        let ov = st.overlays.entry((1, 9)).or_default();
+        ov.insert("saves/slot1.sav".to_string(), b"user boss progress".to_vec());
+        ov.insert("saves/slot2.sav".to_string(), b"user secondary save".to_vec());
+        st.deletions
+            .insert((1, 9), vec!["obsolete.tmp".to_string()]);
+    }
+
+    core.connect_with_password("LAN", &srv.base_url, "valerio", "secret123")
+        .await
+        .unwrap();
+
+    // 1) Download with saves (fresh = false): merges overlay edits & deletions and marks synced.
+    let (with_saves, outcome_saves) = core
+        .download_game(9, false, DownloadControl::new(0, 0))
+        .await
+        .unwrap();
+    assert!(with_saves.last_synced_at.is_some());
+    assert_eq!(outcome_saves.files.len(), 3);
+    assert_eq!(
+        fs::read(with_saves.install_dir.join("game.bin")).unwrap(),
+        b"clean game binary"
+    );
+    assert_eq!(
+        fs::read(with_saves.install_dir.join("saves/slot1.sav")).unwrap(),
+        b"user boss progress"
+    );
+    assert_eq!(
+        fs::read(with_saves.install_dir.join("saves/slot2.sav")).unwrap(),
+        b"user secondary save"
+    );
+    assert!(!with_saves.install_dir.join("obsolete.tmp").exists());
+
+    // 2) Download clean (fresh = true): fetches ?fresh=1, verifies clean manifest, leaves last_synced_at = None.
+    let (clean, outcome_clean) = core
+        .download_game(9, true, DownloadControl::new(0, 0))
+        .await
+        .unwrap();
+    assert!(clean.last_synced_at.is_none());
+    assert_eq!(outcome_clean.files.len(), 3);
+    assert_eq!(
+        fs::read(clean.install_dir.join("game.bin")).unwrap(),
+        b"clean game binary"
+    );
+    assert_eq!(
+        fs::read(clean.install_dir.join("saves/slot1.sav")).unwrap(),
+        b"clean initial save"
+    );
+    assert_eq!(
+        fs::read(clean.install_dir.join("obsolete.tmp")).unwrap(),
+        b"remove in overlay"
+    );
+    assert!(!clean.install_dir.join("saves/slot2.sav").exists());
+}

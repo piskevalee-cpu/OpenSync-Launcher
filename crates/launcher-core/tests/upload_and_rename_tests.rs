@@ -275,10 +275,7 @@ async fn picked_folder_upload_moves_into_games_dir_and_marks_installed() {
         let st = srv.state.lock().unwrap();
         st.games.get(&game_id).unwrap().slug.clone()
     };
-    // Install dirs are canonicalized by the core; canonicalize the expected base too
-    // so macOS /var (a symlink to /private/var) does not break the comparison below.
-    let games_dir = fs::canonicalize(dir.path().join("games")).unwrap();
-    let expected_dir = games_dir.join(&profile.id).join(&slug);
+    let expected_dir = dir.path().join("games").join(&profile.id).join(&slug);
 
     // The files were moved, not copied: the original picked folder no longer exists.
     assert!(expected_dir.join("mygame.sh").is_file());
@@ -297,7 +294,10 @@ async fn picked_folder_upload_moves_into_games_dir_and_marks_installed() {
         .get_installed_game(&profile.id, game_id)
         .unwrap()
         .expect("uploaded game must be installed");
-    assert_eq!(installed.install_dir, expected_dir);
+    assert_eq!(
+        installed.install_dir,
+        fs::canonicalize(&expected_dir).unwrap()
+    );
     assert_eq!(installed.executable_rel_path.as_deref(), Some("mygame.sh"));
     assert!(installed.manifest_hash.is_some(), "clean manifest hash recorded");
     assert!(installed.total_size > 0);
@@ -374,6 +374,6 @@ async fn dropped_upload_stages_chunks_then_finalizes() {
         fs::read(installed.install_dir.join("saves/slot1.dat")).unwrap(),
         payload
     );
-    let games_dir = fs::canonicalize(dir.path().join("games")).unwrap();
-    assert!(installed.install_dir.starts_with(games_dir));
+    let expected_games = std::fs::canonicalize(dir.path().join("games")).unwrap();
+    assert!(installed.install_dir.starts_with(expected_games));
 }

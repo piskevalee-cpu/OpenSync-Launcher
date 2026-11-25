@@ -383,6 +383,52 @@ impl Drop for SyncActivityGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DirFingerprint {
+    file_count: usize,
+    total_bytes: u64,
+    max_mtime_nanos: u128,
+}
+
+fn compute_dir_fingerprint(root: &Path) -> io::Result<DirFingerprint> {
+    if !root.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("directory does not exist: {}", root.display()),
+        ));
+    }
+    let mut fp = DirFingerprint::default();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            if entry.file_name().to_string_lossy().ends_with(".part") {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            fp.file_count += 1;
+            fp.total_bytes = fp.total_bytes.saturating_add(meta.len());
+            if let Ok(mtime) = meta.modified()
+                && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
+            {
+                fp.max_mtime_nanos = fp.max_mtime_nanos.max(dur.as_nanos());
+            }
+        }
+    }
+    Ok(fp)
+}
+
 pub struct LauncherCore {
     db: LauncherDb,
     secrets: Arc<dyn SecretStore>,
@@ -401,6 +447,11 @@ pub struct LauncherCore {
     uninstalling_games: Mutex<HashSet<(String, i64)>>,
     /// Tracks interrupted sessions already logged during this process run.
     notified_interrupted: Mutex<HashSet<(String, i64)>>,
+    /// Cached Proton scan results; invalidated/refreshed by `rescan_proton` and GE-Proton installs.
+    proton_cache: StdRwLock<Option<Vec<ProtonInstallation>>>,
+    /// Metadata-only directory fingerprints keyed by `(profile_id, game_id)` so idle background
+    /// auto-sync passes skip HTTP manifest fetches and SHA-256 hashing when nothing changed.
+    sync_fingerprints: Mutex<HashMap<(String, i64), DirFingerprint>>,
     /// Number of save sync operations currently in flight.
     active_syncs: Arc<AtomicUsize>,
     /// Notified whenever `active_syncs` drops to 0.
@@ -428,6 +479,8 @@ impl LauncherCore {
             playing_games: Mutex::new(HashSet::new()),
             uninstalling_games: Mutex::new(HashSet::new()),
             notified_interrupted: Mutex::new(HashSet::new()),
+            proton_cache: StdRwLock::new(None),
+            sync_fingerprints: Mutex::new(HashMap::new()),
             active_syncs: Arc::new(AtomicUsize::new(0)),
             sync_idle_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
@@ -1221,7 +1274,7 @@ impl LauncherCore {
                 let mut last_file: Option<String> = None;
                 let mut last_samples = usize::MAX;
                 loop {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     let tp = poll_ctrl.snapshot();
                     let changed = tp.bytes_downloaded != last_bytes
                         || tp.files_extracted != last_files
@@ -1498,6 +1551,7 @@ impl LauncherCore {
 
             match res {
                 Ok(installation) => {
+                    core.rescan_proton();
                     core.update_download_snapshot(&jid, |snap| {
                         snap.status = DownloadStatus::Completed;
                         let final_bytes = snap.bytes_downloaded.max(snap.total_bytes);
@@ -2353,6 +2407,10 @@ impl LauncherCore {
         }
         self.db.remove_installed_game(&profile.id, game_id)?;
         let _ = self.db.clear_pending_sync(&profile.id, game_id);
+        self.sync_fingerprints
+            .lock()
+            .unwrap()
+            .remove(&(profile.id, game_id));
         Ok(())
     }
 
@@ -2445,6 +2503,15 @@ impl LauncherCore {
                 self.db
                     .update_game_synced_at(&profile.id, game_id, Utc::now())?;
                 self.db.clear_pending_sync(&profile.id, game_id)?;
+                let dir_for_fp = installed.install_dir.clone();
+                if let Ok(Ok(post_fp)) =
+                    tokio::task::spawn_blocking(move || compute_dir_fingerprint(&dir_for_fp)).await
+                {
+                    self.sync_fingerprints
+                        .lock()
+                        .unwrap()
+                        .insert((profile.id.clone(), game_id), post_fp);
+                }
                 let detail = format_sync_report_detail(&report);
                 let _ = self.record_activity(
                     &profile.id,
@@ -2541,6 +2608,14 @@ impl LauncherCore {
         }
 
         let flushed_pending = self.flush_pending_syncs().await.unwrap_or(0);
+        let pending_before_flush: HashSet<i64> = pending.into_iter().map(|p| p.game_id).collect();
+        let pending_after_flush: HashSet<i64> = self
+            .db
+            .list_pending_syncs(&profile.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.game_id)
+            .collect();
         let mut synced_games = 0usize;
         let installed = self.db.list_installed_games(&profile.id).unwrap_or_default();
         for game in installed {
@@ -2556,6 +2631,25 @@ impl LauncherCore {
             {
                 continue;
             }
+
+            let is_pending = pending_before_flush.contains(&game.game_id)
+                || pending_after_flush.contains(&game.game_id);
+            let fp_key = (profile.id.clone(), game.game_id);
+            if !is_pending {
+                let dir_for_fp = game.install_dir.clone();
+                let pre_fp =
+                    tokio::task::spawn_blocking(move || compute_dir_fingerprint(&dir_for_fp))
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                if let Some(fp) = pre_fp {
+                    let cached = self.sync_fingerprints.lock().unwrap().get(&fp_key).copied();
+                    if cached == Some(fp) {
+                        continue;
+                    }
+                }
+            }
+
             let _sync_guard = self.begin_sync_activity();
             if let Ok(report) =
                 sync_game_saves(&client, game.game_id, &game.install_dir, false).await
@@ -2564,6 +2658,12 @@ impl LauncherCore {
                     .db
                     .update_game_synced_at(&profile.id, game.game_id, Utc::now());
                 let _ = self.db.clear_pending_sync(&profile.id, game.game_id);
+                let dir_for_fp = game.install_dir.clone();
+                if let Ok(Ok(post_fp)) =
+                    tokio::task::spawn_blocking(move || compute_dir_fingerprint(&dir_for_fp)).await
+                {
+                    self.sync_fingerprints.lock().unwrap().insert(fp_key, post_fp);
+                }
                 if report.uploaded_files > 0 || report.deleted_paths > 0 {
                     let _ = self.record_activity(
                         &profile.id,
@@ -3215,8 +3315,17 @@ impl LauncherCore {
     }
 
     pub fn detect_proton(&self) -> Vec<ProtonInstallation> {
+        if let Some(cached) = self.proton_cache.read().unwrap().as_ref() {
+            return cached.clone();
+        }
+        self.rescan_proton()
+    }
+
+    pub fn rescan_proton(&self) -> Vec<ProtonInstallation> {
         let roots = default_proton_search_roots(&self.paths.proton_dir);
-        detect_proton_in_roots(&roots)
+        let list = detect_proton_in_roots(&roots);
+        *self.proton_cache.write().unwrap() = Some(list.clone());
+        list
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3251,6 +3360,10 @@ impl LauncherCore {
             proton_override: None,
         };
         self.db.upsert_installed_game(&installed)?;
+        self.sync_fingerprints
+            .lock()
+            .unwrap()
+            .remove(&(profile_id.to_string(), game_id));
         Ok(installed)
     }
 
@@ -3595,11 +3708,8 @@ mod path_safety_tests {
         let dir = tempdir().unwrap();
         let games_dir = dir.path().join("games");
         let install = install_dir_for_slug(&games_dir, "profile-1", "fogwoods").unwrap();
-        // `install_dir_for_slug` returns a canonicalized path. Canonicalize the expected
-        // base too: on macOS `tempdir()` lives under /var, a symlink to /private/var,
-        // which otherwise makes this a /var vs /private/var prefix mismatch.
-        let canonical_games_dir = std::fs::canonicalize(&games_dir).unwrap();
-        assert!(install.starts_with(canonical_games_dir.join("profile-1")));
+        let expected_base = std::fs::canonicalize(games_dir.join("profile-1")).unwrap();
+        assert!(install.starts_with(expected_base));
         assert_eq!(install.file_name().unwrap(), "fogwoods");
 
         let escape = dir.path().join("escaped");
@@ -3644,5 +3754,47 @@ mod path_safety_tests {
         let legacy_install = other_games_dir.join("profile-1").join("fogwoods");
         std::fs::create_dir_all(&legacy_install).unwrap();
         assert_install_dir_contained(&games_dir, "profile-1", &legacy_install).unwrap();
+    }
+
+    #[test]
+    fn dir_fingerprint_ignores_part_files_and_tracks_changes() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.sav"), b"hello").unwrap();
+        let fp1 = compute_dir_fingerprint(dir.path()).unwrap();
+        assert_eq!(fp1.file_count, 1);
+        assert_eq!(fp1.total_bytes, 5);
+
+        std::fs::write(dir.path().join("tmp.sav.part"), b"partial data").unwrap();
+        let fp_with_part = compute_dir_fingerprint(dir.path()).unwrap();
+        assert_eq!(fp_with_part, fp1);
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::fs::write(dir.path().join("a.sav"), b"world").unwrap();
+        let fp_same_size = compute_dir_fingerprint(dir.path()).unwrap();
+        assert_ne!(fp_same_size, fp1);
+    }
+
+    #[test]
+    fn proton_cache_returns_cached_list_until_rescan() {
+        let dir = tempdir().unwrap();
+        let db = LauncherDb::open_in_memory().unwrap();
+        let secrets = launcher_db::MemorySecretStore::new();
+        let paths = LauncherPaths::under(dir.path());
+        let core = LauncherCore::new(db, secrets, paths.clone());
+
+        assert!(core.detect_proton().is_empty());
+
+        // Add a fake Proton installation under paths.proton_dir
+        let proton_root = paths.proton_dir.join("GE-Proton-Test");
+        std::fs::create_dir_all(&proton_root).unwrap();
+        std::fs::write(proton_root.join("proton"), b"#!/bin/sh\n").unwrap();
+
+        // Cached detect_proton still returns the cached list until rescan_proton() is called.
+        let cached = core.detect_proton();
+        assert!(cached.is_empty());
+
+        let rescanned = core.rescan_proton();
+        assert!(rescanned.iter().any(|p| p.name == "GE-Proton-Test"));
+        assert_eq!(core.detect_proton(), rescanned);
     }
 }

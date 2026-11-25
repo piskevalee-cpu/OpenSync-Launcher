@@ -5,15 +5,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use walkdir::WalkDir;
 
-const HASH_BUF_SIZE: usize = 256 * 1024;
-const UPLOAD_CONCURRENCY: usize = 4;
+const HASH_BUF_SIZE: usize = 512 * 1024;
+const UPLOAD_CONCURRENCY: usize = 6;
 
 #[derive(Debug, Error)]
 pub enum SyncError {
@@ -115,34 +115,41 @@ pub fn scan_folder_parallel(root: &Path) -> SyncResult<Vec<LocalFile>> {
 
     let mut hashed: Vec<LocalFile> = entries
         .into_par_iter()
-        .map(|(rel_path, abs_path, size)| {
-            let sha256 = hash_file_sha256(&abs_path)?;
-            Ok(LocalFile {
-                rel_path,
-                abs_path,
-                size,
-                sha256,
-            })
-        })
+        .map_init(
+            || vec![0u8; HASH_BUF_SIZE],
+            |buf, (rel_path, abs_path, size)| {
+                let sha256 = hash_file_sha256_with_buf(&abs_path, buf)?;
+                Ok(LocalFile {
+                    rel_path,
+                    abs_path,
+                    size,
+                    sha256,
+                })
+            },
+        )
         .collect::<Result<Vec<_>, std::io::Error>>()?;
 
     hashed.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(hashed)
 }
 
-pub fn hash_file_sha256(path: &Path) -> std::io::Result<String> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(HASH_BUF_SIZE, file);
+fn hash_file_sha256_with_buf(path: &Path, buf: &mut [u8]) -> std::io::Result<String> {
+    let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+        match file.read(buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
-        hasher.update(&buf[..n]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+pub fn hash_file_sha256(path: &Path) -> std::io::Result<String> {
+    let mut buf = vec![0u8; HASH_BUF_SIZE];
+    hash_file_sha256_with_buf(path, &mut buf)
 }
 
 /// Computes the differential save plan strictly against the clean manifest (never chained).
@@ -276,51 +283,88 @@ async fn upload_file_chunked(
     game_id: i64,
     item: &DiffUpload,
     chunk_size: usize,
-    mut resume_from: usize,
+    resume_from: usize,
 ) -> SyncResult<()> {
-    let total_chunks = ((item.size as usize).div_ceil(chunk_size)).max(1);
-    let mut i = resume_from.min(total_chunks);
+    let total_chunks = if item.size == 0 {
+        1
+    } else {
+        item.size.div_ceil(chunk_size as u64) as usize
+    };
+    let mut start = resume_from.min(total_chunks);
     let mut retried_resume = false;
 
-    while i < total_chunks {
-        let offset = (i as u64) * (chunk_size as u64);
-        let len = ((item.size.saturating_sub(offset)) as usize).min(chunk_size);
+    while start < total_chunks {
         let path = item.abs_path.clone();
-        let chunk_bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Bytes> {
-            if len == 0 {
-                return Ok(Bytes::new());
-            }
-            let mut file = File::open(&path)?;
-            file.seek(SeekFrom::Start(offset))?;
-            let mut buf = vec![0u8; len];
-            file.read_exact(&mut buf)?;
-            Ok(Bytes::from(buf))
-        })
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))??;
+        let size = item.size;
+        let (tx, mut rx) = mpsc::channel::<(usize, Bytes)>(2);
 
-        match client
-            .upload_overlay_chunk(
-                game_id,
-                &item.rel_path,
-                i,
-                total_chunks,
-                item.size,
-                &item.sha256,
-                chunk_bytes,
-            )
-            .await
-        {
-            Ok(()) => {
-                i += 1;
+        // Single open + sequential read-ahead on blocking pool overlaps disk I/O with HTTP POSTs.
+        let reader = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut file = File::open(&path)?;
+            let start_offset = (start as u64) * (chunk_size as u64);
+            if start_offset > 0 {
+                file.seek(SeekFrom::Start(start_offset))?;
             }
-            Err(ApiError::ResumeRequired { received }) if !retried_resume => {
-                retried_resume = true;
-                resume_from = received.min(total_chunks);
-                i = resume_from;
+            for index in start..total_chunks {
+                let offset = (index as u64) * (chunk_size as u64);
+                let len = ((size.saturating_sub(offset)) as usize).min(chunk_size);
+                let data = if len == 0 {
+                    Bytes::new()
+                } else {
+                    let mut buf = vec![0u8; len];
+                    file.read_exact(&mut buf)?;
+                    Bytes::from(buf)
+                };
+                if tx.blocking_send((index, data)).is_err() {
+                    break;
+                }
             }
-            Err(e) => return Err(e.into()),
+            Ok(())
+        });
+
+        let mut next_resume: Option<usize> = None;
+        let mut upload_err: Option<SyncError> = None;
+
+        while let Some((index, chunk_bytes)) = rx.recv().await {
+            match client
+                .upload_overlay_chunk(
+                    game_id,
+                    &item.rel_path,
+                    index,
+                    total_chunks,
+                    item.size,
+                    &item.sha256,
+                    chunk_bytes,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(ApiError::ResumeRequired { received }) if !retried_resume => {
+                    retried_resume = true;
+                    next_resume = Some(received.min(total_chunks));
+                    break;
+                }
+                Err(e) => {
+                    upload_err = Some(e.into());
+                    break;
+                }
+            }
         }
+
+        drop(rx);
+        let reader_res = reader
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        if let Some(err) = upload_err {
+            return Err(err);
+        }
+        if let Some(new_start) = next_resume {
+            start = new_start;
+            continue;
+        }
+        reader_res?;
+        break;
     }
 
     Ok(())
@@ -330,8 +374,9 @@ async fn upload_file_chunked(
 /// changes (used when recovering from an interrupted / force-quit game session).
 ///
 /// - When `clean_manifest` is available (online), computes the exact SHA-256 diff against the
-///   clean manifest. If `last_synced_at` is set, filters to files modified since `last_synced_at`
-///   (with a 1-second grace window for filesystem mtime granularity) or any deletions.
+///   clean manifest. If `last_synced_at` is set, skips hashing files older than `last_synced_at`
+///   (with a 1-second grace window for filesystem mtime granularity), as well as new or
+///   size-mismatched files, while still reporting all deletions.
 /// - When `clean_manifest` is `None` (offline), falls back to checking whether any file in
 ///   `install_dir` has an mtime newer than `baseline_time`.
 pub fn inspect_unsynced_saves(
@@ -345,42 +390,114 @@ pub fn inspect_unsynced_saves(
     }
 
     if let Some(manifest) = clean_manifest {
-        let local_files = scan_folder_parallel(install_dir)?;
-        let diff = compute_diff(&local_files, manifest);
-        if diff.is_empty() {
+        let cutoff = last_synced_at.map(|last_sync| {
+            last_sync
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap_or(last_sync)
+        });
+        let clean_map: HashMap<&str, &opensync_api::ManifestEntry> = manifest
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f))
+            .collect();
+
+        struct SameSizeCandidate<'a> {
+            rel_path: String,
+            abs_path: PathBuf,
+            size: u64,
+            expected_hash: &'a str,
+        }
+
+        let mut local_paths = HashSet::new();
+        let mut changed: Vec<(String, u64)> = Vec::new();
+        let mut to_hash: Vec<SameSizeCandidate<'_>> = Vec::new();
+
+        for entry in WalkDir::new(install_dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+        {
+            let abs_path = entry.path().to_path_buf();
+            let Ok(rel) = abs_path.strip_prefix(install_dir) else {
+                continue;
+            };
+            let rel_path = rel.to_string_lossy().replace('\\', "/");
+            if rel_path.ends_with(".part") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let size = meta.len();
+            local_paths.insert(rel_path.clone());
+
+            if let Some(cutoff_time) = cutoff {
+                let is_recent = meta
+                    .modified()
+                    .map(|mtime| mtime >= cutoff_time)
+                    .unwrap_or(true);
+                if !is_recent {
+                    continue;
+                }
+            }
+
+            match clean_map.get(rel_path.as_str()) {
+                None => changed.push((rel_path, size)),
+                Some(clean) if clean.size != size => changed.push((rel_path, size)),
+                Some(clean) => to_hash.push(SameSizeCandidate {
+                    rel_path,
+                    abs_path,
+                    size,
+                    expected_hash: clean.hash.as_str(),
+                }),
+            }
+        }
+
+        if !to_hash.is_empty() {
+            let hashed_diffs: Vec<Option<(String, u64)>> = to_hash
+                .into_par_iter()
+                .map_init(
+                    || vec![0u8; HASH_BUF_SIZE],
+                    |buf, cand| {
+                        let sha256 = hash_file_sha256_with_buf(&cand.abs_path, buf)?;
+                        if sha256 != cand.expected_hash {
+                            Ok(Some((cand.rel_path, cand.size)))
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )
+                .collect::<Result<Vec<_>, std::io::Error>>()?;
+
+            changed.extend(hashed_diffs.into_iter().flatten());
+        }
+
+        changed.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut deletions: Vec<String> = manifest
+            .files
+            .iter()
+            .filter(|f| !local_paths.contains(f.path.as_str()))
+            .map(|f| f.path.clone())
+            .collect();
+        deletions.sort();
+
+        if changed.is_empty() && deletions.is_empty() {
             return Ok(LocalSaveInspection::default());
         }
 
-        let uploads: Vec<&DiffUpload> = if let Some(last_sync) = last_synced_at {
-            let cutoff = last_sync
-                .checked_sub(std::time::Duration::from_secs(1))
-                .unwrap_or(last_sync);
-            let recent: Vec<&DiffUpload> = diff
-                .uploads
-                .iter()
-                .filter(|u| {
-                    std::fs::metadata(&u.abs_path)
-                        .and_then(|m| m.modified())
-                        .map(|mtime| mtime >= cutoff)
-                        .unwrap_or(true)
-                })
-                .collect();
-            recent
-        } else {
-            diff.uploads.iter().collect()
-        };
-
-        let changed_files = uploads.len();
-        let deleted_files = diff.deletions.len();
-        let changed_bytes: u64 = uploads.iter().map(|u| u.size).sum();
+        let changed_files = changed.len();
+        let deleted_files = deletions.len();
+        let changed_bytes: u64 = changed.iter().map(|(_, size)| *size).sum();
         let has_changes = changed_files > 0 || deleted_files > 0;
-        let mut sample_paths: Vec<String> = uploads
+        let mut sample_paths: Vec<String> = changed
             .iter()
             .take(5)
-            .map(|u| u.rel_path.clone())
+            .map(|(path, _)| path.clone())
             .collect();
         if sample_paths.len() < 5 {
-            for del in diff.deletions.iter().take(5 - sample_paths.len()) {
+            for del in deletions.iter().take(5 - sample_paths.len()) {
                 sample_paths.push(format!("{del} (deleted)"));
             }
         }
@@ -439,4 +556,106 @@ pub fn inspect_unsynced_saves(
         changed_bytes,
         sample_paths,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opensync_api::ManifestEntry;
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+    use tempfile::tempdir;
+
+    #[test]
+    fn hash_file_sha256_and_scan_folder_parallel_hash_large_and_empty_files() {
+        let dir = tempdir().unwrap();
+        let big = vec![0x5Cu8; HASH_BUF_SIZE * 2 + 12345];
+        let small = b"save=42\n".to_vec();
+
+        fs::write(dir.path().join("empty.bin"), &[]).unwrap();
+        fs::write(dir.path().join("small.sav"), &small).unwrap();
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/big.pak"), &big).unwrap();
+        fs::write(dir.path().join("ignored.part"), b"partial").unwrap();
+
+        let scanned = scan_folder_parallel(dir.path()).unwrap();
+        let paths: Vec<&str> = scanned.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["empty.bin", "small.sav", "sub/big.pak"]);
+
+        assert_eq!(scanned[0].sha256, hex::encode(Sha256::digest([])));
+        assert_eq!(scanned[1].sha256, hex::encode(Sha256::digest(&small)));
+        assert_eq!(scanned[2].sha256, hex::encode(Sha256::digest(&big)));
+        assert_eq!(
+            hash_file_sha256(&dir.path().join("sub/big.pak")).unwrap(),
+            scanned[2].sha256
+        );
+    }
+
+    #[test]
+    fn inspect_unsynced_saves_handles_new_size_mismatch_same_size_and_deletions() {
+        let dir = tempdir().unwrap();
+        let untouched = b"unchanged content".to_vec();
+        let same_size_orig = b"AAAA".to_vec();
+        let same_size_mod = b"BBBB".to_vec();
+        let resized_orig = b"123".to_vec();
+        let resized_mod = b"123456".to_vec();
+
+        fs::write(dir.path().join("untouched.bin"), &untouched).unwrap();
+        fs::write(dir.path().join("same_size.sav"), &same_size_mod).unwrap();
+        fs::write(dir.path().join("resized.sav"), &resized_mod).unwrap();
+        fs::write(dir.path().join("new_slot.sav"), b"brand new").unwrap();
+
+        let manifest = GameManifest {
+            game_id: 1,
+            files: vec![
+                ManifestEntry {
+                    path: "untouched.bin".into(),
+                    hash: hex::encode(Sha256::digest(&untouched)),
+                    size: untouched.len() as u64,
+                },
+                ManifestEntry {
+                    path: "same_size.sav".into(),
+                    hash: hex::encode(Sha256::digest(&same_size_orig)),
+                    size: same_size_orig.len() as u64,
+                },
+                ManifestEntry {
+                    path: "resized.sav".into(),
+                    hash: hex::encode(Sha256::digest(&resized_orig)),
+                    size: resized_orig.len() as u64,
+                },
+                ManifestEntry {
+                    path: "deleted.tmp".into(),
+                    hash: hex::encode(Sha256::digest(b"gone")),
+                    size: 4,
+                },
+            ],
+        };
+
+        let res = inspect_unsynced_saves(dir.path(), Some(&manifest), None, None).unwrap();
+        assert!(res.has_changes);
+        assert_eq!(res.changed_files, 3);
+        assert_eq!(res.deleted_files, 1);
+        assert_eq!(
+            res.changed_bytes,
+            (same_size_mod.len() + resized_mod.len() + b"brand new".len()) as u64
+        );
+        assert_eq!(
+            res.sample_paths,
+            vec![
+                "new_slot.sav",
+                "resized.sav",
+                "same_size.sav",
+                "deleted.tmp (deleted)",
+            ]
+        );
+
+        // If last_synced_at is well in the future, modified files older than cutoff are ignored,
+        // while missing manifest entries still count as deleted.
+        let future_sync = SystemTime::now() + Duration::from_secs(60);
+        let res_future =
+            inspect_unsynced_saves(dir.path(), Some(&manifest), Some(future_sync), None).unwrap();
+        assert!(res_future.has_changes);
+        assert_eq!(res_future.changed_files, 0);
+        assert_eq!(res_future.deleted_files, 1);
+    }
 }

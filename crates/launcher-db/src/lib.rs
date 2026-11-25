@@ -204,14 +204,14 @@ impl SecretStore for MemorySecretStore {
 /// File-backed secret store with 0600 permissions on Unix for standalone persistence across restarts.
 pub struct FileSecretStore {
     path: PathBuf,
-    lock: Mutex<()>,
+    cache: Mutex<Option<HashMap<String, String>>>,
 }
 
 impl FileSecretStore {
     pub fn new(path: impl Into<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             path: path.into(),
-            lock: Mutex::new(()),
+            cache: Mutex::new(None),
         })
     }
 
@@ -240,22 +240,48 @@ impl FileSecretStore {
 
 impl SecretStore for FileSecretStore {
     fn set(&self, profile_id: &str, cookie: &str) -> DbResult<()> {
-        let _guard = self.lock.lock().unwrap();
-        let mut map = self.read_map()?;
-        map.insert(profile_id.to_string(), cookie.to_string());
-        self.write_map(&map)
+        let mut guard = self.cache.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(self.read_map()?);
+        }
+        let map = guard.as_mut().unwrap();
+        let previous = map.insert(profile_id.to_string(), cookie.to_string());
+        if let Err(err) = self.write_map(map) {
+            match previous {
+                Some(old) => {
+                    map.insert(profile_id.to_string(), old);
+                }
+                None => {
+                    map.remove(profile_id);
+                }
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn get(&self, profile_id: &str) -> DbResult<Option<String>> {
-        let _guard = self.lock.lock().unwrap();
-        Ok(self.read_map()?.remove(profile_id))
+        let mut guard = self.cache.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(self.read_map()?);
+        }
+        Ok(guard.as_ref().and_then(|map| map.get(profile_id).cloned()))
     }
 
     fn delete(&self, profile_id: &str) -> DbResult<()> {
-        let _guard = self.lock.lock().unwrap();
-        let mut map = self.read_map()?;
-        map.remove(profile_id);
-        self.write_map(&map)
+        let mut guard = self.cache.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(self.read_map()?);
+        }
+        let map = guard.as_mut().unwrap();
+        let Some(previous) = map.remove(profile_id) else {
+            return Ok(());
+        };
+        if let Err(err) = self.write_map(map) {
+            map.insert(profile_id.to_string(), previous);
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -292,6 +318,10 @@ impl LauncherDb {
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA cache_size = -32000;
+            PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = ON;
 
             CREATE TABLE IF NOT EXISTS app_state (
@@ -383,8 +413,11 @@ impl LauncherDb {
                 created_at TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_activity_logs_profile_created
+            CREATE INDEX IF NOT EXISTS idx_activity_logs_profile_id
                 ON activity_logs(profile_id, id DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_activity_logs_profile_created
+                ON activity_logs(profile_id, created_at DESC);
             "#,
         )?;
         Ok(())
@@ -1204,5 +1237,72 @@ mod tests {
             resolved.to_string_lossy().contains("Library/Application Support"),
             "macOS data dir must not use XDG paths: {resolved:?}"
         );
+    }
+
+    #[test]
+    fn file_secret_store_caches_reads_and_persists_with_0600_mode() {
+        let dir = std::env::temp_dir().join(format!("opensync-secrets-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secrets.json");
+
+        let store = FileSecretStore::new(&path);
+        assert_eq!(store.get("p1").unwrap(), None);
+
+        store.set("p1", "cookie-1").unwrap();
+        assert_eq!(store.get("p1").unwrap().as_deref(), Some("cookie-1"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Subsequent reads hit the in-memory cache without re-reading disk.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(store.get("p1").unwrap().as_deref(), Some("cookie-1"));
+
+        // set() and delete() update both memory and disk.
+        store.set("p2", "cookie-2").unwrap();
+        store.delete("p1").unwrap();
+        assert_eq!(store.get("p1").unwrap(), None);
+        assert_eq!(store.get("p2").unwrap().as_deref(), Some("cookie-2"));
+
+        let reopened = FileSecretStore::new(&path);
+        assert_eq!(reopened.get("p1").unwrap(), None);
+        assert_eq!(reopened.get("p2").unwrap().as_deref(), Some("cookie-2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_schema_sets_pragmas_and_activity_log_index() {
+        let db = LauncherDb::open_in_memory().unwrap();
+        let conn = db.conn.lock().unwrap();
+        let sync_mode: i64 = conn
+            .query_row("PRAGMA synchronous;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync_mode, 1); // NORMAL
+        let temp_store: i64 = conn
+            .query_row("PRAGMA temp_store;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(temp_store, 2); // MEMORY
+        let cache_size: i64 = conn
+            .query_row("PRAGMA cache_size;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cache_size, -32000);
+        let busy_timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5000);
+
+        let index_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_activity_logs_profile_created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_exists, 1);
     }
 }

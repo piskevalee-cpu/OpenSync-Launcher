@@ -164,3 +164,95 @@ async fn background_sync_skips_currently_playing_games_and_their_pending_queue()
         .last_synced_at
         .is_some());
 }
+
+#[tokio::test]
+async fn background_sync_skips_idle_games_until_external_edit_or_same_size_mtime_change() {
+    let dir = tempdir().unwrap();
+    let db = LauncherDb::open_in_memory().unwrap();
+    let secrets = MemorySecretStore::new();
+    let core = LauncherCore::new(db, secrets, LauncherPaths::under(dir.path()));
+
+    let srv = MockOpenSyncServer::start().await;
+    srv.add_user(1, "valerio", "secret123");
+    srv.add_game(
+        23,
+        "IdleSkipQuest",
+        "idle-skip-quest",
+        vec![
+            ("game.bin", b"binary".to_vec()),
+            ("saves/slot1.sav", b"save-001".to_vec()),
+        ],
+    );
+
+    let profile = core
+        .connect_with_password("LAN", &srv.base_url, "valerio", "secret123")
+        .await
+        .unwrap();
+    let (installed, _) = core
+        .download_game(23, true, DownloadControl::new(0, 0))
+        .await
+        .unwrap();
+
+    // First background pass runs sync_game_saves (no fingerprint cached yet) and records it.
+    let first = core.run_background_auto_sync_once().await.unwrap();
+    assert_eq!(first.synced_games, 1);
+    assert_eq!(first.flushed_pending, 0);
+    let synced_at_after_first = core
+        .db()
+        .get_installed_game(&profile.id, 23)
+        .unwrap()
+        .unwrap()
+        .last_synced_at
+        .expect("last_synced_at must be set after initial pass");
+
+    // Second idle pass skips sync_game_saves completely (zero HTTP/hashing) when unchanged.
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    let second = core.run_background_auto_sync_once().await.unwrap();
+    assert_eq!(second.synced_games, 0);
+    assert_eq!(second.flushed_pending, 0);
+    assert_eq!(
+        core.db()
+            .get_installed_game(&profile.id, 23)
+            .unwrap()
+            .unwrap()
+            .last_synced_at,
+        Some(synced_at_after_first),
+        "idle skip must not invoke sync_game_saves or bump last_synced_at"
+    );
+
+    // Even with `.part` temp files present and server offline while session is Connected,
+    // idle skip avoids any HTTP manifest fetch.
+    fs::write(installed.install_dir.join("saves/temp.sav.part"), b"partial").unwrap();
+    srv.set_offline(true);
+    let while_offline = core.run_background_auto_sync_once().await.unwrap();
+    assert_eq!(while_offline.synced_games, 0);
+    assert_eq!(while_offline.flushed_pending, 0);
+    assert_eq!(
+        core.connection_state().await,
+        launcher_core::ConnectionState::Connected
+    );
+    srv.set_offline(false);
+
+    // Same-size external edit that updates mtime must invalidate the idle skip and trigger sync.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    fs::write(installed.install_dir.join("saves/slot1.sav"), b"save-002").unwrap();
+    let after_same_size_edit = core.run_background_auto_sync_once().await.unwrap();
+    assert_eq!(after_same_size_edit.synced_games, 1);
+    assert_eq!(
+        srv.overlay_files(1, 23).get("saves/slot1.sav").unwrap(),
+        b"save-002"
+    );
+
+    // Next idle pass skips again.
+    let idle_again = core.run_background_auto_sync_once().await.unwrap();
+    assert_eq!(idle_again.synced_games, 0);
+
+    // Adding a brand new file also triggers sync.
+    fs::write(installed.install_dir.join("saves/slot2.sav"), b"new slot").unwrap();
+    let after_new_file = core.run_background_auto_sync_once().await.unwrap();
+    assert_eq!(after_new_file.synced_games, 1);
+    assert_eq!(
+        srv.overlay_files(1, 23).get("saves/slot2.sav").unwrap(),
+        b"new slot"
+    );
+}

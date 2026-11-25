@@ -104,21 +104,17 @@ fn main() {
             });
 
             tauri::async_runtime::spawn(async move {
-                match core_for_restore.restore_remembered_profile().await {
-                    Ok(Some(_)) => {
-                        let _ = core_for_restore.detect_interrupted_sessions().await;
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(error = %err, "failed to restore remembered profile");
-                    }
+                if let Err(err) = core_for_restore.restore_remembered_profile().await {
+                    tracing::warn!(error = %err, "failed to restore remembered profile");
                 }
             });
 
-            // Background differential save sync every 30s: flushes offline queues on
-            // reconnect and picks up external save edits without any manual click.
+            // Background differential save sync every 30s: defer the initial pass by 5s so
+            // background scanning does not compete with cold boot / UI hydration.
             tauri::async_runtime::spawn(async move {
-                let _handle = core_for_auto_sync.spawn_background_auto_sync(Duration::from_secs(30));
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _handle =
+                    core_for_auto_sync.spawn_background_auto_sync(Duration::from_secs(30));
             });
 
             Ok(())

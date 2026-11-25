@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -24,8 +24,8 @@ const ZIP64_EOCD_SIG: u32 = 0x0606_4b50;
 
 /// 1 MB write buffer per extracted file minimizes syscalls on fast NVMe/LAN transfers.
 const FILE_WRITE_BUF: usize = 1024 * 1024;
-/// 256 KB streaming read chunk size for zip extraction.
-const STREAM_CHUNK_BUF: usize = 256 * 1024;
+/// 512 KB streaming read chunk size for zip extraction.
+const STREAM_CHUNK_BUF: usize = 512 * 1024;
 
 #[derive(Debug, Error)]
 pub enum TransferError {
@@ -74,6 +74,8 @@ pub struct DownloadControl {
     paused: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     max_bytes_per_sec: Arc<AtomicU64>,
+    bytes_downloaded: Arc<AtomicU64>,
+    files_extracted: Arc<AtomicUsize>,
     progress: Arc<Mutex<TransferProgress>>,
 }
 
@@ -83,6 +85,8 @@ impl DownloadControl {
             paused: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
             max_bytes_per_sec: Arc::new(AtomicU64::new(0)),
+            bytes_downloaded: Arc::new(AtomicU64::new(0)),
+            files_extracted: Arc::new(AtomicUsize::new(0)),
             progress: Arc::new(Mutex::new(TransferProgress {
                 bytes_downloaded: 0,
                 total_bytes,
@@ -142,7 +146,10 @@ impl DownloadControl {
     }
 
     pub fn snapshot(&self) -> TransferProgress {
-        self.progress.lock().unwrap().clone()
+        let mut snap = self.progress.lock().unwrap().clone();
+        snap.bytes_downloaded = self.bytes_downloaded.load(Ordering::Relaxed);
+        snap.files_extracted = self.files_extracted.load(Ordering::Relaxed);
+        snap
     }
 }
 
@@ -171,6 +178,8 @@ struct UploadRate {
 pub struct UploadControl {
     paused: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    bytes_uploaded: Arc<AtomicU64>,
+    files_uploaded: Arc<AtomicUsize>,
     progress: Arc<Mutex<UploadProgress>>,
     rate: Arc<Mutex<UploadRate>>,
 }
@@ -181,6 +190,8 @@ impl UploadControl {
         Self {
             paused: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
+            bytes_uploaded: Arc::new(AtomicU64::new(0)),
+            files_uploaded: Arc::new(AtomicUsize::new(0)),
             progress: Arc::new(Mutex::new(UploadProgress {
                 bytes_uploaded: 0,
                 total_bytes,
@@ -231,7 +242,10 @@ impl UploadControl {
     }
 
     pub fn snapshot(&self) -> UploadProgress {
-        self.progress.lock().unwrap().clone()
+        let mut snap = self.progress.lock().unwrap().clone();
+        snap.bytes_uploaded = self.bytes_uploaded.load(Ordering::Relaxed);
+        snap.files_uploaded = self.files_uploaded.load(Ordering::Relaxed);
+        snap
     }
 
     pub fn set_total_bytes(&self, total: u64) {
@@ -253,7 +267,10 @@ impl UploadControl {
     /// Records bytes that have left the client and refreshes the rolling speed telemetry
     /// roughly every 100 ms (last 60 samples are retained for the waveform).
     pub fn add_bytes(&self, bytes: u64) {
+        self.bytes_uploaded.fetch_add(bytes, Ordering::Relaxed);
+
         let mut rate = self.rate.lock().unwrap();
+        rate.bytes_since_sample += bytes;
         let dt = rate.last_sample.elapsed();
         let sample = if dt >= Duration::from_millis(100) {
             let bps = if dt.as_secs_f64() > 0.0 {
@@ -261,23 +278,20 @@ impl UploadControl {
             } else {
                 0.0
             };
-            Some(SpeedSample {
+            let s = SpeedSample {
                 elapsed_ms: rate.started.elapsed().as_millis() as u64,
                 bytes_per_sec: bps,
-            })
+            };
+            rate.last_sample = Instant::now();
+            rate.bytes_since_sample = 0;
+            Some(s)
         } else {
             None
         };
-        if sample.is_some() {
-            rate.last_sample = Instant::now();
-            rate.bytes_since_sample = 0;
-        }
-        rate.bytes_since_sample += bytes;
         drop(rate);
 
-        let mut progress = self.progress.lock().unwrap();
-        progress.bytes_uploaded += bytes;
         if let Some(sample) = sample {
+            let mut progress = self.progress.lock().unwrap();
             progress.bytes_per_sec = sample.bytes_per_sec;
             progress.speed_samples.push(sample);
             if progress.speed_samples.len() > 60 {
@@ -287,7 +301,7 @@ impl UploadControl {
     }
 
     pub fn finish_file(&self) {
-        self.progress.lock().unwrap().files_uploaded += 1;
+        self.files_uploaded.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -683,7 +697,9 @@ pub async fn download_and_extract_game(
                 }
             }
 
-            // Rolling speed telemetry (every 100ms, kept to last 60 samples for waveform)
+            // Rolling speed telemetry (every 100ms, kept to last 60 samples for waveform).
+            // Keep the hot byte-counter lock-free so every HTTP chunk avoids mutex contention.
+            net_control.bytes_downloaded.store(total_rx, Ordering::Relaxed);
             let dt = last_sample.elapsed();
             if dt >= Duration::from_millis(100) || total_rx >= expected_total {
                 let bps = if dt.as_secs_f64() > 0.0 {
@@ -703,8 +719,6 @@ pub async fn download_and_extract_game(
                 }
                 last_sample = Instant::now();
                 bytes_since_sample = 0;
-            } else {
-                net_control.progress.lock().unwrap().bytes_downloaded = total_rx;
             }
 
             if tx.send(Ok(chunk)).await.is_err() {
@@ -816,28 +830,48 @@ impl Read for ChannelReader {
         if buf.is_empty() {
             return Ok(0);
         }
-        while self.offset >= self.current.len() {
-            match self.rx.blocking_recv() {
-                Some(Ok(chunk)) => {
-                    if chunk.is_empty() {
-                        continue;
+        if let Some(ref e) = self.err {
+            return Err(io::Error::other(e.to_string()));
+        }
+        let mut total = 0;
+        loop {
+            while self.offset >= self.current.len() {
+                let next = if total == 0 {
+                    self.rx.blocking_recv()
+                } else {
+                    match self.rx.try_recv() {
+                        Ok(item) => Some(item),
+                        Err(_) => return Ok(total),
                     }
-                    self.current = chunk;
-                    self.offset = 0;
+                };
+                match next {
+                    Some(Ok(chunk)) => {
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        self.current = chunk;
+                        self.offset = 0;
+                    }
+                    Some(Err(e)) => {
+                        let msg = e.to_string();
+                        self.err = Some(e);
+                        if total > 0 {
+                            return Ok(total);
+                        }
+                        return Err(io::Error::other(msg));
+                    }
+                    None => return Ok(total),
                 }
-                Some(Err(e)) => {
-                    let msg = e.to_string();
-                    self.err = Some(e);
-                    return Err(io::Error::other(msg));
-                }
-                None => return Ok(0),
+            }
+            let avail = &self.current[self.offset..];
+            let n = avail.len().min(buf.len() - total);
+            buf[total..total + n].copy_from_slice(&avail[..n]);
+            self.offset += n;
+            total += n;
+            if total == buf.len() {
+                return Ok(total);
             }
         }
-        let avail = &self.current[self.offset..];
-        let n = avail.len().min(buf.len());
-        buf[..n].copy_from_slice(&avail[..n]);
-        self.offset += n;
-        Ok(n)
     }
 }
 
@@ -845,15 +879,20 @@ impl Read for ChannelReader {
 /// - Method 0 (STORE) with known size (fast zero-overhead direct streaming)
 /// - Method 0 (STORE) with Data Descriptor (bit 3, as emitted by Node's `archiver`)
 /// - Method 8 (DEFLATE) with known size or Data Descriptor
-/// Extracts directly to disk with 1 MB write buffers and inline SHA-256 calculation.
+/// Extracts directly to disk with buffered writes and inline SHA-256 calculation.
 pub fn extract_zip_stream<R: Read>(
     reader: R,
     dest_root: &Path,
     control: &DownloadControl,
 ) -> TransferResult<Vec<ExtractedFile>> {
+    const MAX_DD: usize = 24;
     let mut r = PeekableReader::new(BufReader::with_capacity(STREAM_CHUNK_BUF, reader));
     let mut extracted = Vec::new();
     let mut copy_buf = vec![0u8; STREAM_CHUNK_BUF];
+    let mut dd_buf = vec![0u8; STREAM_CHUNK_BUF + MAX_DD];
+    let mut name_buf = Vec::with_capacity(256);
+    let mut extra_buf = Vec::with_capacity(64);
+    let mut last_file_update: Option<Instant> = None;
 
     loop {
         if control.is_cancelled() {
@@ -884,15 +923,15 @@ pub fn extract_zip_stream<R: Read>(
         let name_len = u16::from_le_bytes([hdr[22], hdr[23]]) as usize;
         let extra_len = u16::from_le_bytes([hdr[24], hdr[25]]) as usize;
 
-        let mut name_bytes = vec![0u8; name_len];
-        r.read_exact(&mut name_bytes)?;
-        let raw_name = String::from_utf8(name_bytes)
+        name_buf.resize(name_len, 0);
+        r.read_exact(&mut name_buf)?;
+        let raw_name = std::str::from_utf8(&name_buf)
             .map_err(|_| TransferError::InvalidArchive("non-UTF8 entry name".into()))?;
 
-        let mut extra = vec![0u8; extra_len];
-        r.read_exact(&mut extra)?;
+        extra_buf.resize(extra_len, 0);
+        r.read_exact(&mut extra_buf)?;
         // Parse ZIP64 extra field (tag 0x0001) when 32-bit sizes overflow
-        let is_zip64 = parse_zip64_extra(&extra, &mut uncomp_size, &mut comp_size);
+        let is_zip64 = parse_zip64_extra(&extra_buf, &mut uncomp_size, &mut comp_size);
 
         let has_data_descriptor = (flags & 0x0008) != 0;
 
@@ -908,9 +947,15 @@ pub fn extract_zip_stream<R: Read>(
             continue;
         }
 
-        let rel = safe_rel_path(&raw_name)?;
+        let rel = safe_rel_path(raw_name)?;
         let normalized_name = rel.to_string_lossy().replace('\\', "/");
-        control.progress.lock().unwrap().current_file = Some(normalized_name.clone());
+        if last_file_update
+            .map(|t| t.elapsed() >= Duration::from_millis(50))
+            .unwrap_or(true)
+        {
+            control.progress.lock().unwrap().current_file = Some(normalized_name.clone());
+            last_file_update = Some(Instant::now());
+        }
 
         let out_path = dest_root.join(&rel);
         if let Some(parent) = out_path.parent() {
@@ -921,7 +966,12 @@ pub fn extract_zip_stream<R: Read>(
             // Preallocate disk space when size is known to prevent fragmentation
             let _ = file.set_len(uncomp_size);
         }
-        let mut writer = BufWriter::with_capacity(FILE_WRITE_BUF, file);
+        let write_buf_cap = if !has_data_descriptor {
+            (uncomp_size as usize).clamp(4096, FILE_WRITE_BUF)
+        } else {
+            256 * 1024
+        };
+        let mut writer = BufWriter::with_capacity(write_buf_cap, file);
         let mut sha = Sha256::new();
         let mut crc = Crc32::new();
         let mut written: u64 = 0;
@@ -960,6 +1010,7 @@ pub fn extract_zip_stream<R: Read>(
                         &mut r,
                         &mut writer,
                         &mut sha,
+                        &mut dd_buf,
                         control,
                     )?;
                 }
@@ -1027,7 +1078,7 @@ pub fn extract_zip_stream<R: Read>(
             size: written,
             sha256,
         });
-        control.progress.lock().unwrap().files_extracted = extracted.len();
+        control.files_extracted.store(extracted.len(), Ordering::Relaxed);
     }
 
     Ok(extracted)
@@ -1041,12 +1092,12 @@ fn extract_store_with_data_descriptor<R: Read, W: Write>(
     r: &mut PeekableReader<R>,
     writer: &mut W,
     sha: &mut Sha256,
+    dd_buf: &mut [u8],
     control: &DownloadControl,
 ) -> TransferResult<u64> {
     let mut crc = Crc32::new();
     let mut written: u64 = 0;
-    let mut pending: VecDeque<u8> = VecDeque::with_capacity(STREAM_CHUNK_BUF);
-    let mut tmp = vec![0u8; STREAM_CHUNK_BUF];
+    let mut len: usize = 0;
     // Maximum data descriptor size is 24 bytes (4 sig + 4 crc + 8 comp + 8 uncomp).
     const MAX_DD: usize = 24;
 
@@ -1054,39 +1105,38 @@ fn extract_store_with_data_descriptor<R: Read, W: Write>(
         if control.is_cancelled() {
             return Err(TransferError::Cancelled);
         }
-        while pending.len() < MAX_DD + 4 {
-            let n = r.read(&mut tmp)?;
+        while len < MAX_DD + 4 {
+            let n = r.read(&mut dd_buf[len..])?;
             if n == 0 {
                 break;
             }
-            pending.extend(&tmp[..n]);
+            len += n;
         }
-        if pending.is_empty() {
+        if len == 0 {
             return Err(TransferError::InvalidArchive(
                 "unexpected EOF waiting for ZIP data descriptor".into(),
             ));
         }
 
-        // Make contiguous slice for fast signature scan
-        let slice = pending.make_contiguous();
-        if let Some(pos) = find_subslice(slice, &DATA_DESCRIPTOR_SIG) {
+        if let Some(pos) = find_subslice(&dd_buf[..len], &DATA_DESCRIPTOR_SIG) {
             if pos > 0 {
-                let data = &slice[..pos];
+                let data = &dd_buf[..pos];
                 writer.write_all(data)?;
                 sha.update(data);
                 crc.update(data);
                 written += pos as u64;
-                pending.drain(..pos);
+                dd_buf.copy_within(pos..len, 0);
+                len -= pos;
             }
             // Ensure we have enough bytes to inspect both 16-byte (ZIP32) and 24-byte (ZIP64) descriptors
-            while pending.len() < MAX_DD {
-                let n = r.read(&mut tmp)?;
+            while len < MAX_DD {
+                let n = r.read(&mut dd_buf[len..])?;
                 if n == 0 {
                     break;
                 }
-                pending.extend(&tmp[..n]);
+                len += n;
             }
-            let dd = pending.make_contiguous();
+            let dd = &dd_buf[..len];
             let running_crc = crc.clone().finalize();
 
             // Check standard 16-byte data descriptor: sig(4) + crc(4) + comp(4) + uncomp(4)
@@ -1095,8 +1145,7 @@ fn extract_store_with_data_descriptor<R: Read, W: Write>(
                 let dd_comp = u32::from_le_bytes([dd[8], dd[9], dd[10], dd[11]]) as u64;
                 let dd_uncomp = u32::from_le_bytes([dd[12], dd[13], dd[14], dd[15]]) as u64;
                 if dd_crc == running_crc && dd_comp == written && dd_uncomp == written {
-                    pending.drain(..16);
-                    r.unread_slice(pending.make_contiguous());
+                    r.unread_slice(&dd_buf[16..len]);
                     return Ok(written);
                 }
             }
@@ -1106,33 +1155,34 @@ fn extract_store_with_data_descriptor<R: Read, W: Write>(
                 let dd_comp = u64::from_le_bytes(dd[8..16].try_into().unwrap());
                 let dd_uncomp = u64::from_le_bytes(dd[16..24].try_into().unwrap());
                 if dd_crc == running_crc && dd_comp == written && dd_uncomp == written {
-                    pending.drain(..24);
-                    r.unread_slice(pending.make_contiguous());
+                    r.unread_slice(&dd_buf[24..len]);
                     return Ok(written);
                 }
             }
 
             // False positive signature inside binary file content — emit the 4 bytes and keep scanning
-            let sig_slice = &dd[..4];
+            let sig_slice = &dd_buf[..4];
             writer.write_all(sig_slice)?;
             sha.update(sig_slice);
             crc.update(sig_slice);
             written += 4;
-            pending.drain(..4);
+            dd_buf.copy_within(4..len, 0);
+            len -= 4;
         } else {
             // Safe to flush all except the last 3 bytes (which could start a split signature)
-            let safe_len = slice.len().saturating_sub(3);
+            let safe_len = len.saturating_sub(3);
             if safe_len == 0 {
                 return Err(TransferError::InvalidArchive(
                     "truncated ZIP stream before data descriptor".into(),
                 ));
             }
-            let data = &slice[..safe_len];
+            let data = &dd_buf[..safe_len];
             writer.write_all(data)?;
             sha.update(data);
             crc.update(data);
             written += safe_len as u64;
-            pending.drain(..safe_len);
+            dd_buf.copy_within(safe_len..len, 0);
+            len -= safe_len;
         }
     }
 }
@@ -1211,8 +1261,12 @@ impl<R: Read> PeekableReader<R> {
     }
 
     fn unread_slice(&mut self, bytes: &[u8]) {
-        for &b in bytes.iter().rev() {
-            self.stash.push_front(b);
+        if self.stash.is_empty() {
+            self.stash.extend(bytes);
+        } else {
+            for &b in bytes.iter().rev() {
+                self.stash.push_front(b);
+            }
         }
     }
 
@@ -1238,16 +1292,15 @@ impl<R: Read> PeekableReader<R> {
 impl<R: Read> Read for PeekableReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if !self.stash.is_empty() {
-            let mut n = 0;
-            while n < buf.len() {
-                match self.stash.pop_front() {
-                    Some(b) => {
-                        buf[n] = b;
-                        n += 1;
-                    }
-                    None => break,
-                }
+            let n = self.stash.len().min(buf.len());
+            let (front, back) = self.stash.as_slices();
+            let from_front = n.min(front.len());
+            buf[..from_front].copy_from_slice(&front[..from_front]);
+            if from_front < n {
+                let rem = n - from_front;
+                buf[from_front..n].copy_from_slice(&back[..rem]);
             }
+            self.stash.drain(..n);
             return Ok(n);
         }
         self.inner.read(buf)
@@ -1258,4 +1311,82 @@ impl<R: Read> Read for PeekableReader<R> {
 #[allow(dead_code)]
 fn _channel_error_check(r: &mut ChannelReader) -> Option<TransferError> {
     r.take_error()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use tempfile::tempdir;
+
+    fn build_dd_store_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, data) in entries {
+            let name_bytes = name.as_bytes();
+            out.extend_from_slice(&LOCAL_FILE_HEADER_SIG.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0x0008u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(data);
+
+            let mut crc = Crc32::new();
+            crc.update(data);
+            out.extend_from_slice(&DATA_DESCRIPTOR_SIG);
+            out.extend_from_slice(&crc.finalize().to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        }
+        out.extend_from_slice(&EOCD_SIG.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn upload_and_download_controls_reflect_atomic_counters_in_snapshots() {
+        let up = UploadControl::new(1000, 2);
+        up.add_bytes(256);
+        up.add_bytes(128);
+        up.finish_file();
+        let up_snap = up.snapshot();
+        assert_eq!(up_snap.bytes_uploaded, 384);
+        assert_eq!(up_snap.files_uploaded, 1);
+
+        let dl = DownloadControl::new(2048, 3);
+        dl.bytes_downloaded.store(1024, Ordering::Relaxed);
+        dl.files_extracted.store(2, Ordering::Relaxed);
+        let dl_snap = dl.snapshot();
+        assert_eq!(dl_snap.bytes_downloaded, 1024);
+        assert_eq!(dl_snap.files_extracted, 2);
+    }
+
+    #[test]
+    fn extract_store_with_data_descriptor_spans_multiple_buffers_and_split_signature() {
+        let dir = tempdir().unwrap();
+        // Payload larger than 2x STREAM_CHUNK_BUF with a decoy PK\x07\x08 straddling the first
+        // STREAM_CHUNK_BUF boundary and a second entry right behind it to exercise PeekableReader.
+        let mut big = vec![0x42u8; STREAM_CHUNK_BUF * 2 + 4096];
+        let split_at = STREAM_CHUNK_BUF - 2;
+        big[split_at..split_at + 4].copy_from_slice(&DATA_DESCRIPTOR_SIG);
+        let tail = b"after-big-file".to_vec();
+
+        let zip = build_dd_store_zip(&[("big.bin", &big), ("tail.txt", &tail)]);
+        let ctrl = DownloadControl::new(zip.len() as u64, 2);
+        let extracted = extract_zip_stream(Cursor::new(zip), dir.path(), &ctrl).unwrap();
+
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted[0].size, big.len() as u64);
+        assert_eq!(extracted[0].sha256, hex::encode(Sha256::digest(&big)));
+        assert_eq!(extracted[1].size, tail.len() as u64);
+        assert_eq!(extracted[1].sha256, hex::encode(Sha256::digest(&tail)));
+        assert_eq!(ctrl.snapshot().files_extracted, 2);
+        assert_eq!(fs::read(dir.path().join("big.bin")).unwrap(), big);
+        assert_eq!(fs::read(dir.path().join("tail.txt")).unwrap(), tail);
+    }
 }
