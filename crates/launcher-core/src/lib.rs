@@ -3595,7 +3595,11 @@ mod path_safety_tests {
         let dir = tempdir().unwrap();
         let games_dir = dir.path().join("games");
         let install = install_dir_for_slug(&games_dir, "profile-1", "fogwoods").unwrap();
-        assert!(install.starts_with(games_dir.join("profile-1")));
+        // `install_dir_for_slug` returns a canonicalized path. Canonicalize the expected
+        // base too: on macOS `tempdir()` lives under /var, a symlink to /private/var,
+        // which otherwise makes this a /var vs /private/var prefix mismatch.
+        let canonical_games_dir = std::fs::canonicalize(&games_dir).unwrap();
+        assert!(install.starts_with(canonical_games_dir.join("profile-1")));
         assert_eq!(install.file_name().unwrap(), "fogwoods");
 
         let escape = dir.path().join("escaped");

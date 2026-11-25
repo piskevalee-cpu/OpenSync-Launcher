@@ -23,10 +23,11 @@ finish-args:
   # freedesktop one explicitly and let the loader find the installed 32-bit libs.
   - --env=LD_LIBRARY_PATH=/app/lib/i386-linux-gnu
 
-inherit-extensions:
-  - org.freedesktop.Platform.Compat.i386
-  - org.freedesktop.Platform.GL32
-
+# Do not use `inherit-extensions` here: it copies extension points from the parent
+# runtime's metadata, and org.gnome.Platform 49 no longer declares the i386/GL32
+# points (flatpak-builder then fails with "Can't find inherited extension point
+# org.freedesktop.Platform.Compat.i386"). Defining the points with `add-extensions`
+# below is the supported way to attach the freedesktop compat extensions to an app.
 add-extensions:
   org.freedesktop.Platform.Compat.i386:
     directory: lib/i386-linux-gnu
